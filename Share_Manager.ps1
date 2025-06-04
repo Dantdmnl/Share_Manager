@@ -1,35 +1,49 @@
 ﻿<#
 .SYNOPSIS
-    Share Manager Script (v1.0) – Map and unmap network shares via CLI or GUI.
+    Share Manager Script (v1.1) – Map and unmap network shares via CLI or GUI,
+    with robust credential persistence using AES-encrypted SecureString.
 
 .DESCRIPTION
     - Interactive management of network shares (SMB) with both CLI and GUI interfaces.
-    - Stores configuration at `%USERPROFILE%\AppData\Roaming\Share_Manager\config.json`.
-    - Stores encrypted credentials at `%USERPROFILE%\AppData\Roaming\Share_Manager\cred.xml`.
-    - Logs actions to `%USERPROFILE%\AppData\Roaming\Share_Manager\actions.log`, with automatic rotation.
+    - Credentials stored securely via ConvertFrom-SecureString with a generated AES key at
+      `%APPDATA%\Share_Manager\cred.txt` and key at `%APPDATA%\Share_Manager\key.bin`.
+    - CLI password entry shows asterisks as you type.
+    - Users can switch between CLI and GUI without losing configuration.
+    - Logs actions to `%APPDATA%\Share_Manager\Share_Manager.log`, with automatic rotation.
     - Preferences pane to toggle auto-unmapping on drive-letter change and select startup mode.
     - Version number displayed in title bars and menus.
     - Author: Dantdmnl.
 
+.PARAMETER StartupMode
+    Optional. Pass "CLI" or "GUI" to force that mode on launch, bypassing saved preference.
+
 .VERSION
-    1.0
+    1.1
 
 .NOTES
-    GUI mode requires `-STA` when launching PowerShell:
-    `powershell.exe -ExecutionPolicy Bypass -STA -File "C:\Scripts\Share_Manager.ps1"`
+    - No administrator permissions are required.
+    - GUI mode requires `-STA` when launching PowerShell:
+      
+      E.g. powershell.exe -ExecutionPolicy Bypass -STA -File "C:\Scripts\Share_Manager.ps1"
+     
 #>
+
+param(
+    [string]$StartupMode
+)
 
 #region Global Variables (Version, Paths, Defaults)
 
-$version        = '1.0'
+$version        = '1.1'
 $author         = 'Dantdmnl'
-$baseFolder     = Join-Path $env:USERPROFILE "AppData\Roaming\Share_Manager"
+$baseFolder     = Join-Path $env:APPDATA "Share_Manager"
 if (-not (Test-Path $baseFolder)) {
     New-Item -Path $baseFolder -ItemType Directory -Force | Out-Null
 }
-$configPath     = Join-Path $baseFolder "config.json"
-$credentialPath = Join-Path $baseFolder "cred.xml"
-$logPath        = Join-Path $baseFolder "actions.log"
+$configPath       = Join-Path $baseFolder "config.json"
+$credentialPath   = Join-Path $baseFolder "cred.txt"
+$keyPath          = Join-Path $baseFolder "key.bin"
+$logPath          = Join-Path $baseFolder "Share_Manager.log"
 
 $defaultConfigTemplate = [PSCustomObject]@{
     SharePath   = $null
@@ -45,7 +59,7 @@ $script:UseGUI = $false
 
 #endregion
 
-#region Helper Functions: InputBox, Logging, Config & Credentials
+#region Helper Functions: InputBox, Logging, Config & Credential Key
 
 function Show-InputBox {
     param (
@@ -64,9 +78,9 @@ function Rotate-LogIfNeeded {
     $sizeMB   = [math]::Round($fileInfo.Length / 1MB, 2)
     if ($ageDays.TotalDays -ge 30 -or $sizeMB -ge 5) {
         $timestamp = (Get-Date).ToString("yyyy-MM-dd_HHmmss")
-        $archived  = Join-Path $baseFolder "actions_$timestamp.log"
+        $archived  = Join-Path $baseFolder "Share_Manager_$timestamp.log"
         try {
-            Rename-Item -Path $logPath -NewName $(Split-Path $archived -Leaf) -ErrorAction Stop
+            Rename-Item -Path $logPath -NewName (Split-Path $archived -Leaf) -ErrorAction Stop
             New-Item -Path $logPath -ItemType File -Force | Out-Null
             if (-not $UseGUI) {
                 Write-Host "Log rotated to $(Split-Path $archived -Leaf)" -ForegroundColor Cyan
@@ -177,36 +191,41 @@ function Save-Config {
     }
 }
 
-function Load-Credential {
-    if (Test-Path $credentialPath) {
-        try {
-            return Import-Clixml -Path $credentialPath
-        }
-        catch {
-            if ($UseGUI) {
-                [System.Windows.Forms.MessageBox]::Show(
-                    "Stored credentials are invalid.",
-                    "Share Manager v$version",
-                    [System.Windows.Forms.MessageBoxButtons]::OK,
-                    [System.Windows.Forms.MessageBoxIcon]::Warning
-                )
-            }
-            else {
-                Write-Host "Warning: Stored credentials invalid." -ForegroundColor Yellow
-            }
-            return $null
-        }
+#endregion
+
+#region Credential Storage: AES-Encrypted SecureString
+
+function Ensure-Key {
+    if (-not (Test-Path $keyPath)) {
+        # Generate 256-bit AES key
+        $aesKey = New-Object byte[] 32
+        [System.Security.Cryptography.RNGCryptoServiceProvider]::Create().GetBytes($aesKey)
+        [System.IO.File]::WriteAllBytes($keyPath, $aesKey)
+        Log-Action "Generated new AES key at $keyPath"
     }
-    return $null
+}
+
+function Get-Key {
+    Ensure-Key
+    return [System.IO.File]::ReadAllBytes($keyPath)
 }
 
 function Save-Credential {
     param ([System.Management.Automation.PSCredential]$Credential)
+
+    # Caller must ensure $Credential is non-null
     try {
-        $Credential | Export-Clixml -Path $credentialPath -Force
+        $user        = $Credential.UserName
+        $securePW    = $Credential.Password
+        $aesKey      = Get-Key
+        $encryptedPW = $securePW | ConvertFrom-SecureString -Key $aesKey
+
+        # Store as two lines: username and encrypted string
+        @($user, $encryptedPW) | Set-Content -Path $credentialPath -Force -Encoding UTF8
+
         if ($UseGUI) {
             [System.Windows.Forms.MessageBox]::Show(
-                "Credentials saved.",
+                "Credentials saved securely.",
                 "Share Manager v$version",
                 [System.Windows.Forms.MessageBoxButtons]::OK,
                 [System.Windows.Forms.MessageBoxIcon]::Information
@@ -215,7 +234,7 @@ function Save-Credential {
         else {
             Write-Host "Credentials saved to $credentialPath" -ForegroundColor Green
         }
-        Log-Action "Saved credential for $($Credential.UserName)"
+        Log-Action "Saved credential for $user"
     }
     catch {
         if ($UseGUI) {
@@ -231,6 +250,35 @@ function Save-Credential {
         }
         Log-Action "Failed to save credential: $_"
     }
+}
+
+function Load-Credential {
+    if (Test-Path $credentialPath) {
+        try {
+            $lines       = Get-Content -Path $credentialPath -Encoding UTF8
+            if ($lines.Count -lt 2) { return $null }
+            $user        = $lines[0]
+            $encryptedPW = $lines[1]
+            $aesKey      = Get-Key
+            $securePW    = $encryptedPW | ConvertTo-SecureString -Key $aesKey
+            return New-Object System.Management.Automation.PSCredential($user, $securePW)
+        }
+        catch {
+            if ($UseGUI) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Stored credentials invalid or cannot be decrypted.",
+                    "Share Manager v$version",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning
+                )
+            }
+            else {
+                Write-Host "Warning: Stored credentials invalid or cannot be decrypted." -ForegroundColor Yellow
+            }
+            return $null
+        }
+    }
+    return $null
 }
 
 function Remove-Credential {
@@ -267,24 +315,55 @@ function Remove-Credential {
 
 #endregion
 
+#region Read-Password (CLI, masked with asterisks)
+
+function Read-Password {
+    param (
+        [string]$Prompt = "Password: "
+    )
+    Write-Host -NoNewline $Prompt
+    $secureString = New-Object Security.SecureString
+    while ($true) {
+        $key = [System.Console]::ReadKey($true)
+        if ($key.Key -eq 'Enter') {
+            break
+        }
+        elseif ($key.Key -eq 'Backspace') {
+            if ($secureString.Length -gt 0) {
+                $secureString.RemoveAt($secureString.Length - 1)
+                $cursorLeft = [System.Console]::CursorLeft
+                if ($cursorLeft -gt ($Prompt.Length)) {
+                    [System.Console]::SetCursorPosition($cursorLeft - 1, [System.Console]::CursorTop)
+                    Write-Host -NoNewline ' '
+                    [System.Console]::SetCursorPosition($cursorLeft - 1, [System.Console]::CursorTop)
+                }
+            }
+        }
+        else {
+            $secureString.AppendChar($key.KeyChar)
+            Write-Host -NoNewline '*'
+        }
+    }
+    Write-Host ""
+    $secureString.MakeReadOnly()
+    return $secureString
+}
+
+#endregion
+
 #region Network Check & Mapping Functions
 
 function Test-ShareOnline {
     param ([string]$SharePath)
-
-    # If the share path doesn't match \\Server\Share, return $false
     if ($SharePath -notmatch '^\\\\([^\\]+)\\') {
         return $false
     }
-
-    # Use -match to populate $Matches
     if ($SharePath -match '^\\\\([^\\]+)\\') {
         $shareHost = $Matches[1]
     }
     else {
         return $false
     }
-
     try {
         return Test-Connection -ComputerName $shareHost -Count 1 -Quiet -ErrorAction SilentlyContinue
     }
@@ -385,7 +464,6 @@ function Map-Share {
 
 function Unmap-Share {
     param ([string]$DriveLetter)
-
     try {
         if (Test-Path "$DriveLetter`:") {
             net use "$DriveLetter`:" /DELETE /Y | Out-Null
@@ -449,7 +527,6 @@ function Unmap-Share {
 }
 
 function Open-LogFile {
-    # Ensure the log file exists
     if (-not (Test-Path $logPath)) {
         try {
             New-Item -Path $logPath -ItemType File -Force | Out-Null
@@ -469,9 +546,8 @@ function Open-LogFile {
             return
         }
     }
-
     try {
-        Invoke-Item -Path $logPath -ErrorAction Stop
+        Start-Process -FilePath $logPath -ErrorAction Stop
         Log-Action "Opened log file"
     }
     catch {
@@ -515,6 +591,16 @@ function Initialize-Config-CLI {
         if (-not [string]::IsNullOrWhiteSpace($username)) { break }
         Write-Host "Cannot be blank." -ForegroundColor Yellow
     } while ($true)
+
+    # Prompt for password (masked) using Read-Password
+    $password = Read-Password ("Enter password for $($username): ")
+    if ($password.Length -gt 0) {
+        $cred = New-Object System.Management.Automation.PSCredential($username, $password)
+        Save-Credential -Credential $cred
+    }
+    else {
+        Write-Host "No password entered; credentials skipped." -ForegroundColor Yellow
+    }
 
     $dummyPrefs = [PSCustomObject]@{
         UnmapOldMapping = $true
@@ -573,6 +659,19 @@ function Initialize-Config-GUI {
         )
     } while ($true)
 
+    # Prompt for credentials in GUI, defaulting to provided username
+    $cred = Get-Credential -Message "Enter password for $username" -UserName $username
+    if ($cred) {
+        Save-Credential -Credential $cred
+    } else {
+        [System.Windows.Forms.MessageBox]::Show(
+            "No credentials entered; skipping.",
+            "Share Manager v$version",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        )
+    }
+
     $dummyPrefs = [PSCustomObject]@{
         UnmapOldMapping = $true
         PreferredMode   = "Prompt"
@@ -603,7 +702,8 @@ function Show-CLI-Menu {
     Write-Host "5. Update/Remove Credentials"
     Write-Host "6. Open Log File"
     Write-Host "7. Test Connectivity"
-    Write-Host "8. Exit"
+    Write-Host "8. Switch to GUI"
+    Write-Host "9. Exit"
     Write-Host "==============================" -ForegroundColor Cyan
 }
 
@@ -671,7 +771,7 @@ function Preferences-CLI {
     Write-Host ""
     Write-Host "1. Auto-unmap on drive change: $($prefs.UnmapOldMapping)"
     Write-Host "2. Preferred startup mode    : $($prefs.PreferredMode)"
-    Write-Host "3. Back" 
+    Write-Host "3. Back"
     Write-Host ""
 
     $choice = Read-Host "Select (1-3)"
@@ -723,9 +823,19 @@ function Update-CredentialsMenu-CLI {
     switch ($sub) {
         "1" {
             $cc = Load-Config
-            $prompt = "Enter credentials for $($cc.Username) at $($cc.SharePath)"
-            $cred = Get-Credential -Message $prompt -UserName $cc.Username
-            Save-Credential -Credential $cred
+            if (-not $cc) {
+                Write-Host "No configuration found. Please configure first." -ForegroundColor Yellow
+                return
+            }
+            $username = $cc.Username
+            $password = Read-Password ("Enter password for $($username): ")
+            if ($password.Length -gt 0) {
+                $cred = New-Object System.Management.Automation.PSCredential($username, $password)
+                Save-Credential -Credential $cred
+            }
+            else {
+                Write-Host "Credential prompt cancelled; nothing saved." -ForegroundColor Yellow
+            }
         }
         "2" {
             Remove-Credential
@@ -737,15 +847,27 @@ function Update-CredentialsMenu-CLI {
 function Run-CLI {
     do {
         Show-CLI-Menu
-        $choice = Read-Host "Choice (1-8)"
+        $choice = Read-Host "Choice (1-9)"
         switch ($choice) {
             "1" {
                 $cfg  = Load-Config
+                if (-not $cfg) {
+                    Write-Host "No configuration found. Please run 'Configure Settings' first." -ForegroundColor Yellow
+                    break
+                }
                 $cred = Load-Credential
                 if (-not $cred) {
                     Write-Host "No saved credentials. Please enter now." -ForegroundColor Yellow
-                    $cred = Get-Credential -Message "Enter credentials for $($cfg.Username) at $($cfg.SharePath)" -UserName $cfg.Username
-                    Save-Credential -Credential $cred
+                    $username = $cfg.Username
+                    $password = Read-Password ("Enter password for $($username): ")
+                    if ($password.Length -gt 0) {
+                        $cred = New-Object System.Management.Automation.PSCredential($username, $password)
+                        Save-Credential -Credential $cred
+                    }
+                    else {
+                        Write-Host "Credential prompt cancelled; mapping skipped." -ForegroundColor Yellow
+                        break
+                    }
                 }
                 Map-Share -SharePath   $cfg.SharePath `
                           -DriveLetter $cfg.DriveLetter `
@@ -753,7 +875,12 @@ function Run-CLI {
             }
             "2" {
                 $cfg = Load-Config
-                Unmap-Share -DriveLetter $cfg.DriveLetter
+                if ($cfg) {
+                    Unmap-Share -DriveLetter $cfg.DriveLetter
+                }
+                else {
+                    Write-Host "No configuration found." -ForegroundColor Yellow
+                }
             }
             "3" { Configure-Settings-CLI }
             "4" { Preferences-CLI }
@@ -771,10 +898,17 @@ function Run-CLI {
                     Write-Host "No configuration found." -ForegroundColor Yellow
                 }
             }
-            "8" { exit }  # use exit instead of break
+            "8" {
+                Write-Host "Switching to GUI mode..."
+                Start-Process -FilePath "powershell.exe" `
+                    -ArgumentList "-ExecutionPolicy Bypass -STA -File `"$PSCommandPath`" -StartupMode GUI" `
+                    -WindowStyle Normal
+                exit
+            }
+            "9" { exit }
             default { Write-Host "Invalid." -ForegroundColor Red }
         }
-        if ($choice -ne "8") { Write-Host ""; Pause }
+        if ($choice -ne "9" -and $choice -ne "8") { Write-Host ""; Pause }
     } while ($true)
 }
 
@@ -910,7 +1044,7 @@ function Show-GUI {
     $form = New-Object System.Windows.Forms.Form
     $form.Text            = "Share Manager v$version"
     $form.Width           = 400
-    $form.Height          = 520
+    $form.Height          = 560
     $form.StartPosition   = "CenterScreen"
     $form.FormBorderStyle = "FixedDialog"
     $form.MaximizeBox     = $false
@@ -940,8 +1074,19 @@ function Show-GUI {
                 [System.Windows.Forms.MessageBoxIcon]::Warning
             )
             $newCred = Get-Credential -Message "Enter credentials for $($cfg.Username) at $($cfg.SharePath)" -UserName $cfg.Username
-            Save-Credential -Credential $newCred
-            $script:cred = $newCred
+            if ($newCred) {
+                Save-Credential -Credential $newCred
+                $script:cred = $newCred
+            }
+            else {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Credential prompt cancelled; mapping skipped.",
+                    "Share Manager v$version",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning
+                )
+                return
+            }
         }
         Map-Share -SharePath   $cfg.SharePath `
                   -DriveLetter $cfg.DriveLetter `
@@ -1105,8 +1250,17 @@ function Show-GUI {
             'Yes' {
                 $prompt = "Enter credentials for $($cfg.Username) at $($cfg.SharePath)"
                 $newCred = Get-Credential -Message $prompt -UserName $cfg.Username
-                Save-Credential -Credential $newCred
-                $script:cred = $newCred
+                if ($newCred) {
+                    Save-Credential -Credential $newCred
+                    $script:cred = $newCred
+                } else {
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "Credential prompt cancelled; nothing saved.",
+                        "Share Manager v$version",
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
+                        [System.Windows.Forms.MessageBoxIcon]::Warning
+                    )
+                }
             }
             'No' {
                 Remove-Credential
@@ -1147,12 +1301,27 @@ function Show-GUI {
     })
     $form.Controls.Add($btnRotate)
 
+    # Switch to CLI Button
+    $btnSwitchCLI = New-Object System.Windows.Forms.Button
+    $btnSwitchCLI.Text   = "Switch to CLI"
+    $btnSwitchCLI.Width  = 350
+    $btnSwitchCLI.Height = 35
+    $btnSwitchCLI.Top    = 420
+    $btnSwitchCLI.Left   = 20
+    $btnSwitchCLI.Add_Click({
+        Start-Process -FilePath "powershell.exe" `
+            -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`" -StartupMode CLI" `
+            -WindowStyle Normal
+        $form.Close()
+    })
+    $form.Controls.Add($btnSwitchCLI)
+
     # Exit
     $btnExit = New-Object System.Windows.Forms.Button
     $btnExit.Text   = "Exit"
     $btnExit.Width  = 350
     $btnExit.Height = 35
-    $btnExit.Top    = 420
+    $btnExit.Top    = 480
     $btnExit.Left   = 20
     $btnExit.Add_Click({
         $form.Close()
@@ -1168,6 +1337,21 @@ function Show-GUI {
 
 $cfg = Load-Config
 
+# If StartupMode parameter is provided, override preference
+if ($StartupMode -eq "CLI" -or $StartupMode -eq "GUI") {
+    if ($StartupMode -eq "CLI") {
+        $script:UseGUI = $false
+        Run-CLI
+        return
+    }
+    elseif ($StartupMode -eq "GUI") {
+        $script:UseGUI = $true
+        Show-GUI
+        return
+    }
+}
+
+# Otherwise, use saved preference if present
 if ($cfg) {
     switch ($cfg.Preferences.PreferredMode) {
         "CLI" {
@@ -1180,10 +1364,11 @@ if ($cfg) {
             Show-GUI
             return
         }
-        default { }  # Prompt
+        default { }  # Prompt if "Prompt"
     }
 }
 
+# If no saved config or preference is "Prompt", ask user
 Write-Host ""
 Write-Host "Choose startup mode for Share Manager v${version}:" -ForegroundColor Cyan
 Write-Host "1. CLI Mode"

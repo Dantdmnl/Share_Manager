@@ -13,7 +13,7 @@ Easily manage and map network shares using this PowerShell script with support f
 - **Test connectivity to the NAS/share** before attempting to map.
 - **Review and modify preferences** at any time.
 - **Log file for troubleshooting** and activity tracking.
-- **Automatic setup wizard** for first-time use.
+- **Setup wizard** for first-time use.
 - **No administrator permissions required.**
 
 ## Prerequisites
@@ -56,9 +56,9 @@ Easily manage and map network shares using this PowerShell script with support f
    - Double-click the shortcut to launch the script in your preferred mode (CLI or GUI).
 
 ## Notes
-- Settings are stored in the `C:\Scripts\config.xml` file.
-- Log output is stored in `C:\Scripts\log.txt`.
-- Use the Preferences menu to update paths, credentials, or behavior at any time.
+- Settings are stored in the `%USERPROFILE%\AppData\Roaming\Share_Manager\config.json` file.
+- Log output is stored in `%USERPROFILE%\AppData\Roaming\Share_Manager\Share_Manager.log`.
+- Use the Preferences menu to update paths, or behavior at any time.
 
 ## License
 This project is licensed under the MIT License. See the `LICENSE` file for details.
