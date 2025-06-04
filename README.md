@@ -56,7 +56,7 @@ Easily manage and map network shares using this PowerShell script with support f
    - Double-click the shortcut to launch the script in your preferred mode (CLI or GUI).
 
 ## Notes
-- Settings are stored in the `    - Stores configuration at `%USERPROFILE%\AppData\Roaming\Share_Manager\config.json` file.
+- Settings are stored in the `%USERPROFILE%\AppData\Roaming\Share_Manager\config.json` file.
 - Log output is stored in `%USERPROFILE%\AppData\Roaming\Share_Manager\actions.log`.
 - Use the Preferences menu to update paths, credentials, or behavior at any time.
 
