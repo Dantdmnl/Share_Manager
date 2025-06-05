@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Share Manager Script (v1.1) – Map and unmap network shares via CLI or GUI,
+    Share Manager Script (v1.1.1) – Map and unmap network shares via CLI or GUI,
     with robust credential persistence using AES-encrypted SecureString.
 
 .DESCRIPTION
@@ -18,14 +18,14 @@
     Optional. Pass "CLI" or "GUI" to force that mode on launch, bypassing saved preference.
 
 .VERSION
-    1.1
+    1.1.1
 
 .NOTES
     - No administrator permissions are required.
     - GUI mode requires `-STA` when launching PowerShell:
-      
-      E.g. powershell.exe -ExecutionPolicy Bypass -STA -File "C:\Scripts\Share_Manager.ps1"
-     
+      ```text
+      powershell.exe -ExecutionPolicy Bypass -STA -File "C:\Scripts\Share_Manager.ps1"
+      ```
 #>
 
 param(
@@ -34,7 +34,7 @@ param(
 
 #region Global Variables (Version, Paths, Defaults)
 
-$version        = '1.1'
+$version        = '1.1.1'
 $author         = 'Dantdmnl'
 $baseFolder     = Join-Path $env:APPDATA "Share_Manager"
 if (-not (Test-Path $baseFolder)) {
@@ -1038,7 +1038,11 @@ function Show-GUI {
     Minimize-Console
 
     $cfg   = Load-Config
-    $cred  = Load-Credential
+    
+    $loaded = Load-Credential
+    if ($loaded) { $script:cred = $loaded }
+    else { $script:cred = $null }
+    
     $prefs = $cfg.Preferences
 
     $form = New-Object System.Windows.Forms.Form
