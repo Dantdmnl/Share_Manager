@@ -1,16 +1,16 @@
 ﻿<#
 .SYNOPSIS
-    Share Manager Script (v1.1.1) – Map and unmap network shares via CLI or GUI,
+    Share Manager Script (v1.1.2) - Map and unmap network shares via CLI or GUI,
     with robust credential persistence using AES-encrypted SecureString.
 
 .DESCRIPTION
     - Interactive management of network shares (SMB) with both CLI and GUI interfaces.
     - Credentials stored securely via ConvertFrom-SecureString with a generated AES key at
-      `%APPDATA%\Share_Manager\cred.txt` and key at `%APPDATA%\Share_Manager\key.bin`.
+      '%APPDATA%\Share_Manager\cred.txt' and key at '%APPDATA%\Share_Manager\key.bin'.
     - CLI password entry shows asterisks as you type.
     - Users can switch between CLI and GUI without losing configuration.
-    - Logs actions to `%APPDATA%\Share_Manager\Share_Manager.log`, with automatic rotation.
-    - Preferences pane to toggle auto-unmapping on drive-letter change and select startup mode.
+    - Logs actions to '%APPDATA%\Share_Manager\Share_Manager.log', with automatic rotation.
+    - Preferences pane to toggle auto-unmapping on drive-letter change, select startup mode and persistent mapping.
     - Version number displayed in title bars and menus.
     - Author: Dantdmnl.
 
@@ -18,14 +18,12 @@
     Optional. Pass "CLI" or "GUI" to force that mode on launch, bypassing saved preference.
 
 .VERSION
-    1.1.1
+    1.1.2
 
 .NOTES
     - No administrator permissions are required.
-    - GUI mode requires `-STA` when launching PowerShell:
-      ```text
+    - GUI mode requires '-STA' when launching PowerShell:
       powershell.exe -ExecutionPolicy Bypass -STA -File "C:\Scripts\Share_Manager.ps1"
-      ```
 #>
 
 param(
@@ -34,7 +32,7 @@ param(
 
 #region Global Variables (Version, Paths, Defaults)
 
-$version        = '1.1.1'
+$version        = '1.1.2'
 $author         = 'Dantdmnl'
 $baseFolder     = Join-Path $env:APPDATA "Share_Manager"
 if (-not (Test-Path $baseFolder)) {
@@ -123,6 +121,10 @@ function Load-Config {
             if (-not $cfg.PSObject.Properties['Preferences']) {
                 $cfg | Add-Member -MemberType NoteProperty -Name Preferences -Value $defaultConfigTemplate.Preferences
             }
+            # Add PersistentMapping if missing
+            if (-not $cfg.Preferences.PSObject.Properties['PersistentMapping']) {
+                $cfg.Preferences | Add-Member -MemberType NoteProperty -Name PersistentMapping -Value $false
+            }
             return $cfg
         }
         catch {
@@ -149,15 +151,17 @@ function Save-Config {
         [string]$DriveLetter,
         [string]$Username,
         [bool]  $UnmapOldMapping,
-        [string]$PreferredMode
+        [string]$PreferredMode,
+        [bool]  $PersistentMapping = $false
     )
     $obj = [PSCustomObject]@{
         SharePath   = $SharePath
         DriveLetter = $DriveLetter
         Username    = $Username
         Preferences = [PSCustomObject]@{
-            UnmapOldMapping = $UnmapOldMapping
-            PreferredMode   = $PreferredMode
+            UnmapOldMapping   = $UnmapOldMapping
+            PreferredMode     = $PreferredMode
+            PersistentMapping = $PersistentMapping
         }
     }
     try {
@@ -173,7 +177,13 @@ function Save-Config {
         else {
             Write-Host "Configuration saved to $configPath" -ForegroundColor Green
         }
-        Log-Action "Saved config: SharePath=$SharePath, DriveLetter=$DriveLetter, Username=$Username, UnmapOldMapping=$UnmapOldMapping, PreferredMode=$PreferredMode"
+        Log-Action "Saved config: SharePath=$SharePath, DriveLetter=$DriveLetter, Username=$Username, UnmapOldMapping=$UnmapOldMapping, PreferredMode=$PreferredMode, PersistentMapping=$PersistentMapping"
+        # Automate logon script management
+        if ($PersistentMapping) {
+            Install-LogonScript
+        } else {
+            Remove-LogonScript
+        }
     }
     catch {
         if ($UseGUI) {
@@ -250,6 +260,12 @@ function Save-Credential {
         }
         Log-Action "Failed to save credential: $_"
     }
+}
+
+# Utility: Get-StartupFolder (returns user's Startup folder)
+function Get-StartupFolder {
+    $shell = New-Object -ComObject WScript.Shell
+    return $shell.SpecialFolders.Item('Startup')
 }
 
 function Load-Credential {
@@ -379,6 +395,13 @@ function Map-Share {
         [System.Management.Automation.PSCredential]$Credential
     )
 
+    $cfg = Load-Config
+    $persistent = $false
+    if ($cfg -and $cfg.Preferences.PSObject.Properties["PersistentMapping"]) {
+        $persistent = [bool]$cfg.Preferences.PersistentMapping
+    }
+    $persistentFlag = if ($persistent) { "/PERSISTENT:YES" } else { "/PERSISTENT:NO" }
+
     if (Test-Path "$DriveLetter`:") {
         if ($UseGUI) {
             [System.Windows.Forms.MessageBox]::Show(
@@ -406,7 +429,7 @@ function Map-Share {
         else {
             Write-Host "Share host not reachable. Skipping mapping." -ForegroundColor Yellow
         }
-        Log-Action "Skipped mapping $DriveLetter → $SharePath (offline)"
+        Log-Action "Skipped mapping $DriveLetter -> $SharePath (offline)"
         return
     }
 
@@ -415,12 +438,29 @@ function Map-Share {
         $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
             [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
         )
-        net use "$DriveLetter`:" $SharePath /USER:$user $plainPassword /PERSISTENT:NO | Out-Null
+        # If persistent, store credentials in Windows Credential Manager
+        if ($persistent) {
+            # Extract only the server name from the UNC path (e.g., \\server)
+            $target = $null
+            if ($SharePath -match '^\\[^\\]+') {
+                $target = $Matches[0]
+            } else {
+                $target = $SharePath
+            }
+            # Remove any existing credentials for this server
+            cmdkey /delete:$target | Out-Null
+            # Add credentials for the server
+            cmdkey /add:$target /user:$user /pass:$plainPassword | Out-Null
+        }
+        net use "$DriveLetter`:" $SharePath /USER:$user $plainPassword $persistentFlag | Out-Null
 
         if ($LASTEXITCODE -eq 0) {
+            if ($persistent) { Install-LogonScript }
             if ($UseGUI) {
+                $msg = "Mapped $DriveLetter -> $SharePath"
+                if ($persistent) { $msg += " (persistent)" }
                 [System.Windows.Forms.MessageBox]::Show(
-                    "Mapped $DriveLetter → $SharePath",
+                    $msg,
                     "Share Manager v$version",
                     [System.Windows.Forms.MessageBoxButtons]::OK,
                     [System.Windows.Forms.MessageBoxIcon]::Information
@@ -429,7 +469,7 @@ function Map-Share {
             else {
                 Write-Host "Drive $DriveLetter mapped to $SharePath." -ForegroundColor Green
             }
-            Log-Action "Mapped $DriveLetter → $SharePath as $user"
+            Log-Action "Mapped $DriveLetter -> $SharePath as $user (Persistent: $persistent)"
         }
         else {
             if ($UseGUI) {
@@ -443,7 +483,7 @@ function Map-Share {
             else {
                 Write-Host "Failed to map drive. Check details." -ForegroundColor Red
             }
-            Log-Action "Failed mapping $DriveLetter → $SharePath"
+            Log-Action "Failed mapping $DriveLetter -> $SharePath"
         }
     }
     catch {
@@ -465,12 +505,31 @@ function Map-Share {
 function Unmap-Share {
     param ([string]$DriveLetter)
     try {
+        $cfg = Load-Config
+        $persistent = $false
+        if ($cfg -and $cfg.Preferences.PSObject.Properties["PersistentMapping"]) {
+            $persistent = [bool]$cfg.Preferences.PersistentMapping
+        }
+        $sharePath = $cfg.SharePath
         if (Test-Path "$DriveLetter`:") {
             net use "$DriveLetter`:" /DELETE /Y | Out-Null
             if ($LASTEXITCODE -eq 0) {
+                # If persistent, remove credentials from Credential Manager
+                if ($persistent -and $sharePath) {
+                    # Extract only the server name from the UNC path (e.g., \\server)
+                    $target = $null
+                    if ($sharePath -match '^\\[^\\]+') {
+                        $target = $Matches[0]
+                    } else {
+                        $target = $sharePath
+                    }
+                    cmdkey /delete:$target | Out-Null
+                }
+                # Always remove logon script on unmap
+                Remove-LogonScript
                 if ($UseGUI) {
                     [System.Windows.Forms.MessageBox]::Show(
-                        "Unmapped $DriveLetter.",
+                        "Drive $DriveLetter unmapped.",
                         "Share Manager v$version",
                         [System.Windows.Forms.MessageBoxButtons]::OK,
                         [System.Windows.Forms.MessageBoxIcon]::Information
@@ -484,7 +543,7 @@ function Unmap-Share {
             else {
                 if ($UseGUI) {
                     [System.Windows.Forms.MessageBox]::Show(
-                        "Unmapping failed.",
+                        "Failed to unmap drive.",
                         "Share Manager v$version",
                         [System.Windows.Forms.MessageBoxButtons]::OK,
                         [System.Windows.Forms.MessageBoxIcon]::Error
@@ -581,9 +640,9 @@ function Initialize-Config-CLI {
     } while ($true)
 
     do {
-        $driveLetter = Read-Host "Enter drive letter (A–Z)"
+        $driveLetter = Read-Host "Enter drive letter (A-Z)"
         if ($driveLetter -match '^[A-Za-z]$') { $driveLetter = $driveLetter.ToUpper(); break }
-        Write-Host "Enter a single letter A–Z." -ForegroundColor Yellow
+        Write-Host "Enter a single letter A-Z." -ForegroundColor Yellow
     } while ($true)
 
     do {
@@ -602,17 +661,45 @@ function Initialize-Config-CLI {
         Write-Host "No password entered; credentials skipped." -ForegroundColor Yellow
     }
 
-    $dummyPrefs = [PSCustomObject]@{
-        UnmapOldMapping = $true
-        PreferredMode   = "Prompt"
-    }
-    $prefValues = Show-PreferencesForm -CurrentPrefs $dummyPrefs -IsInitial $true
+    # CLI preferences prompt (no GUI)
+    $unmapOld = $true
+    $preferredMode = "Prompt"
+    $persistentMapping = $false
+    Write-Host ""
+    do {
+        $yn = Read-Host "Auto-unmap on letter change? (Y/N) [Y]"
+        if ($yn -eq "") { $unmapOld = $true; break }
+        if ($yn -match '^[YyNn]$') { $unmapOld = ($yn -match '^[Yy]$'); break }
+        Write-Host "Enter Y or N." -ForegroundColor Yellow
+    } while ($true)
+    Write-Host "Mode: 1) CLI  2) GUI  3) Prompt"
+    do {
+        $m = Read-Host "Preferred startup mode (1-3) [3]"
+        if ($m -eq "") { $preferredMode = "Prompt"; break }
+        if ($m -match '^[123]$') {
+            switch ($m) {
+                "1" { $preferredMode = "CLI" }
+                "2" { $preferredMode = "GUI" }
+                "3" { $preferredMode = "Prompt" }
+            }
+            break
+        }
+        Write-Host "Enter 1-3." -ForegroundColor Yellow
+    } while ($true)
+    do {
+        $yn = Read-Host "Enable persistent mapping (reconnect at logon)? (Y/N) [N]"
+        if ($yn -eq "") { $persistentMapping = $false; break }
+        if ($yn -match '^[YyNn]$') { $persistentMapping = ($yn -match '^[Yy]$'); break }
+        Write-Host "Enter Y or N." -ForegroundColor Yellow
+    } while ($true)
 
     Save-Config -SharePath       $sharePath `
                 -DriveLetter     $driveLetter `
                 -Username        $username `
-                -UnmapOldMapping $prefValues.UnmapOldMapping `
-                -PreferredMode   $prefValues.PreferredMode
+                -UnmapOldMapping $unmapOld `
+                -PreferredMode   $preferredMode `
+                -PersistentMapping $persistentMapping
+    Pause
 }
 
 function Initialize-Config-GUI {
@@ -624,6 +711,7 @@ function Initialize-Config-GUI {
         $sharePath = Show-InputBox -Prompt "Enter network share (UNC), e.g. \\server\share" `
                                    -Title  "Initial Share Path" `
                                    -DefaultValue ""
+        if ($sharePath -eq $null) { return } # User cancelled
         if ($sharePath -match '^\\\\[^\\]+\\') { break }
         [System.Windows.Forms.MessageBox]::Show(
             "Invalid UNC; try again.",
@@ -634,12 +722,13 @@ function Initialize-Config-GUI {
     } while ($true)
 
     do {
-        $driveLetter = Show-InputBox -Prompt "Enter drive letter (A–Z)" `
+        $driveLetter = Show-InputBox -Prompt "Enter drive letter (A-Z)" `
                                       -Title  "Initial Drive Letter" `
                                       -DefaultValue ""
+        if ($driveLetter -eq $null) { return } # User cancelled
         if ($driveLetter -match '^[A-Za-z]$') { $driveLetter = $driveLetter.ToUpper(); break }
         [System.Windows.Forms.MessageBox]::Show(
-            "Enter single letter A–Z.",
+            "Enter single letter A-Z.",
             "Share Manager v$version",
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Warning
@@ -650,6 +739,7 @@ function Initialize-Config-GUI {
         $username = Show-InputBox -Prompt "Enter username (DOMAIN\\User or local)" `
                                  -Title  "Initial Username" `
                                  -DefaultValue ""
+        if ($username -eq $null) { return } # User cancelled
         if (-not [string]::IsNullOrWhiteSpace($username)) { break }
         [System.Windows.Forms.MessageBox]::Show(
             "Cannot be blank.",
@@ -659,10 +749,12 @@ function Initialize-Config-GUI {
         )
     } while ($true)
 
-    # Prompt for credentials in GUI, defaulting to provided username
-    $cred = Get-Credential -Message "Enter password for $username" -UserName $username
+    # Use custom credential form for GUI reliability
+    $cred = Show-CredentialForm -Username $username -Message "Enter password for $username"
+    $gotCred = $false
     if ($cred) {
         Save-Credential -Credential $cred
+        $gotCred = $true
     } else {
         [System.Windows.Forms.MessageBox]::Show(
             "No credentials entered; skipping.",
@@ -670,25 +762,221 @@ function Initialize-Config-GUI {
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Information
         )
+        # Prompt: Would you like to add credentials now?
+        $result = [System.Windows.Forms.MessageBox]::Show(
+            "Would you like to add credentials now?",
+            "Share Manager v$version",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Question
+        )
+        if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+            $cred2 = Show-CredentialForm -Username $username -Message "Enter password for $username"
+            if ($cred2) {
+                Save-Credential -Credential $cred2
+                $gotCred = $true
+            } else {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "No credentials entered; skipping.",
+                    "Share Manager v$version",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Information
+                )
+            }
+        } 
     }
 
+    # Always show preferences dialog after credentials
     $dummyPrefs = [PSCustomObject]@{
-        UnmapOldMapping = $true
-        PreferredMode   = "Prompt"
+        UnmapOldMapping   = $true
+        PreferredMode     = "Prompt"
+        PersistentMapping = $false
     }
     $prefValues = Show-PreferencesForm -CurrentPrefs $dummyPrefs -IsInitial $true
+    if ($null -eq $prefValues) { return }
 
     Save-Config -SharePath       $sharePath `
                 -DriveLetter     $driveLetter `
                 -Username        $username `
                 -UnmapOldMapping $prefValues.UnmapOldMapping `
-                -PreferredMode   $prefValues.PreferredMode
+                -PreferredMode   $prefValues.PreferredMode `
+                -PersistentMapping $prefValues.PersistentMapping
+
+    # Attempt to map the drive if credentials exist
+    $finalCred = Load-Credential
+    if ($finalCred) {
+        Map-Share -SharePath $sharePath -DriveLetter $driveLetter -Credential $finalCred
+    } else {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Drive was not mapped because no credentials are saved. You can map later from the main window.",
+            "Share Manager v$version",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        )
+    }
+}
+
+#endregion
+
+#region Credential GUI Form
+
+function Show-CredentialForm {
+    param(
+        [string]$Username = "",
+        [string]$Message = "Enter credentials"
+    )
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = $Message
+    $form.Width = 350
+    $form.Height = 220
+    $form.StartPosition = "CenterParent"
+    $form.FormBorderStyle = "FixedDialog"
+    $form.MaximizeBox = $false
+
+    $lblUser = New-Object System.Windows.Forms.Label
+    $lblUser.Text = "Username:"
+    $lblUser.Left = 20
+    $lblUser.Top = 20
+    $lblUser.Width = 80
+    $form.Controls.Add($lblUser)
+
+    $txtUser = New-Object System.Windows.Forms.TextBox
+    $txtUser.Left = 110
+    $txtUser.Top = 18
+    $txtUser.Width = 200
+    $txtUser.Text = $Username
+    $form.Controls.Add($txtUser)
+
+    $lblPass = New-Object System.Windows.Forms.Label
+    $lblPass.Text = "Password:"
+    $lblPass.Left = 20
+    $lblPass.Top = 60
+    $lblPass.Width = 80
+    $form.Controls.Add($lblPass)
+
+    $txtPass = New-Object System.Windows.Forms.TextBox
+    $txtPass.Left = 110
+    $txtPass.Top = 58
+    $txtPass.Width = 200
+    $txtPass.UseSystemPasswordChar = $true
+    $form.Controls.Add($txtPass)
+
+    $btnOK = New-Object System.Windows.Forms.Button
+    $btnOK.Text = "OK"
+    $btnOK.Left = 60
+    $btnOK.Top = 110
+    $btnOK.Width = 80
+    $okHandler = {
+        if ([string]::IsNullOrWhiteSpace($txtUser.Text) -or [string]::IsNullOrWhiteSpace($txtPass.Text)) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Username and password cannot be blank.",
+                $form.Text,
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            return
+        }
+        $form.Tag = @($txtUser.Text, $txtPass.Text)
+        $form.Close()
+    }
+    $btnOK.Add_Click($okHandler)
+    $form.Controls.Add($btnOK)
+
+    # Pressing Enter in password box triggers OK
+    $txtPass.Add_KeyDown({
+        if ($_.KeyCode -eq 'Enter') {
+            $btnOK.PerformClick()
+        }
+    })
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = "Cancel"
+    $btnCancel.Left = 180
+    $btnCancel.Top = 110
+    $btnCancel.Width = 80
+    $btnCancel.Add_Click({ $form.Tag = $null; $form.Close() })
+    $form.Controls.Add($btnCancel)
+
+    [void]$form.ShowDialog()
+    if ($form.Tag -ne $null) {
+        $user = $form.Tag[0]
+        $pass = $form.Tag[1]
+        $secure = ConvertTo-SecureString $pass -AsPlainText -Force
+        return New-Object System.Management.Automation.PSCredential($user, $secure)
+    } else {
+        return $null
+    }
 }
 
 #endregion
 
 #region CLI Interface
-
+function Run-CLI {
+    do {
+        Show-CLI-Menu
+        $choice = Read-Host "Choice (1-9)"
+        switch ($choice) {
+            "1" {
+                $cfg  = Load-Config
+                if (-not $cfg) {
+                    Write-Host "No configuration found. Please run 'Configure Settings' first." -ForegroundColor Yellow
+                    break
+                }
+                $cred = Load-Credential
+                if (-not $cred) {
+                    Write-Host "No saved credentials. Please enter now." -ForegroundColor Yellow
+                    $username = $cfg.Username
+                    $password = Read-Password ("Enter password for $($username): ")
+                    if ($password.Length -gt 0) {
+                        $cred = New-Object System.Management.Automation.PSCredential($username, $password)
+                        Save-Credential -Credential $cred
+                    } else {
+                        Write-Host "No password entered; mapping skipped." -ForegroundColor Yellow
+                        break
+                    }
+                }
+                Map-Share -SharePath   $cfg.SharePath `
+                          -DriveLetter $cfg.DriveLetter `
+                          -Credential  $cred
+            }
+            "2" {
+                $cfg = Load-Config
+                if ($cfg) {
+                    Unmap-Share -DriveLetter $cfg.DriveLetter
+                } else {
+                    Write-Host "No configuration found." -ForegroundColor Yellow
+                }
+            }
+            "3" { Configure-Settings-CLI }
+            "4" { Preferences-CLI }
+            "5" { Update-CredentialsMenu-CLI }
+            "6" { Open-LogFile }
+            "7" {
+                $cfg = Load-Config
+                if ($cfg) {
+                    if (Test-ShareOnline -SharePath $cfg.SharePath) {
+                        Write-Host "Share '$($cfg.SharePath)' is ONLINE." -ForegroundColor Green
+                    } else {
+                        Write-Host "Share '$($cfg.SharePath)' is OFFLINE." -ForegroundColor Yellow
+                    }
+                } else {
+                    Write-Host "No configuration found." -ForegroundColor Yellow
+                }
+            }
+            "8" {
+                Write-Host "Switching to GUI mode..."
+                Start-Process -FilePath "powershell.exe" `
+                    -ArgumentList "-ExecutionPolicy Bypass -STA -File `"$PSCommandPath`" -StartupMode GUI" `
+                    -WindowStyle Normal
+                exit
+            }
+            "9" { exit }
+            default { Write-Host "Invalid." -ForegroundColor Red }
+        }
+        if ($choice -ne "9" -and $choice -ne "8") { Write-Host ""; Pause }
+    } while ($true)
+}
 function Show-CLI-Menu {
     Clear-Host
     Write-Host "==============================" -ForegroundColor Cyan
@@ -732,14 +1020,14 @@ function Configure-Settings-CLI {
     } while ($true)
 
     do {
-        $newDriveLetter = Read-Host "New drive letter (A–Z), or Enter"
+        $newDriveLetter = Read-Host "New drive letter (A-Z), or Enter"
         if ($newDriveLetter -eq "") { break }
         if ($newDriveLetter -match '^[A-Za-z]$') {
             $cfg.DriveLetter = $newDriveLetter.ToUpper()
             break
         }
         else {
-            Write-Host "Enter single letter A–Z, or blank." -ForegroundColor Yellow
+            Write-Host "Enter single letter A-Z, or blank." -ForegroundColor Yellow
         }
     } while ($true)
 
@@ -766,50 +1054,75 @@ function Preferences-CLI {
     if (-not $cfg) { return }
     $prefs = $cfg.Preferences
 
-    Clear-Host
-    Write-Host "=== Preferences v$version ===" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "1. Auto-unmap on drive change: $($prefs.UnmapOldMapping)"
-    Write-Host "2. Preferred startup mode    : $($prefs.PreferredMode)"
-    Write-Host "3. Back"
-    Write-Host ""
-
-    $choice = Read-Host "Select (1-3)"
-    switch ($choice) {
-        "1" {
-            do {
-                $yn = Read-Host "Auto-unmap on letter change? (Y/N)"
-                if ($yn -match '^[YyNn]$') { break }
-                Write-Host "Enter Y or N." -ForegroundColor Yellow
-            } while ($true)
-            $newUnmap = $yn -match '^[Yy]$'
-            Save-Config -SharePath       $cfg.SharePath `
-                        -DriveLetter     $cfg.DriveLetter `
-                        -Username        $cfg.Username `
-                        -UnmapOldMapping $newUnmap `
-                        -PreferredMode   $prefs.PreferredMode
-            Write-Host "Updated." -ForegroundColor Green
-        }
-        "2" {
-            Write-Host "Mode: 1) CLI  2) GUI  3) Prompt"
-            do {
-                $m = Read-Host "Enter 1, 2, or 3"
-                if ($m -match '^[123]$') { break }
-                Write-Host "Enter 1-3." -ForegroundColor Yellow
-            } while ($true)
-            switch ($m) {
-                "1" { $nm = "CLI" }
-                "2" { $nm = "GUI" }
-                "3" { $nm = "Prompt" }
+    while ($true) {
+        Clear-Host
+        Write-Host "=== Preferences v$version ===" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "1. Auto-unmap on drive change: $($prefs.UnmapOldMapping)"
+        Write-Host "2. Preferred startup mode    : $($prefs.PreferredMode)"
+        Write-Host "3. Persistent mapping        : $($prefs.PersistentMapping)"
+        Write-Host "4. Back"
+        Write-Host ""
+        $choice = Read-Host "Select (1-4)"
+        switch ($choice) {
+            "1" {
+                do {
+                    $yn = Read-Host "Auto-unmap on letter change? (Y/N)"
+                    if ($yn -match '^[YyNn]$') { break }
+                    Write-Host "Enter Y or N." -ForegroundColor Yellow
+                } while ($true)
+                $newUnmap = $yn -match '^[Yy]$'
+                Save-Config -SharePath       $cfg.SharePath `
+                            -DriveLetter     $cfg.DriveLetter `
+                            -Username        $cfg.Username `
+                            -UnmapOldMapping $newUnmap `
+                            -PreferredMode   $prefs.PreferredMode `
+                            -PersistentMapping $prefs.PersistentMapping
+                Write-Host "Updated." -ForegroundColor Green
+                $cfg = Load-Config
+                $prefs = $cfg.Preferences
             }
-            Save-Config -SharePath       $cfg.SharePath `
-                        -DriveLetter     $cfg.DriveLetter `
-                        -Username        $cfg.Username `
-                        -UnmapOldMapping $prefs.UnmapOldMapping `
-                        -PreferredMode   $nm
-            Write-Host "Updated." -ForegroundColor Green
+            "2" {
+                Write-Host "Mode: 1) CLI  2) GUI  3) Prompt"
+                do {
+                    $m = Read-Host "Enter 1, 2, or 3"
+                    if ($m -match '^[123]$') { break }
+                    Write-Host "Enter 1-3." -ForegroundColor Yellow
+                } while ($true)
+                switch ($m) {
+                    "1" { $nm = "CLI" }
+                    "2" { $nm = "GUI" }
+                    "3" { $nm = "Prompt" }
+                }
+                Save-Config -SharePath       $cfg.SharePath `
+                            -DriveLetter     $cfg.DriveLetter `
+                            -Username        $cfg.Username `
+                            -UnmapOldMapping $prefs.UnmapOldMapping `
+                            -PreferredMode   $nm `
+                            -PersistentMapping $prefs.PersistentMapping
+                Write-Host "Updated." -ForegroundColor Green
+                $cfg = Load-Config
+                $prefs = $cfg.Preferences
+            }
+            "3" {
+                do {
+                    $yn = Read-Host "Enable persistent mapping (reconnect at logon)? (Y/N)"
+                    if ($yn -match '^[YyNn]$') { break }
+                    Write-Host "Enter Y or N." -ForegroundColor Yellow
+                } while ($true)
+                $newPersist = $yn -match '^[Yy]$'
+                Save-Config -SharePath       $cfg.SharePath `
+                            -DriveLetter     $cfg.DriveLetter `
+                            -Username        $cfg.Username `
+                            -UnmapOldMapping $prefs.UnmapOldMapping `
+                            -PreferredMode   $prefs.PreferredMode `
+                            -PersistentMapping $newPersist
+                Write-Host "Updated." -ForegroundColor Green
+                $cfg = Load-Config
+                $prefs = $cfg.Preferences
+            }
+            default { return }
         }
-        default { return }
     }
 }
 
@@ -844,72 +1157,107 @@ function Update-CredentialsMenu-CLI {
     }
 }
 
-function Run-CLI {
-    do {
-        Show-CLI-Menu
-        $choice = Read-Host "Choice (1-9)"
-        switch ($choice) {
-            "1" {
-                $cfg  = Load-Config
-                if (-not $cfg) {
-                    Write-Host "No configuration found. Please run 'Configure Settings' first." -ForegroundColor Yellow
-                    break
-                }
-                $cred = Load-Credential
-                if (-not $cred) {
-                    Write-Host "No saved credentials. Please enter now." -ForegroundColor Yellow
-                    $username = $cfg.Username
-                    $password = Read-Password ("Enter password for $($username): ")
-                    if ($password.Length -gt 0) {
-                        $cred = New-Object System.Management.Automation.PSCredential($username, $password)
-                        Save-Credential -Credential $cred
-                    }
-                    else {
-                        Write-Host "Credential prompt cancelled; mapping skipped." -ForegroundColor Yellow
-                        break
-                    }
-                }
-                Map-Share -SharePath   $cfg.SharePath `
-                          -DriveLetter $cfg.DriveLetter `
-                          -Credential  $cred
-            }
-            "2" {
-                $cfg = Load-Config
-                if ($cfg) {
-                    Unmap-Share -DriveLetter $cfg.DriveLetter
-                }
-                else {
-                    Write-Host "No configuration found." -ForegroundColor Yellow
-                }
-            }
-            "3" { Configure-Settings-CLI }
-            "4" { Preferences-CLI }
-            "5" { Update-CredentialsMenu-CLI }
-            "6" { Open-LogFile }
-            "7" {
-                $cfg = Load-Config
-                if ($cfg) {
-                    if (Test-ShareOnline -SharePath $cfg.SharePath) {
-                        Write-Host "Share '$($cfg.SharePath)' is ONLINE." -ForegroundColor Green
-                    } else {
-                        Write-Host "Share '$($cfg.SharePath)' is OFFLINE." -ForegroundColor Yellow
-                    }
-                } else {
-                    Write-Host "No configuration found." -ForegroundColor Yellow
-                }
-            }
-            "8" {
-                Write-Host "Switching to GUI mode..."
-                Start-Process -FilePath "powershell.exe" `
-                    -ArgumentList "-ExecutionPolicy Bypass -STA -File `"$PSCommandPath`" -StartupMode GUI" `
-                    -WindowStyle Normal
-                exit
-            }
-            "9" { exit }
-            default { Write-Host "Invalid." -ForegroundColor Red }
+function Install-LogonScript {
+    $startupFolder = Get-StartupFolder
+    $baseFolder = Join-Path $env:APPDATA "Share_Manager"
+    $ps1Path = Join-Path $baseFolder 'Share_Manager_AutoMap.ps1'
+    $cmdPath = Join-Path $startupFolder 'Share_Manager_AutoMap.cmd'
+    $logPath = Join-Path $baseFolder 'LogonScript.log'
+    $cmdLog = Join-Path $baseFolder 'LogonScript_cmd.log'
+    $logonScript = @'
+# Auto-generated by Share Manager
+param()
+$baseFolder = Join-Path $env:APPDATA "Share_Manager"
+$keyPath = Join-Path $baseFolder "key.bin"
+$credentialPath = Join-Path $baseFolder "cred.txt"
+$configPath = Join-Path $baseFolder "config.json"
+$logPath = Join-Path $baseFolder "LogonScript.log"
+function Write-Log($msg) {
+    $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    "$ts`t$msg" | Out-File -FilePath $logPath -Encoding UTF8 -Append
+}
+if (!(Test-Path $configPath) -or !(Test-Path $credentialPath) -or !(Test-Path $keyPath)) { Write-Log "Missing config/cred/key"; return }
+$json = Get-Content -Path $configPath -Raw
+$cfg = $null
+try { $cfg = $json | ConvertFrom-Json } catch { Write-Log "Config parse error"; return }
+if (-not $cfg) { Write-Log "Config null"; return }
+$drive = $cfg.DriveLetter
+$share = $cfg.SharePath
+$user = $cfg.Username
+$aesKey = [System.IO.File]::ReadAllBytes($keyPath)
+$lines = Get-Content -Path $credentialPath -Encoding UTF8
+if ($lines.Count -lt 2) { Write-Log "Cred file invalid"; return }
+$encPW = $lines[1]
+$securePW = $encPW | ConvertTo-SecureString -Key $aesKey
+$plainPW = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePW))
+# Wait for network (up to 30s)
+$tries = 0
+while ($tries -lt 6) {
+    if (Test-Connection -ComputerName ($share -replace '^\\\\([^\\]+)\\.*', '$1') -Count 1 -Quiet -ErrorAction SilentlyContinue) { break }
+    Start-Sleep -Seconds 5
+    $tries++
+}
+# Remove existing mapping
+net use "$drive`:" /delete /y | Out-Null
+# Try mapping up to 3 times
+for ($i=0; $i -lt 3; $i++) {
+    net use "$drive`:" $share /user:$user $plainPW /persistent:yes | Out-Null
+    if ($LASTEXITCODE -eq 0) { Write-Log "Mapped $drive to $share"; break }
+    else { Write-Log "Map attempt $($i+1) failed"; Start-Sleep -Seconds 5 }
+}
+'@
+    $cmdScript = @"
+@echo off
+set SCRIPT=%APPDATA%\Share_Manager\Share_Manager_AutoMap.ps1
+set LOG=%APPDATA%\Share_Manager\LogonScript_cmd.log
+where pwsh >nul 2>nul
+if %errorlevel%==0 (
+    start "" pwsh -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""%SCRIPT%"" >>""%LOG%"" 2>&1
+) else (
+    start "" powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""%SCRIPT%"" >>""%LOG%"" 2>&1
+)
+"@
+    if (-not (Test-Path $baseFolder)) {
+        New-Item -Path $baseFolder -ItemType Directory -Force | Out-Null
+    }
+    Set-Content -Path $ps1Path -Value $logonScript -Encoding UTF8 -Force
+    Set-Content -Path $cmdPath -Value $cmdScript -Encoding ASCII -Force
+    if ($UseGUI) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Persistent mapping enabled. Logon script installed to $cmdPath.",
+            "Share Manager v$version",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        )
+    } else {
+        Write-Host "Persistent mapping enabled. Logon script installed to $cmdPath." -ForegroundColor Green
+    }
+    Log-Action "Logon script installed to $cmdPath and $ps1Path"
+}
+
+function Remove-LogonScript {
+    $startupFolder = Get-StartupFolder
+    $baseFolder = Join-Path $env:APPDATA "Share_Manager"
+    $ps1Path = Join-Path $baseFolder 'Share_Manager_AutoMap.ps1'
+    $cmdPath = Join-Path $startupFolder 'Share_Manager_AutoMap.cmd'
+    $logPath = Join-Path $baseFolder 'LogonScript.log'
+    $removed = $false
+    if (Test-Path $ps1Path) { Remove-Item $ps1Path -Force; $removed = $true }
+    if (Test-Path $cmdPath) { Remove-Item $cmdPath -Force; $removed = $true }
+    if (Test-Path $logPath) { Remove-Item $logPath -Force }
+    if ($removed) {
+        if ($UseGUI) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Persistent mapping removed. Logon script removed from $startupFolder.",
+                "Share Manager v$version",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            )
+        } else {
+            Write-Host "Persistent mapping removed. Logon script removed from $startupFolder." -ForegroundColor Yellow
         }
-        if ($choice -ne "9" -and $choice -ne "8") { Write-Host ""; Pause }
-    } while ($true)
+        Log-Action "Logon script removed from $startupFolder and $ps1Path"
+    }
 }
 
 #endregion
@@ -928,12 +1276,13 @@ function Show-PreferencesForm {
     $prefs = [PSCustomObject]@{
         UnmapOldMapping = [bool]$CurrentPrefs.UnmapOldMapping
         PreferredMode   = $CurrentPrefs.PreferredMode
+        PersistentMapping = if ($CurrentPrefs.PSObject.Properties["PersistentMapping"]) { [bool]$CurrentPrefs.PersistentMapping } else { $false }
     }
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text            = "Preferences v$version"
     $form.Width           = 350
-    $form.Height          = 260
+    $form.Height          = 300
     $form.StartPosition   = "CenterParent"
     $form.FormBorderStyle = "FixedDialog"
     $form.MaximizeBox     = $false
@@ -947,11 +1296,20 @@ function Show-PreferencesForm {
     $chk.Checked  = $prefs.UnmapOldMapping
     $form.Controls.Add($chk)
 
+    # Persistent mapping checkbox
+    $chkPersist = New-Object System.Windows.Forms.CheckBox
+    $chkPersist.Text     = "Map drive persistently (reconnect at logon)"
+    $chkPersist.AutoSize = $true
+    $chkPersist.Top      = 50
+    $chkPersist.Left     = 20
+    $chkPersist.Checked  = $prefs.PersistentMapping
+    $form.Controls.Add($chkPersist)
+
     # Label
     $lbl = New-Object System.Windows.Forms.Label
     $lbl.Text     = "Startup mode:"
     $lbl.AutoSize = $true
-    $lbl.Top      = 60
+    $lbl.Top      = 90
     $lbl.Left     = 20
     $form.Controls.Add($lbl)
 
@@ -959,17 +1317,17 @@ function Show-PreferencesForm {
     $rdoCLI    = New-Object System.Windows.Forms.RadioButton
     $rdoCLI.Text     = "CLI"
     $rdoCLI.AutoSize = $true
-    $rdoCLI.Top      = 90
+    $rdoCLI.Top      = 120
     $rdoCLI.Left     = 40
     $rdoGUI    = New-Object System.Windows.Forms.RadioButton
     $rdoGUI.Text     = "GUI"
     $rdoGUI.AutoSize = $true
-    $rdoGUI.Top      = 120
+    $rdoGUI.Top      = 150
     $rdoGUI.Left     = 40
     $rdoPrompt = New-Object System.Windows.Forms.RadioButton
     $rdoPrompt.Text     = "Prompt"
     $rdoPrompt.AutoSize = $true
-    $rdoPrompt.Top      = 150
+    $rdoPrompt.Top      = 180
     $rdoPrompt.Left     = 40
 
     switch ($prefs.PreferredMode) {
@@ -986,14 +1344,14 @@ function Show-PreferencesForm {
     $btnSave.Text   = "Save"
     $btnSave.Width  = 100
     $btnSave.Height = 30
-    $btnSave.Top    = 190
+    $btnSave.Top    = 220
     $btnSave.Left   = 50
     $btnSave.Add_Click({
-        $prefs.UnmapOldMapping = $chk.Checked
+        $prefs.UnmapOldMapping   = $chk.Checked
+        $prefs.PersistentMapping = $chkPersist.Checked
         if ($rdoCLI.Checked)    { $prefs.PreferredMode = "CLI" }
         elseif ($rdoGUI.Checked) { $prefs.PreferredMode = "GUI" }
         else                     { $prefs.PreferredMode = "Prompt" }
-
         $form.Tag = $prefs
         $form.Close()
     })
@@ -1005,7 +1363,7 @@ function Show-PreferencesForm {
         $btnCancel.Text   = "Cancel"
         $btnCancel.Width  = 100
         $btnCancel.Height = 30
-        $btnCancel.Top    = 190
+        $btnCancel.Top    = 220
         $btnCancel.Left   = 180
         $btnCancel.Add_Click({ $form.Close() })
         $form.Controls.Add($btnCancel)
@@ -1045,10 +1403,16 @@ function Show-GUI {
     
     $prefs = $cfg.Preferences
 
+    # Helper: Check if drive is mapped
+    function Is-DriveMapped($driveLetter) {
+        $drive = "${driveLetter}:"
+        return Test-Path $drive
+    }
+
     $form = New-Object System.Windows.Forms.Form
     $form.Text            = "Share Manager v$version"
     $form.Width           = 400
-    $form.Height          = 560
+    $form.Height          = 610  # Increased for status bar
     $form.StartPosition   = "CenterScreen"
     $form.FormBorderStyle = "FixedDialog"
     $form.MaximizeBox     = $false
@@ -1095,6 +1459,7 @@ function Show-GUI {
         Map-Share -SharePath   $cfg.SharePath `
                   -DriveLetter $cfg.DriveLetter `
                   -Credential  $script:cred
+        Update-StatusAndButtons
     })
     $form.Controls.Add($btnMap)
 
@@ -1107,6 +1472,7 @@ function Show-GUI {
     $btnUnmap.Left   = 180
     $btnUnmap.Add_Click({
         Unmap-Share -DriveLetter $cfg.DriveLetter
+        Update-StatusAndButtons
     })
     $form.Controls.Add($btnUnmap)
 
@@ -1149,7 +1515,7 @@ function Show-GUI {
         $oldDrive = $cfg.DriveLetter
 
         do {
-            $newShare = Show-InputBox -Prompt "Enter share (\\server\share)" `
+            $newShare = Show-InputBox -Prompt "Enter share (\\server\\share)" `
                                       -Title  "Update Share" `
                                       -DefaultValue $cfg.SharePath
             if ($newShare -eq "") { break }
@@ -1168,7 +1534,7 @@ function Show-GUI {
         } while ($true)
 
         do {
-            $newDrive = Show-InputBox -Prompt "Enter drive letter (A–Z)" `
+            $newDrive = Show-InputBox -Prompt "Enter drive letter (A-Z)" `
                                       -Title  "Update Drive Letter" `
                                       -DefaultValue $cfg.DriveLetter
             if ($newDrive -eq "") { break }
@@ -1178,7 +1544,7 @@ function Show-GUI {
             }
             else {
                 [System.Windows.Forms.MessageBox]::Show(
-                    "Invalid letter; try A–Z or Cancel.",
+                    "Invalid letter; try A-Z or Cancel.",
                     "Share Manager v$version",
                     [System.Windows.Forms.MessageBoxButtons]::OK,
                     [System.Windows.Forms.MessageBoxIcon]::Warning
@@ -1229,9 +1595,12 @@ function Show-GUI {
                         -DriveLetter     $cfg.DriveLetter `
                         -Username        $cfg.Username `
                         -UnmapOldMapping $newPrefs.UnmapOldMapping `
-                        -PreferredMode   $newPrefs.PreferredMode
+                        -PreferredMode   $newPrefs.PreferredMode `
+                        -PersistentMapping $newPrefs.PersistentMapping
             $cfg   = Load-Config
             $prefs = $cfg.Preferences
+            Set-Variable -Name prefs -Value $prefs -Scope 1
+            Update-StatusAndButtons
         }
     })
     $form.Controls.Add($btnPrefs)
@@ -1245,7 +1614,7 @@ function Show-GUI {
     $btnCred.Left   = 20
     $btnCred.Add_Click({
         $choice = [System.Windows.Forms.MessageBox]::Show(
-            "Yes → Save/Update.  No → Remove.",
+            "Yes -> Save/Update.  No -> Remove.",
             "Credentials Menu",
             [System.Windows.Forms.MessageBoxButtons]::YesNoCancel,
             [System.Windows.Forms.MessageBoxIcon]::Question
@@ -1313,8 +1682,10 @@ function Show-GUI {
     $btnSwitchCLI.Top    = 420
     $btnSwitchCLI.Left   = 20
     $btnSwitchCLI.Add_Click({
+        $scriptPath = $MyInvocation.MyCommand.Path
+        if (-not $scriptPath) { $scriptPath = $PSCommandPath }
         Start-Process -FilePath "powershell.exe" `
-            -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`" -StartupMode CLI" `
+            -ArgumentList @("-ExecutionPolicy", "Bypass", "-File", $scriptPath, "-StartupMode", "CLI") `
             -WindowStyle Normal
         $form.Close()
     })
@@ -1331,6 +1702,36 @@ function Show-GUI {
         $form.Close()
     })
     $form.Controls.Add($btnExit)
+
+    # Status bar (Label at bottom, original position, less thick)
+    $lblStatus = New-Object System.Windows.Forms.Label
+    $lblStatus.Width  = 370
+    $lblStatus.Height = 18  # Slimmer height
+    $lblStatus.Top    = $form.ClientSize.Height - $lblStatus.Height - 8  # 8px margin from bottom
+    $lblStatus.Left   = 10
+    $lblStatus.Anchor = 'Bottom, Left, Right'
+    $lblStatus.Font   = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Regular)
+    $lblStatus.BorderStyle = 'Fixed3D'
+    $lblStatus.TextAlign = 'MiddleLeft'
+    $lblStatus.BackColor = [System.Drawing.Color]::FromArgb(245,245,245)
+    $lblStatus.ForeColor = [System.Drawing.Color]::FromArgb(30,30,30)
+    $form.Controls.Add($lblStatus)
+
+    # Helper: Update status and button states
+    function Update-StatusAndButtons {
+        $mapped = Is-DriveMapped $cfg.DriveLetter
+        if ($mapped) {
+            $lblStatus.Text = "Status: Drive $($cfg.DriveLetter): mapped to $($cfg.SharePath)"
+            $btnMap.Enabled = $false
+            $btnUnmap.Enabled = $true
+        } else {
+            $lblStatus.Text = "Status: Drive $($cfg.DriveLetter): not mapped."
+            $btnMap.Enabled = $true
+            $btnUnmap.Enabled = $false
+        }
+    }
+
+    Update-StatusAndButtons
 
     [void]$form.ShowDialog()
 }

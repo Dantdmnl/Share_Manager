@@ -15,6 +15,8 @@ Easily manage and map network shares using this PowerShell script with support f
 - **Log file for troubleshooting** and activity tracking.
 - **Setup wizard** for first-time use.
 - **No administrator permissions required.**
+- **Option for persistent mapping (reconnect at logon).**
+- **Status indicator in GUI mode to check if the share is mounted.**
 
 ## Prerequisites
 - Windows OS with PowerShell 5.1 or higher.
