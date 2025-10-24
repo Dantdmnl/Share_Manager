@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [2.0.2] - 2025-10-24
+
+### Added
+- Smart defaults for Y/N prompts throughout CLI to improve workflow efficiency:
+  - Credential save prompts default to `[Y]` (save by default)
+  - Connection prompts default to `[Y]` (connect after adding/configuring)
+  - Auto-unmap preference defaults to `[Y]` (recommended setting)
+  - Persistent mapping defaults to `[N]` (conservative/safe default)
+  - Reconnect All defaults to `[Y]` (typical action)
+  - Disconnect All defaults to `[N]` (safety measure)
+- Enhanced visual feedback with summary counters in status displays
+- Contextual tip displayed on main menu when no shares are configured
+
+### Improved
+- Menu navigation: Preferences option 4 now returns directly to main menu
+- Batch operation feedback: clearer result messages ("reconnected" vs "reset", "already connected" vs "skipped")
+- Consistent "Press any key to continue..." prompts across all operations
+- Visual separators and formatting for better readability in CLI
+- Menu labels improved: "Backup/Restore" and "View Log" for clarity
+
+### Fixed
+- Eliminated duplicate "Press any key..." prompts after batch operations
+- Status display now shows proper summary line with connected/total counts
+
 ## [2.0.1] - 2025-10-24
 
 ### Fixed

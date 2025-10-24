@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Share Manager Script (v2.0.0) - Manage multiple network shares via CLI or GUI,
+    Share Manager Script - Manage multiple network shares via CLI or GUI,
     with robust credential persistence using Windows DPAPI (per-user, per-machine).
 
 .DESCRIPTION
@@ -22,7 +22,7 @@
     Optional. Pass "CLI" or "GUI" to force that mode on launch, bypassing saved preference.
 
 .VERSION
-    2.0.1
+    2.0.2
 
 .NOTES
     - No administrator permissions are required.
@@ -36,7 +36,7 @@ param(
 
 #region Global Variables (Version, Paths, Defaults)
 
-$version        = '2.0.1'
+$version        = '2.0.2'
 $author         = 'Dantdmnl'
 $baseFolder     = Join-Path $env:APPDATA "Share_Manager"
 if (-not (Test-Path $baseFolder)) {
@@ -816,8 +816,9 @@ function Save-Credential {
         # Persist JSON
         $store | ConvertTo-Json -Depth 5 | Set-Content -Path $credentialsStorePath -Encoding UTF8 -Force
 
+        # Silent in GUI (caller handles messaging), verbose in CLI
         if (-not $UseGUI) {
-            Write-Host "Credentials saved securely for $user" -ForegroundColor Green
+            Write-Host "  [OK] Credentials saved for $user" -ForegroundColor Green
         }
         Write-ActionLog "Saved credential for $user"
     }
@@ -945,6 +946,18 @@ function Import-CredentialStore {
     return [PSCustomObject]@{ Entries = @() }
 }
 
+function Get-AllCredentials {
+    <#
+    .SYNOPSIS
+        Gets all stored credentials (usernames only, no passwords)
+    #>
+    $store = Import-CredentialStore
+    if ($store -and $store.Entries) {
+        return @($store.Entries | Select-Object Username)
+    }
+    return @()
+}
+
 function Remove-Credential {
     param([string]$Username)
 
@@ -1004,9 +1017,7 @@ function Remove-Credential {
                 [System.Windows.Forms.MessageBoxIcon]::Information
             )
         }
-        else {
-            Write-Host "Credentials removed." -ForegroundColor Yellow
-        }
+        # CLI callers handle their own success messaging
         Write-ActionLog "Removed stored credentials"
     }
     else {
@@ -1018,9 +1029,7 @@ function Remove-Credential {
                 [System.Windows.Forms.MessageBoxIcon]::Information
             )
         }
-        else {
-            Write-Host "No credentials to remove." -ForegroundColor Yellow
-        }
+        # CLI callers handle their own messaging
         Write-ActionLog "No credentials to remove"
     }
 }
@@ -1658,7 +1667,7 @@ function Start-CliMode {
         }
         
         # Only pause for actions that need it (skip for actions with their own pause)
-        if ($choice -notin @("Q", "G", "3", "B") + $autoContinue) { 
+        if ($choice -notin @("Q", "G", "3", "B", "P", "D", "C", "N") + $autoContinue) { 
             Write-Host ""
             Write-Host "  Press any key..." -ForegroundColor DarkGray
             $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
@@ -1732,9 +1741,9 @@ function Show-ManageSharesMenu {
                     $password = Read-Password "  Password: "
                     if ($password.Length -gt 0) {
                         $cred = New-Object System.Management.Automation.PSCredential($share.Username, $password)
-                        Write-Host "  Save credentials? (Y/N): " -NoNewline
+                        Write-Host "  Save credentials? (Y/N) [Y]: " -NoNewline
                         $saveIt = Read-Host
-                        if ($saveIt -match '^[Yy]$') {
+                        if ($saveIt -eq "" -or $saveIt -match '^[Yy]$') {
                             Save-Credential -Credential $cred
                         }
                     }
@@ -1966,10 +1975,10 @@ function Add-NewShareCli {
             # No credentials exist - prompt to save them
             Write-Host "  No credentials found for user: " -NoNewline -ForegroundColor Yellow
             Write-Host "$username" -ForegroundColor White
-            Write-Host "  Would you like to save credentials now? (Y/N) " -ForegroundColor Yellow -NoNewline
+            Write-Host "  Would you like to save credentials now? (Y/N) [Y]: " -ForegroundColor Yellow -NoNewline
             $saveCreds = Read-Host
             
-            if ($saveCreds -match '^[Yy]$') {
+            if ($saveCreds -eq "" -or $saveCreds -match '^[Yy]$') {
                 $password = Read-Password "  Enter password: "
                 if ($password.Length -gt 0) {
                     $credential = New-Object System.Management.Automation.PSCredential($username, $password)
@@ -1985,10 +1994,10 @@ function Add-NewShareCli {
         
         # Ask if user wants to connect now
         Write-Host ""
-        Write-Host "  Connect now? (Y/N) " -ForegroundColor Yellow -NoNewline
+        Write-Host "  Connect now? (Y/N) [Y]: " -ForegroundColor Yellow -NoNewline
         $connectNow = Read-Host
         
-        if ($connectNow -match '^[Yy]$') {
+        if ($connectNow -eq "" -or $connectNow -match '^[Yy]$') {
             Write-Host ""
             
             # If still no credential, prompt one more time
@@ -2122,9 +2131,9 @@ function Connect-ShareCli {
             if ($password.Length -gt 0) {
                 $cred = New-Object System.Management.Automation.PSCredential($share.Username, $password)
                 
-                Write-Host "  Save these credentials? (Y/N): " -NoNewline
+                Write-Host "  Save these credentials? (Y/N) [Y]: " -NoNewline
                 $save = Read-Host
-                if ($save -match '^[Yy]$') {
+                if ($save -eq "" -or $save -match '^[Yy]$') {
                     Save-Credential -Credential $cred
                 }
             } else {
@@ -2249,11 +2258,12 @@ function Connect-AllSharesCli {
     }
     if ($skipped -gt 0) {
         Write-Host ", " -NoNewline
-        Write-Host "$skipped skipped" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$skipped already connected" -NoNewline -ForegroundColor DarkGray
     }
     Write-Host ""
+    Write-Host "  ------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "  Press any key..." -ForegroundColor DarkGray
+    Write-Host "  Press any key to continue..." -ForegroundColor DarkGray
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
 }
 
@@ -2276,14 +2286,14 @@ function Reset-AllSharesCli {
         return
     }
     
-        Write-Host "  This will disconnect and reset " -NoNewline -ForegroundColor Yellow
+        Write-Host "  This will disconnect and reconnect " -NoNewline -ForegroundColor Yellow
     Write-Host "$($shares.Count)" -NoNewline -ForegroundColor White
     Write-Host " share(s)." -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "  Continue? (Y/N): " -NoNewline
+    Write-Host "  Continue? (Y/N) [Y]: " -NoNewline
     $confirm = Read-Host
     
-    if ($confirm -notmatch '^[Yy]$') {
+    if ($confirm -ne "" -and $confirm -notmatch '^[Yy]$') {
         Write-Host "  Cancelled" -ForegroundColor Gray
         return
     }
@@ -2344,14 +2354,15 @@ function Reset-AllSharesCli {
     Write-Host ""
     Write-Host "  ------------------------------------------" -ForegroundColor DarkGray
     Write-Host "  Results: " -NoNewline
-        Write-Host "$success reset" -NoNewline -ForegroundColor Green
+    Write-Host "$success reconnected" -NoNewline -ForegroundColor Green
     if ($failed -gt 0) {
         Write-Host ", " -NoNewline
-        Write-Host "$failed failed" -ForegroundColor Red
+        Write-Host "$failed failed" -NoNewline -ForegroundColor Red
     }
     Write-Host ""
+    Write-Host "  ------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "  Press any key..." -ForegroundColor DarkGray
+    Write-Host "  Press any key to continue..." -ForegroundColor DarkGray
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
 }
 
@@ -2380,7 +2391,7 @@ function Disconnect-AllSharesCli {
     Write-Host "$($connected.Count)" -NoNewline -ForegroundColor White
     Write-Host " share(s)." -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "  Are you sure? (Y/N): " -NoNewline
+    Write-Host "  Are you sure? (Y/N) [N]: " -NoNewline
     $confirm = Read-Host
     
     if ($confirm -notmatch '^[Yy]$') {
@@ -2404,9 +2415,9 @@ function Disconnect-AllSharesCli {
     Write-Host "  Disconnected " -NoNewline
     Write-Host "$disconnected" -NoNewline -ForegroundColor Yellow
     Write-Host " share(s)" -ForegroundColor Gray
+    Write-Host "  ------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host ""
-    Write-Host "  Press any key..." -ForegroundColor DarkGray
+    Write-Host "  Press any key to continue..." -ForegroundColor DarkGray
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
 }
 
@@ -2422,11 +2433,14 @@ function Show-ShareStatusCli {
     }
     
     Write-Host ""
+    $connectedCount = 0
     foreach ($share in $shares) {
         $status = Get-DetailedShareStatus -ShareId $share.Id
         
         $icon = if ($status.IsConnected) { "[*]" } else { "[ ]" }
         $iconColor = if ($status.IsConnected) { "Green" } else { "Red" }
+        
+        if ($status.IsConnected) { $connectedCount++ }
         
         Write-Host "  $icon " -NoNewline -ForegroundColor $iconColor
         Write-Host "$($share.Name) " -ForegroundColor White -NoNewline
@@ -2443,6 +2457,15 @@ function Show-ShareStatusCli {
         }
         Write-Host "      $($share.SharePath)" -ForegroundColor DarkGray
     }
+    
+    Write-Host ""
+    Write-Host "  " -NoNewline
+    Write-Host "─" -NoNewline -ForegroundColor DarkGray
+    for ($i = 0; $i -lt 40; $i++) { Write-Host "─" -NoNewline -ForegroundColor DarkGray }
+    Write-Host ""
+    Write-Host "  Summary: " -NoNewline -ForegroundColor Gray
+    Write-Host "$connectedCount/$($shares.Count)" -NoNewline -ForegroundColor $(if ($connectedCount -eq $shares.Count) { "Green" } elseif ($connectedCount -eq 0) { "Red" } else { "Yellow" })
+    Write-Host " shares connected" -ForegroundColor Gray
 }
 
 function Import-ExportConfigCli {
@@ -2621,6 +2644,10 @@ function Show-CLI-Menu {
     if ($total -eq 0) {
         Write-Host "  1" -NoNewline -ForegroundColor White
         Write-Host " - Add Your First Share" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "  " -NoNewline
+        Write-Host "💡 Tip: " -NoNewline -ForegroundColor Yellow
+        Write-Host "Start by adding a network share to get started!" -ForegroundColor DarkGray
     } else {
         $disconnected = $total - $connected
         
@@ -2665,10 +2692,10 @@ function Show-CLI-Menu {
     Write-Host "K" -NoNewline -ForegroundColor White
     Write-Host " - Credentials  " -NoNewline -ForegroundColor Gray
     Write-Host "B" -NoNewline -ForegroundColor White
-    Write-Host " - Backup" -ForegroundColor Gray
+    Write-Host " - Backup/Restore" -ForegroundColor Gray
     
     Write-Host "  L" -NoNewline -ForegroundColor White
-    Write-Host " - Log File     " -NoNewline -ForegroundColor Gray
+    Write-Host " - View Log     " -NoNewline -ForegroundColor Gray
     Write-Host "G" -NoNewline -ForegroundColor Cyan
     Write-Host " - GUI Mode     " -NoNewline -ForegroundColor Gray
     Write-Host "Q" -NoNewline -ForegroundColor Red
@@ -2757,11 +2784,11 @@ function Set-CliPreferences {
         switch ($choice) {
             "1" {
                 do {
-                    $yn = Read-Host "Auto-unmap on letter change? (Y/N)"
-                    if ($yn -match '^[YyNn]$') { break }
+                    $yn = Read-Host "Auto-unmap on letter change? (Y/N) [Y]"
+                    if ($yn -eq "" -or $yn -match '^[YyNn]$') { break }
                     Write-Host "Enter Y or N." -ForegroundColor Yellow
                 } while ($true)
-                $config.Preferences.UnmapOldMapping = $yn -match '^[Yy]$'
+                $config.Preferences.UnmapOldMapping = ($yn -eq "" -or $yn -match '^[Yy]$')
                 Save-AllShares -Config $config | Out-Null
                 Write-Host "Updated." -ForegroundColor Green
                 $prefs = $config.Preferences
@@ -2784,15 +2811,16 @@ function Set-CliPreferences {
             }
             "3" {
                 do {
-                    $yn = Read-Host "Enable persistent mapping (reconnect at logon)? (Y/N)"
-                    if ($yn -match '^[YyNn]$') { break }
+                    $yn = Read-Host "Enable persistent mapping (reconnect at logon)? (Y/N) [N]"
+                    if ($yn -eq "" -or $yn -match '^[YyNn]$') { break }
                     Write-Host "Enter Y or N." -ForegroundColor Yellow
                 } while ($true)
-                $config.Preferences.PersistentMapping = $yn -match '^[Yy]$'
+                $config.Preferences.PersistentMapping = ($yn -match '^[Yy]$')
                 Save-AllShares -Config $config | Out-Null
                 Write-Host "Updated." -ForegroundColor Green
                 $prefs = $config.Preferences
             }
+            "4" { return }
             default { return }
         }
     }
@@ -2818,10 +2846,9 @@ function Update-CliCredentialsMenu {
             if ($password.Length -gt 0) {
                 $cred = New-Object System.Management.Automation.PSCredential($username, $password)
                 Save-Credential -Credential $cred
-                Write-Host "Credential saved for user: $username" -ForegroundColor Green
             }
             else {
-                Write-Host "Credential prompt cancelled; nothing saved." -ForegroundColor Yellow
+                Write-Host "  Password prompt cancelled." -ForegroundColor Yellow
             }
         }
         "2" {
@@ -2855,9 +2882,9 @@ function Update-CliCredentialsMenu {
             if ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le $creds.Count) {
                 $username = $creds[[int]$choice - 1].Username
                 Remove-Credential -Username $username
-                Write-Host "Credential removed for user: $username" -ForegroundColor Green
+                Write-Host "  [OK] Removed credential for: $username" -ForegroundColor Green
             } else {
-                Write-Host "Invalid selection." -ForegroundColor Yellow
+                Write-Host "  Invalid selection." -ForegroundColor Yellow
             }
         }
         default { return }
