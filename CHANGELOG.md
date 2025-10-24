@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [2.0.1] - 2025-10-24
+
+### Fixed
+- Manage Shares menu: numeric selection and Edit/Remove lists now work reliably when only one share exists.
+- Ensured all CLI share lists are treated as arrays to avoid null `.Count` on single-item results.
+- Minor robustness improvements for CLI flows across different PowerShell environments.
+
+### Housekeeping
+- Bumped version to 2.0.1.
+
 ## [2.0.0] - 2025-10-24
 
 Major upgrade from the 1.x line (e.g., v1.1.2 in `Old_Share_Manager.ps1`) to a modern, multi-share architecture with stronger security and improved UX.

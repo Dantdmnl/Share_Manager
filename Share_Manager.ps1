@@ -22,7 +22,7 @@
     Optional. Pass "CLI" or "GUI" to force that mode on launch, bypassing saved preference.
 
 .VERSION
-    2.0.0
+    2.0.1
 
 .NOTES
     - No administrator permissions are required.
@@ -36,7 +36,7 @@ param(
 
 #region Global Variables (Version, Paths, Defaults)
 
-$version        = '2.0.0'
+$version        = '2.0.1'
 $author         = 'Dantdmnl'
 $baseFolder     = Join-Path $env:APPDATA "Share_Manager"
 if (-not (Test-Path $baseFolder)) {
@@ -369,10 +369,12 @@ function Get-ShareConfiguration {
     $config = Import-AllShares
     
     if ($ShareId) {
-        return $config.Shares | Where-Object { $_.Id -eq $ShareId }
+        # When a specific ID is requested, return the single matching object
+        return ($config.Shares | Where-Object { $_.Id -eq $ShareId })
     }
     
-    return $config.Shares
+    # Always return an array when no ShareId is provided to avoid .Count/$index issues
+    return @($config.Shares)
 }
 
 function Test-ShareConnection {
@@ -1578,7 +1580,7 @@ function Start-CliMode {
             # Quick Actions
             "C" { 
                 # Check if any shares are disconnected
-                $shares = Get-ShareConfiguration | Where-Object { $_.Enabled }
+                $shares = @(Get-ShareConfiguration | Where-Object { $_.Enabled })
                 $hasDisconnected = $false
                 foreach ($share in $shares) {
                     if (-not (Test-ShareConnection -DriveLetter $share.DriveLetter)) {
@@ -1612,7 +1614,7 @@ function Start-CliMode {
             }
             "N" { 
                 # Check if any shares are connected or can be connected
-                $shares = Get-ShareConfiguration | Where-Object { $_.Enabled }
+                $shares = @(Get-ShareConfiguration | Where-Object { $_.Enabled })
                 if ($shares.Count -gt 0) {
                         Reset-AllSharesCli
                 } else {
@@ -1674,7 +1676,7 @@ function Show-ManageSharesMenu {
         Write-Host ""
         Write-Host "  ======[ MANAGE SHARES ]======" -ForegroundColor Cyan
         
-        $shares = Get-ShareConfiguration
+    $shares = @(Get-ShareConfiguration)
         
         if ($shares.Count -eq 0) {
             Write-Host "  No shares configured." -ForegroundColor Yellow
@@ -1779,7 +1781,7 @@ function Edit-ShareCli {
     Write-Host "  ======[ EDIT SHARE ]======" -ForegroundColor Cyan
     Write-Host ""
     
-    $shares = Get-ShareConfiguration
+    $shares = @(Get-ShareConfiguration)
     if ($shares.Count -eq 0) {
         Write-Host "  No shares to edit" -ForegroundColor Yellow
         return
@@ -1848,7 +1850,7 @@ function Show-AllSharesCli {
     Write-Host ""
     Write-Host "  ======[ ALL SHARES ]======" -ForegroundColor Cyan
     
-    $shares = Get-ShareConfiguration
+    $shares = @(Get-ShareConfiguration)
     
     if ($shares.Count -eq 0) {
         Write-Host "  No shares configured. Use option 1 to add." -ForegroundColor Yellow
@@ -2027,7 +2029,7 @@ function Remove-ShareCli {
     Write-Host "  ======[ REMOVE SHARE ]======" -ForegroundColor Cyan
     Write-Host ""
     
-    $shares = Get-ShareConfiguration
+    $shares = @(Get-ShareConfiguration)
     if ($shares.Count -eq 0) {
         Write-Host "  No shares configured." -ForegroundColor Yellow
         return
@@ -2081,14 +2083,14 @@ function Connect-ShareCli {
     Write-Host "  ======[ CONNECT SHARE ]======" -ForegroundColor Cyan
     Write-Host ""
     
-    $shares = Get-ShareConfiguration | Where-Object { $_.Enabled }
+    $shares = @(Get-ShareConfiguration | Where-Object { $_.Enabled })
     if ($shares.Count -eq 0) {
         Write-Host "  No enabled shares configured." -ForegroundColor Yellow
         return
     }
     
     # Show only disconnected shares
-    $disconnected = $shares | Where-Object { -not (Test-ShareConnection -DriveLetter $_.DriveLetter) }
+    $disconnected = @($shares | Where-Object { -not (Test-ShareConnection -DriveLetter $_.DriveLetter) })
     if ($disconnected.Count -eq 0) {
         Write-Host "  [OK] All enabled shares are already connected!" -ForegroundColor Green
         return
@@ -2150,7 +2152,7 @@ function Disconnect-ShareCli {
     Write-Host ""
     
     $shares = Get-ShareConfiguration
-    $connected = $shares | Where-Object { Test-ShareConnection -DriveLetter $_.DriveLetter }
+    $connected = @($shares | Where-Object { Test-ShareConnection -DriveLetter $_.DriveLetter })
     
     if ($connected.Count -eq 0) {
         Write-Host "  No shares are currently connected." -ForegroundColor Yellow
@@ -2183,7 +2185,7 @@ function Connect-AllSharesCli {
     Write-Host "  ======[ CONNECT ALL ]======" -ForegroundColor Cyan
     Write-Host ""
     
-    $shares = Get-ShareConfiguration | Where-Object { $_.Enabled }
+    $shares = @(Get-ShareConfiguration | Where-Object { $_.Enabled })
     if ($shares.Count -eq 0) {
         Write-Host "  No enabled shares configured." -ForegroundColor Yellow
         return
@@ -2265,7 +2267,7 @@ function Reset-AllSharesCli {
     Write-Host "  ======[ RECONNECT ALL SHARES ]======" -ForegroundColor Cyan
     Write-Host ""
     
-    $shares = Get-ShareConfiguration | Where-Object { $_.Enabled }
+    $shares = @(Get-ShareConfiguration | Where-Object { $_.Enabled })
     if ($shares.Count -eq 0) {
         Write-Host "  No enabled shares configured." -ForegroundColor Yellow
         Write-Host ""
@@ -2413,7 +2415,7 @@ function Show-ShareStatusCli {
     Write-Host ""
     Write-Host "  ======[ STATUS ]======" -ForegroundColor Cyan
     
-    $shares = Get-ShareConfiguration
+    $shares = @(Get-ShareConfiguration)
     if ($shares.Count -eq 0) {
         Write-Host "  No shares configured." -ForegroundColor Yellow
         return
