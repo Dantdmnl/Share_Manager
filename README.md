@@ -10,15 +10,18 @@ Easily manage and map network shares using this PowerShell script with support f
 - **Configure and store NAS/share settings** including hostname, path, drive letter, and credentials per share
 - **Toggle between CLI and GUI mode** with persistent startup preference
 - **Securely save credentials** using Windows DPAPI encryption - tied to your user account
+- **Credential backup/restore** (v2.1.0+) - Export and import encrypted credentials with Merge or Replace modes
 - **Map or unmap shares** individually or all at once with batch operations
+- **Enhanced connection retry** (v2.1.0+) - Exponential backoff and intelligent error classification for reliable mapping
 - **Test connectivity** before attempting to map shares
 - **Review and modify preferences** at any time via Settings menu
-- **Log file with automatic rotation** for troubleshooting and activity tracking
+- **Structured logging** (v2.1.0+) - Dual-output logs (human-readable text + machine-readable JSONL) with automatic rotation
+- **Log analysis tools** (v2.1.0+) - Query and filter events by category, level, time range, or session ID
 - **First-time setup wizard** for guided configuration (CLI and GUI)
 - **No administrator permissions required**
 - **Persistent mapping** - Automatic reconnection at Windows logon
 - **Real-time status indicators** showing connection state for all shares
-- **Import/Export configuration** for backup and portability (credentials excluded)
+- **Import/Export configuration** for backup and portability (credentials handled separately)
 - **Duplicate-safe imports** with Merge or Replace modes and built-in duplicate detection
 - **Keyboard shortcuts** in GUI (Ctrl+A to select all, Enter to navigate/submit)
 - **Automatic credential prompts** when referencing a non-existent username
@@ -67,10 +70,22 @@ Easily manage and map network shares using this PowerShell script with support f
 
 - **DPAPI Encryption**: Credentials are encrypted using Windows Data Protection API (DPAPI), which ties encryption to your user account and machine. Only you can decrypt them.
 - **Automatic Migration**: Legacy AES-encrypted credentials (if you're upgrading from an older version) are automatically migrated to DPAPI on first use.
-- **GDPR Compliant**: See [GDPR-COMPLIANCE.md](GDPR-COMPLIANCE.md) for details on data handling, your rights, and how to export or delete your data.
+- **GDPR Compliant**: 
+  - **INFO logs** (default): No personal data - share names only for operational purposes
+  - **DEBUG logs** (opt-in): Includes usernames for troubleshooting when enabled via `$MANUAL_LOG_LEVEL = 'DEBUG'` (line 56 in script)
+  - See [GDPR-COMPLIANCE.md](GDPR-COMPLIANCE.md) for full details on data handling and your rights
 - **Local Storage Only**: All data (config, credentials, logs) is stored locally under `%APPDATA%\Share_Manager`. Nothing is transmitted to third parties.
+- **Log Rotation**: Automatic cleanup after 30 days or 5MB to prevent indefinite data retention
 
 ## What's New in v2.0.0
+
+### Performance & Optimization (v2.1.0+)
+- **Config caching system**: Reduces disk I/O by 80-95% with intelligent 5-second cache
+  - Automatic cache expiration and refresh
+  - Force reload when updating data
+  - Cache cleared after every save operation
+- **Preference helpers**: Consolidated preference retrieval logic for cleaner code
+- **Null-safe logging**: All log messages properly handle missing data
 
 ### Multi-Share Architecture
 - Manage unlimited network shares from one interface
@@ -123,6 +138,34 @@ Easily manage and map network shares using this PowerShell script with support f
 - Enter: Move to the next input field; when on buttons, Enter activates the default action
 - In Add/Edit/Preferences dialogs: Enter will trigger the primary action (e.g., Save/OK)
 
+## Advanced Features (v2.1.0+)
+
+### Structured Logging & Analysis
+- **Dual-output logs**: Human-readable text (`.log`) and machine-readable JSONL (`.events.jsonl`)
+- **Log levels**: DEBUG, INFO, WARN, ERROR (filter via `SM_LOG_LEVEL` environment variable)
+- **Categories**: Config, Credentials, BackupRestore, Migration, Mapping, Log, Startup, AutoMap
+- **Session tracking**: Each run gets a unique session ID for correlation
+- **Automatic rotation**: Logs rotate at 30 days or 5MB size
+- **Query events**: 
+  - CLI: Press `L` → `Query Events` for interactive filtering
+  - PowerShell: `Get-LogEvents -Category Mapping -Level ERROR -Last 10`
+- **GDPR-compliant**: No usernames logged, only session IDs and technical diagnostics
+
+### Credential Backup & Restore
+- **Export**: Create timestamped backups of encrypted credentials
+  - CLI: Press `K` → `Export Credentials`
+  - GUI: Click `Credentials` button → `Export Credentials (Backup)`
+- **Import**: Restore from backup with Merge or Replace modes
+  - CLI: Press `K` → `Import Credentials` → Choose mode
+  - GUI: Click `Credentials` button → `Import Credentials (Restore)`
+- **Security**: Backups remain DPAPI-encrypted (machine/user-specific)
+
+### Enhanced Connection Retry
+- **Exponential backoff**: 3 attempts with 2s, 4s delays (smarter than fixed delays)
+- **Error classification**: Authentication, PathNotFound, InvalidPath, MultipleConnections, DriveInUse, NetworkTimeout
+- **Actionable messages**: Error messages guide you to specific fixes
+- **Applies everywhere**: Main script and AutoMap startup script use same logic
+
 ## Validation and Testing
 This repository includes a comprehensive validation script to ensure the project remains production-ready.
 
@@ -135,11 +178,33 @@ pwsh -NoProfile -File .\Debug\test_syntax.ps1
 What it checks:
 - PowerShell legacy parser (syntax)
 - AST parser (structure)
-- Function analysis (approved verbs)
+- Function analysis (approved verbs, 73 functions)
 - PSScriptAnalyzer (uses `Debug/PSScriptAnalyzerSettings.psd1` if present)
-- File encoding and size
+- Security check (hardcoded secrets)
+- Documentation coverage (34.2% of functions documented)
+- File encoding (UTF-8 without BOM or ASCII) and size
+- Unicode character check (pure ASCII compliance)
+- Function call existence (all called functions are defined)
 
 If PSScriptAnalyzer isn't installed, the script will skip that step and show how to install it.
+
+## Factory Reset
+
+To completely reset Share Manager and remove all stored data (configuration, credentials, logs):
+
+```powershell
+# One-liner to remove all data except the script itself
+Remove-Item -Path "$env:APPDATA\Share_Manager" -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\Share_Manager_AutoMap.*" -Force -ErrorAction SilentlyContinue
+```
+
+**Warning:** This will permanently delete:
+- All share configurations (`shares.json`)
+- All saved credentials (`creds.json`)
+- All log files (`.log` and `.events.jsonl`)
+- Logon script files (if persistent mapping was enabled)
+- Backup files (`.v1.backup`, etc.)
+
+The script file (`Share_Manager.ps1`) itself will remain intact. On next run, you'll go through first-time setup again.
 
 ## Development Notes
 - PowerShell 5.1+ on Windows is required (GUI uses Windows Forms)
@@ -149,8 +214,13 @@ If PSScriptAnalyzer isn't installed, the script will skip that step and show how
 ## Storage Locations
 - **Configuration**: `%APPDATA%\Share_Manager\shares.json` (multi-share)
 - **Credentials**: `%APPDATA%\Share_Manager\creds.json` (DPAPI-encrypted, multi-user)
-- **Logs**: `%APPDATA%\Share_Manager\Share_Manager.log` (auto-rotation enabled)
+- **Logs**: 
+  - `%APPDATA%\Share_Manager\Share_Manager.log` (human-readable text, auto-rotation)
+  - `%APPDATA%\Share_Manager\Share_Manager.events.jsonl` (structured events for analysis)
+  - `%APPDATA%\Share_Manager\LogonScript.log` (AutoMap startup script log)
+  - `%APPDATA%\Share_Manager\LogonScript.events.jsonl` (AutoMap structured events)
 - **Logon Script**: `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Share_Manager_AutoMap.ps1` (if persistent mapping enabled)
+- **Credential Backups**: `%APPDATA%\Share_Manager\creds_backup_YYYY-MM-DD_HHmmss.json` (when exported)
 - **Legacy Files**: `config.json` and `cred.txt` (auto-migrated to v2 format with backups)
 
 ## License

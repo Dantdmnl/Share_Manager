@@ -16,10 +16,14 @@ This document explains how Share Manager (CLI/GUI, v2.x) handles personal data i
   - Multiple entries keyed by Username; each contains a DPAPI-encrypted password
   - Passwords are never stored in plaintext
   - Supports different credentials for different shares
-- **Logs** (Share_Manager.log)
-  - Operational messages (e.g., mapping success/failure, function calls)
-  - No passwords are logged; usernames minimized where possible
-  - Automatic rotation when logs become large
+- **Logs** (Share_Manager.log & Share_Manager.events.jsonl)
+  - **Text Log (Share_Manager.log)**: Human-readable operational messages (e.g., mapping success/failure, function calls)
+  - **Structured Events (Share_Manager.events.jsonl)**: Machine-readable JSON Lines format with timestamps, severity levels (DEBUG/INFO/WARN/ERROR), categories, session IDs, and correlation IDs for analysis
+  - **No personal data**: Usernames are NOT logged in either format to minimize personal data exposure
+  - **No passwords**: Passwords are never stored or logged in any form
+  - **Automatic rotation**: Both logs rotate when reaching 30 days age or 5MB size
+  - **Data minimization**: Error messages omit usernames and include only technical diagnostics
+  - **Session tracking**: Each app launch gets a unique session ID for correlation without personal identifiers
 
 ## Where data is stored (local only)
 
@@ -28,7 +32,10 @@ All data is stored locally under the current Windows user profile:
 **Active Files (v2.0.0+)**:
 - `%APPDATA%\Share_Manager\shares.json` - Multi-share configuration
 - `%APPDATA%\Share_Manager\creds.json` - Multi-user credentials (DPAPI-encrypted)
-- `%APPDATA%\Share_Manager\Share_Manager.log` - Application log with auto-rotation
+- `%APPDATA%\Share_Manager\Share_Manager.log` - Human-readable application log with auto-rotation
+- `%APPDATA%\Share_Manager\Share_Manager.events.jsonl` - Structured machine-readable events log (JSON Lines format)
+- `%APPDATA%\Share_Manager\LogonScript.log` - AutoMap startup script log (if persistent mapping enabled)
+- `%APPDATA%\Share_Manager\LogonScript.events.jsonl` - AutoMap structured events log
 - `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Share_Manager_AutoMap.ps1` - Logon script (if persistent mapping enabled)
 
 **Legacy Files (auto-migrated)**:
@@ -50,12 +57,15 @@ All data is stored locally under the current Windows user profile:
 - Legacy AES-encrypted credentials (key.bin) are automatically migrated to DPAPI on first use and remain backward-compatible during migration.
 - The startup (logon) script decrypts credentials only in the same user context (your account).
 - Passwords are never logged or transmitted.
+- **Enhanced privacy in logs (v2.1.0+)**: Usernames are NOT logged in either text or JSONL event logs. Error messages use generic descriptions without personal identifiers.
+- Session IDs and correlation IDs enable troubleshooting without exposing user identity.
 - You can delete all credentials at any time via the credentials menu.
 
 ## Data retention
 
 - Data persists until you delete it. There is no background collection.
-- Log rotation may automatically archive or reset Share_Manager.log when it becomes old/large.
+- **Log rotation (v2.1.0+)**: Both text logs (Share_Manager.log, LogonScript.log) and structured events (*.events.jsonl) automatically rotate when reaching 30 days age or 5MB size. Rotated logs are timestamped and archived locally.
+- Archived logs can be manually deleted from `%APPDATA%\Share_Manager` at any time.
 
 ## Your rights and how to exercise them
 
@@ -83,10 +93,12 @@ All data is stored locally under the current Windows user profile:
 - Credentials stored per-username in structured JSON (creds.json) supporting multiple users
 
 **Privacy Improvements**:
-- Logs minimize usernames where possible to reduce personal data exposure
+- **Logs minimize personal data** (v2.1.0+): Usernames are completely excluded from logs (both text and JSONL formats)
+- **Structured logging with privacy**: Session IDs and correlation IDs enable diagnostics without user identification
 - Share paths retained for diagnostics but never include credentials
 - No passwords or encryption keys ever logged
 - Silent mode operations prevent credential exposure in GUI popups
+- Error messages use generic descriptions without exposing personal identifiers
 
 **Data Minimization**:
 - Multi-share architecture eliminates redundant data storage

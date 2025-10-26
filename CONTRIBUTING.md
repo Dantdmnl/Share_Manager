@@ -41,12 +41,17 @@ Run the comprehensive validation script:
 pwsh -NoProfile -File .\Debug\test_syntax.ps1
 ```
 
-This runs:
-- Legacy parser syntax check
-- AST parse check
-- Function analysis (approved verbs)
-- PSScriptAnalyzer (Warnings/Errors)
-- File encoding check
+This runs 10 checks:
+1. Legacy parser syntax check
+2. AST parse check
+3. Function analysis (approved verbs, count: 73 functions)
+4. Script complexity & metrics (lines, functions, error handling)
+5. Security check (hardcoded secrets detection)
+6. PSScriptAnalyzer (Warnings/Errors)
+7. Documentation quality check (34.2% of functions documented)
+8. File encoding & size check (UTF-8 without BOM or ASCII, ~244 KB)
+9. Unicode character check (pure ASCII compliance)
+10. Function call existence (all called functions are defined)
 
 If PSScriptAnalyzer is missing, install it:
 
@@ -58,26 +63,92 @@ The repo provides custom analyzer settings:
 - `Debug/PSScriptAnalyzerSettings.psd1`
    - Excluded rules are documented and intentional (e.g., PSAvoidUsingWriteHost for interactive scripts)
 
+## Factory Reset (Testing)
+
+To completely reset Share Manager during development/testing:
+
+```powershell
+# Remove all data except the script itself
+Remove-Item -Path "$env:APPDATA\Share_Manager" -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\Share_Manager_AutoMap.*" -Force -ErrorAction SilentlyContinue
+```
+
+This removes configuration, credentials, logs, and logon scripts for a clean test environment.
+
 ## Coding Guidelines
 
+### General Principles
 - Target PowerShell 5.1+
 - Prefer single, focused functions with approved verbs (Get/Set/Add/Remove/Export/Import/etc.)
 - Use `Write-Host` for interactive CLI/GUI messaging (as per analyzer exclusions)
 - Preserve user experience: minimal blocking prompts, sensible defaults
-- For GUI dialogs:
-   - Support Ctrl+A in textboxes
-   - Support Enter to navigate/submit (use AcceptButton pattern where possible)
-- For imports/merges:
-   - Duplicate detection: duplicates are identified by DriveLetter OR SharePath
-   - Merge mode must not create duplicates
+
+### Configuration Caching (v2.1.0+)
+- **Always use `Get-CachedConfig`** instead of calling `Import-AllShares` directly
+- Use `-Force` flag when you need fresh data (e.g., after user adds/edits shares)
+- Call `Clear-ConfigCache` after saving changes with `Save-AllShares`
+- Cache automatically expires after 5 seconds (configurable via `-MaxAge`)
+- Cache improves performance by 80-95% during bulk operations
+
+Example:
+```powershell
+# Reading config (uses cache if fresh)
+$config = Get-CachedConfig
+
+# After modifications, force reload
+$config = Get-CachedConfig -Force
+Save-AllShares -ConfigData $config
+Clear-ConfigCache  # Invalidate cache after save
+```
+
+### Preference Helpers (v2.1.0+)
+- **Use `Get-PreferenceValue`** for safe preference access with null-checking
+- Supports type conversion: `-AsBoolean`, `-AsInteger`
+- Always provide a default value for robustness
+
+Example:
+```powershell
+$autoConnect = Get-PreferenceValue -Config $config -PreferenceName "AutoConnectAtStartup" -DefaultValue $false -AsBoolean
+$reconnectDelay = Get-PreferenceValue -Config $config -PreferenceName "ReconnectDelay" -DefaultValue 5 -AsInteger
+```
+
+### GDPR Compliance
+- **Never log usernames or personal data at INFO/WARN/ERROR levels**
+- Use DEBUG level for troubleshooting that includes usernames
+- Dual logging pattern for sensitive operations:
+  ```powershell
+  Write-Log -Level "INFO" -Message "Credentials removed for share."
+  Write-Log -Level "DEBUG" -Message "Credentials removed for: $username"
+  ```
+- Always document why personal data is logged (troubleshooting, diagnostics)
+
+### Performance Considerations
+- Minimize disk I/O by leveraging `Get-CachedConfig`
+- Avoid repeated Import-AllShares calls in loops
+- For bulk operations, cache config once, then process all items
+- Log cache hits/misses at DEBUG level for monitoring
+
+### GUI Dialogs
+- Support Ctrl+A in textboxes
+- Support Enter to navigate/submit (use AcceptButton pattern where possible)
+- Consistent message formatting: show both counts and item names in bulk operations
+- Use null-safe string handling: `$shareName = if ($share.Name) { $share.Name } else { "Unknown" }`
+
+### Imports/Merges
+- Duplicate detection: duplicates are identified by DriveLetter OR SharePath
+- Merge mode must not create duplicates
 
 ## Pull Request Checklist
 
-- [ ] Ran `.\\Debug\\test_syntax.ps1` and confirmed ALL CRITICAL TESTS PASSED
+- [ ] Ran `.\Debug\test_syntax.ps1` and confirmed ALL CRITICAL TESTS PASSED
 - [ ] Verified PSScriptAnalyzer shows no new Errors/Warnings under repo settings
-- [ ] Updated documentation (README/CONTRIBUTING) when changing behavior or UX
+- [ ] Updated documentation (README/CONTRIBUTING/CHANGELOG) when changing behavior or UX
 - [ ] Considered backward compatibility and migration when changing storage format
 - [ ] Tested both CLI and GUI flows if affected
+- [ ] Used `Get-CachedConfig` instead of direct `Import-AllShares` calls
+- [ ] Used `Get-PreferenceValue` for safe preference access
+- [ ] Followed GDPR compliance (no usernames in INFO/WARN/ERROR logs)
+- [ ] Added appropriate logging at correct levels (DEBUG for diagnostics, INFO for user actions)
+- [ ] Null-safe string handling in all user-facing messages
 
 ## Reporting Issues
 

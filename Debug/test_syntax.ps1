@@ -43,7 +43,7 @@ $results = @()
 $ast = $null
 
 # Test 1: PowerShell Legacy Parser
-Write-Host "[1/8] PowerShell Legacy Parser Check..." -ForegroundColor Yellow
+Write-Host "[1/10] PowerShell Legacy Parser Check..." -ForegroundColor Yellow
 $errors = $null
 try {
     [System.Management.Automation.PSParser]::Tokenize(
@@ -71,7 +71,7 @@ try {
 }
 
 # Test 2: AST (Abstract Syntax Tree) Parser
-Write-Host "`n[2/8] AST (Abstract Syntax Tree) Parser..." -ForegroundColor Yellow
+Write-Host "`n[2/10] AST (Abstract Syntax Tree) Parser..." -ForegroundColor Yellow
 $parseErrors = $null
 try {
     $ast = [System.Management.Automation.Language.Parser]::ParseFile(
@@ -100,7 +100,7 @@ try {
 }
 
 # Test 3: Function Definition Analysis
-Write-Host "`n[3/8] Function Definition Analysis..." -ForegroundColor Yellow
+Write-Host "`n[3/10] Function Definition Analysis..." -ForegroundColor Yellow
 try {
     if ($ast) {
         $functions = $ast.FindAll({
@@ -140,7 +140,7 @@ try {
 }
 
 # Test 4: Script Complexity & Metrics
-Write-Host "`n[4/8] Script Complexity & Metrics..." -ForegroundColor Yellow
+Write-Host "`n[4/10] Script Complexity & Metrics..." -ForegroundColor Yellow
 try {
     if ($ast) {
         $scriptContent = Get-Content $ScriptPath -Raw
@@ -171,7 +171,7 @@ try {
 }
 
 # Test 5: Security Check - Hardcoded Secrets
-Write-Host "`n[5/8] Security Check - Hardcoded Secrets..." -ForegroundColor Yellow
+Write-Host "`n[5/10] Security Check - Hardcoded Secrets..." -ForegroundColor Yellow
 try {
     $content = Get-Content $ScriptPath -Raw
     $lines = $content -split "`n"
@@ -186,9 +186,9 @@ try {
     
     $findings = @()
     foreach ($item in $suspiciousPatterns) {
-        $matches = [regex]::Matches($content, $item.Pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-        if ($matches.Count -gt 0) {
-            foreach ($match in $matches) {
+        $regexMatches = [regex]::Matches($content, $item.Pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if ($regexMatches.Count -gt 0) {
+            foreach ($match in $regexMatches) {
                 $lineNum = $content.Substring(0, $match.Index).Split("`n").Count
                 $lineContent = $lines[$lineNum - 1].Trim()
                 # Exclude comments, examples, and variable names (without actual values)
@@ -218,8 +218,8 @@ try {
     $results += @{ Test = "Security Check"; Status = "INFO"; Details = "Check skipped"; Critical = $false }
 }
 
-# Test 6: PSScriptAnalyzer
-Write-Host "`n[6/8] PSScriptAnalyzer (Code Quality)..." -ForegroundColor Yellow
+# Test 6: PSScriptAnalyzer (Code Quality)
+Write-Host "`n[6/10] PSScriptAnalyzer (Code Quality)..." -ForegroundColor Yellow
 try {
     # Check if PSScriptAnalyzer is available
     if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
@@ -256,7 +256,7 @@ try {
 }
 
 # Test 7: Documentation Quality
-Write-Host "`n[7/8] Documentation Quality Check..." -ForegroundColor Yellow
+Write-Host "`n[7/10] Documentation Quality Check..." -ForegroundColor Yellow
 try {
     if ($ast) {
         $functions = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
@@ -299,7 +299,7 @@ try {
 }
 
 # Test 8: File Encoding & Size Check
-Write-Host "`n[8/8] File Encoding & Size Check..." -ForegroundColor Yellow
+Write-Host "`n[8/10] File Encoding & Size Check..." -ForegroundColor Yellow
 try {
     $bytes = [System.IO.File]::ReadAllBytes($ScriptPath)
     $encoding = "Unknown"
@@ -331,6 +331,100 @@ try {
 } catch {
     Write-Host "      [X] ERROR - $_" -ForegroundColor Red
     $results += @{ Test = "File Encoding"; Status = "ERROR"; Details = $_.Exception.Message; Critical = $false }
+}
+
+
+# Test 9: Unicode Character Check
+Write-Host "`n[9/10] Unicode Character Check (ASCII Compliance)..." -ForegroundColor Yellow
+try {
+    $content = Get-Content $ScriptPath -Raw
+    $unicodeMatches = [regex]::Matches($content, '[^\x00-\x7F]')
+    
+    if ($unicodeMatches.Count -gt 0) {
+        Write-Host "      [X] FAILED - Found $($unicodeMatches.Count) Unicode character(s)" -ForegroundColor Red
+        $allPassed = $false
+        
+        # Show first few occurrences with line numbers
+        $lines = $content -split "`n"
+        $shown = 0
+        $maxShow = 5
+        
+        foreach ($match in $unicodeMatches) {
+            if ($shown -ge $maxShow) {
+                Write-Host "         ... and $($unicodeMatches.Count - $shown) more" -ForegroundColor Red
+                break
+            }
+            
+            # Find line number
+            $position = $match.Index
+            $lineNum = 1
+            $charCount = 0
+            foreach ($line in $lines) {
+                $charCount += $line.Length + 1  # +1 for newline
+                if ($charCount -gt $position) {
+                    break
+                }
+                $lineNum++
+            }
+            
+            $char = $match.Value
+            $hexCode = "U+{0:X4}" -f [int][char]$char
+            Write-Host "         Line ${lineNum}: '$char' ($hexCode)" -ForegroundColor Red
+            $shown++
+        }
+        
+        $results += @{ Test = "Unicode Check"; Status = "FAILED"; Details = "$($unicodeMatches.Count) non-ASCII chars"; Critical = $false }
+    } else {
+        Write-Host "      [OK] PASSED - Script is pure ASCII" -ForegroundColor Green
+        $results += @{ Test = "Unicode Check"; Status = "PASSED"; Details = "Pure ASCII (no Unicode)"; Critical = $false }
+    }
+} catch {
+    Write-Host "      [X] ERROR - $_" -ForegroundColor Red
+    $results += @{ Test = "Unicode Check"; Status = "ERROR"; Details = $_.Exception.Message; Critical = $false }
+}
+
+
+# Test 10: Function Call Existence Check
+Write-Host "`n[10/10] Function Call Existence Check..." -ForegroundColor Yellow
+try {
+    if ($ast) {
+        # Get all function definitions
+        $funcDefs = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
+        $definedNames = $funcDefs | ForEach-Object { $_.Name.ToLowerInvariant() } | Sort-Object -Unique
+
+        # Get all function calls (CommandAst)
+        $funcCalls = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)
+        $calledNames = $funcCalls | ForEach-Object {
+            $cmd = $_.CommandElements[0].Value
+            if ($cmd -and $cmd -is [string]) { $cmd.ToLowerInvariant() }
+        } | Where-Object { $_ -match '^[a-zA-Z0-9_-]+$' } | Sort-Object -Unique
+
+
+        # Exclude built-in cmdlets/functions and common external commands
+        $builtin = Get-Command -CommandType Cmdlet, Function | Select-Object -ExpandProperty Name | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object -Unique
+        $external = @(
+            'cmdkey','net','cmd','where','start','echo','set','for','if','exit','findstr','copy','move','del','type','powershell','pwsh','timeout','pause','mkdir','rmdir','attrib','xcopy','robocopy','schtasks','tasklist','taskkill','reg','sc','whoami','hostname','ipconfig','ping','nslookup','arp','route','netstat','fsutil','diskpart','chkdsk','format','label','vol','tree','more','clip','assoc','ftype','color','title','ver','date','time','cls','help','choice','goto','call','pushd','popd','shift','rem','break','::'
+        )
+        $userCalls = $calledNames | Where-Object { $_ -notin $builtin -and $_ -notin $external }
+
+        # Find missing
+        $missing = $userCalls | Where-Object { $_ -notin $definedNames }
+
+        if ($missing.Count -gt 0) {
+            Write-Host "      [!] WARNING - Called functions not defined in script:" -ForegroundColor Yellow
+            $missing | ForEach-Object { Write-Host "         - $_" -ForegroundColor Yellow }
+            $results += @{ Test = "Function Call Existence"; Status = "WARNING"; Details = "$($missing.Count) missing: $($missing -join ', ')"; Critical = $true }
+        } else {
+            Write-Host "      [OK] All called functions are defined" -ForegroundColor Green
+            $results += @{ Test = "Function Call Existence"; Status = "PASSED"; Details = "All calls resolved"; Critical = $true }
+        }
+    } else {
+        Write-Host "      [!] SKIPPED - AST not available" -ForegroundColor Yellow
+        $results += @{ Test = "Function Call Existence"; Status = "SKIPPED"; Details = "AST parse failed"; Critical = $false }
+    }
+} catch {
+    Write-Host "      [X] ERROR - $_" -ForegroundColor Red
+    $results += @{ Test = "Function Call Existence"; Status = "ERROR"; Details = $_.Exception.Message; Critical = $false }
 }
 
 # Summary
