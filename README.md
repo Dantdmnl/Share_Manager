@@ -11,13 +11,15 @@ Easily manage and map network shares using this PowerShell script with support f
 - **Toggle between CLI and GUI mode** with persistent startup preference
 - **Securely save credentials** using Windows DPAPI encryption - tied to your user account
 - **Credential backup/restore** (v2.1.0+) - Export and import encrypted credentials with Merge or Replace modes
-- **Map or unmap shares** individually or all at once with batch operations
+- **Map or unmap shares** individually or all at once with batch operations (including enable/disable)
 - **Enhanced connection retry** (v2.1.0+) - Exponential backoff and intelligent error classification for reliable mapping
 - **Test connectivity** before attempting to map shares
-- **Review and modify preferences** at any time via Settings menu
+- **Review and modify preferences** at any time via Settings menu (including drive label sync)
 - **Structured logging** (v2.1.0+) - Dual-output logs (human-readable text + machine-readable JSONL) with automatic rotation
 - **Log analysis tools** (v2.1.0+) - Query and filter events by category, level, time range, or session ID
+- **Share filtering/search** (v2.1.1+) - Instantly filter shares by name, path, or drive letter in CLI
 - **First-time setup wizard** for guided configuration (CLI and GUI)
+- **Batch enable/disable** (v2.1.1+) - Enable or disable multiple shares at once via interactive selection or all at once
 - **No administrator permissions required**
 - **Persistent mapping** - Automatic reconnection at Windows logon
 - **Real-time status indicators** showing connection state for all shares
@@ -69,7 +71,7 @@ Easily manage and map network shares using this PowerShell script with support f
 ## Security & Privacy
 
 - **DPAPI Encryption**: Credentials are encrypted using Windows Data Protection API (DPAPI), which ties encryption to your user account and machine. Only you can decrypt them.
-- **Automatic Migration**: Legacy AES-encrypted credentials (if you're upgrading from an older version) are automatically migrated to DPAPI on first use.
+- **Automatic Migration**: Legacy AES-encrypted credentials (if you're upgrading from an older version) are automatically migrated to DPAPI on first use. Config files from older versions are automatically upgraded in-memory to add new properties (e.g., Enabled, SyncShareNameToDriveLabel) on every load.
 - **GDPR Compliant**: 
   - **INFO logs** (default): No personal data - share names only for operational purposes
   - **DEBUG logs** (opt-in): Includes usernames for troubleshooting when enabled via `$MANUAL_LOG_LEVEL = 'DEBUG'` (line 56 in script)
@@ -144,6 +146,9 @@ Easily manage and map network shares using this PowerShell script with support f
 - **Dual-output logs**: Human-readable text (`.log`) and machine-readable JSONL (`.events.jsonl`)
 - **Log levels**: DEBUG, INFO, WARN, ERROR (filter via `SM_LOG_LEVEL` environment variable)
 - **Categories**: Config, Credentials, BackupRestore, Migration, Mapping, Log, Startup, AutoMap
+- **Drive label sync**: When enabled (default), mapped drives in Explorer are labeled with the share name (user-scope, safe, v2.1.1+)
+- **Batch enable/disable**: Enable or disable multiple shares at once via interactive selection or all at once (CLI, v2.1.1+)
+- **Share filtering/search**: Instantly filter shares by name, path, or drive letter in CLI (v2.1.1+)
 - **Session tracking**: Each run gets a unique session ID for correlation
 - **Automatic rotation**: Logs rotate at 30 days or 5MB size
 - **Query events**: 
@@ -205,6 +210,17 @@ Remove-Item -Path "$env:APPDATA\Share_Manager" -Recurse -Force -ErrorAction Sile
 - Backup files (`.v1.backup`, etc.)
 
 The script file (`Share_Manager.ps1`) itself will remain intact. On next run, you'll go through first-time setup again.
+
+## Migration Notes
+
+**v2.1.1:**
+- Config files from older versions (2.0.0, 2.1.0) are automatically upgraded in-memory to add new properties (e.g., Enabled, SyncShareNameToDriveLabel) on every load. No manual migration needed.
+
+**v2.0.0:**
+- Legacy AES-encrypted credentials (cred.txt/key.bin) are migrated to DPAPI (creds.json) on first run.
+- Configuration moves from config.json (single-share) to shares.json (multi-share).
+- Exports never include credentials. You will be prompted to add missing credentials when they are referenced.
+- If you had scripts relying on legacy function names or single-share assumptions, update them to use the new multi-share behavior.
 
 ## Development Notes
 - PowerShell 5.1+ on Windows is required (GUI uses Windows Forms)

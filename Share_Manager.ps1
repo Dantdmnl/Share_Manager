@@ -24,7 +24,7 @@
     Optional. Pass "CLI" or "GUI" to force that mode on launch, bypassing saved preference.
 
 .VERSION
-    2.1.0
+    2.1.1
 
 .NOTES
     - No administrator permissions are required.
@@ -38,7 +38,7 @@ param(
 
 #region Global Variables (Version, Paths, Defaults)
 
-$version        = '2.1.0'
+$version        = '2.1.1'
 $author         = 'Dantdmnl'
 $baseFolder     = Join-Path $env:APPDATA "Share_Manager"
 if (-not (Test-Path $baseFolder)) {
@@ -88,6 +88,7 @@ $defaultConfigTemplate = [PSCustomObject]@{
     Preferences = [PSCustomObject]@{
         UnmapOldMapping = $true
         PreferredMode   = "Prompt"
+        SyncShareNameToDriveLabel = $true
     }
 }
 
@@ -101,6 +102,7 @@ $defaultSharesConfig = [PSCustomObject]@{
         AutoReconnect     = $true
         ReconnectInterval = 300  # seconds
         Theme             = "Classic" # UI Theme: Classic or Modern
+        SyncShareNameToDriveLabel = $true
     }
 }
 
@@ -364,6 +366,9 @@ function Import-AllShares {
                 if (-not $config.Preferences.PSObject.Properties['Theme']) {
                     $config.Preferences | Add-Member -MemberType NoteProperty -Name Theme -Value "Classic"
                 }
+                if (-not $config.Preferences.PSObject.Properties['SyncShareNameToDriveLabel']) {
+                    $config.Preferences | Add-Member -MemberType NoteProperty -Name SyncShareNameToDriveLabel -Value $true
+                }
             }
             
             return $config
@@ -578,14 +583,16 @@ function Add-ShareConfiguration {
         [string]$SharePath,
         [string]$DriveLetter,
         [string]$Username,
-        [string]$Description = ""
+        [string]$Description = "",
+        [bool]$Enabled = $true
     )
     
     $config = Get-CachedConfig -Force
-    $newShare = New-ShareEntry -Name $Name -SharePath $SharePath -DriveLetter $DriveLetter -Username $Username -Description $Description
+    # Create share entry honoring the Enabled flag from callers (GUI/CLI)
+    $newShare = New-ShareEntry -Name $Name -SharePath $SharePath -DriveLetter $DriveLetter -Username $Username -Description $Description -Enabled $Enabled
     
-    # Check for duplicate drive letters
-    $existing = $config.Shares | Where-Object { $_.DriveLetter -eq $DriveLetter -and $_.Enabled }
+    # Check for duplicate drive letters (any state) to avoid future enablement conflicts
+    $existing = $config.Shares | Where-Object { $_.DriveLetter -eq $DriveLetter }
     if ($existing) {
         if ($UseGUI) {
             [System.Windows.Forms.MessageBox]::Show(
@@ -639,6 +646,7 @@ function Update-ShareConfiguration {
     }
 
     # If drive letter is changing, ensure no conflict with other enabled shares
+    $oldDriveLetter = $share.DriveLetter
     if ($DriveLetter -and $DriveLetter -ne $share.DriveLetter) {
         $conflict = $config.Shares | Where-Object { $_.Id -ne $ShareId -and $_.Enabled -and $_.DriveLetter -eq $DriveLetter }
         if ($conflict) {
@@ -665,6 +673,18 @@ function Update-ShareConfiguration {
     if ($PSBoundParameters.ContainsKey('Enabled')) { $share.Enabled = [bool]$Enabled }
 
     if (Save-AllShares -Config $config) {
+        try {
+            # Auto-unmap old drive if drive letter changed and preference allows
+            if ($DriveLetter -and $DriveLetter -ne $oldDriveLetter) {
+                $autoUnmap = Get-PreferenceValue -Name "UnmapOldMapping" -Default $false -AsBoolean
+                if ($autoUnmap -and (Test-Path "$oldDriveLetter`:")) {
+                    Write-ActionLog -Message "Auto-unmapping previous drive $oldDriveLetter due to drive letter change to $DriveLetter" -Level DEBUG -Category 'Mapping'
+                    Disconnect-NetworkShare -DriveLetter $oldDriveLetter -Silent
+                }
+            }
+        } catch {
+            Write-ActionLog -Message "Failed to auto-unmap previous drive $oldDriveLetter after letter change: $_" -Level WARN -Category 'Mapping'
+        }
     Write-ActionLog -Message "Updated share: $($share.Name) ($ShareId)" -Category 'Config'
         return $true
     }
@@ -1260,16 +1280,17 @@ function Import-CredentialStore {
         try {
             # Migrate to DPAPI encryption
             $encryptedPW = $legacy.Password | ConvertFrom-SecureString
-            $store = [PSCustomObject]@{ 
-                Entries = @([PSCustomObject]@{ 
-                    Username = $legacy.UserName
-                    Encrypted = $encryptedPW
-                    EncryptionType = "DPAPI"
-                })
+            $store = [PSCustomObject]@{
+                Entries = @(
+                    [PSCustomObject]@{
+                        Username = $legacy.UserName
+                        Encrypted = $encryptedPW
+                        EncryptionType = "DPAPI"
+                    }
+                )
             }
             $store | ConvertTo-Json -Depth 5 | Set-Content -Path $credentialsStorePath -Encoding UTF8 -Force
             Write-ActionLog -Message "Migrated legacy credential to DPAPI store" -Category 'Migration'
-            
             # Clean up old credential file after successful migration
             if (Test-Path $credentialPath) {
                 $backupPath = "$credentialPath.v1.backup"
@@ -1277,10 +1298,10 @@ function Import-CredentialStore {
                 Remove-Item $credentialPath -Force -ErrorAction SilentlyContinue
                 Write-ActionLog -Message "Legacy cred.txt backed up and removed" -Category 'Migration'
             }
-            
             return $store
         } catch {
-            Write-ActionLog -Message "Failed to migrate legacy cred to store: $_" -Level ERROR -Category 'Migration' -Data @{ error = ("$_") }
+            Write-ActionLog -Message "Failed to migrate legacy credential: $_" -Level WARN -Category 'Migration'
+            return [PSCustomObject]@{ Entries = @() }
         }
     }
     return [PSCustomObject]@{ Entries = @() }
@@ -1767,6 +1788,22 @@ function Connect-NetworkShare {
             elseif (-not $UseGUI -and -not $Silent) {
                 Write-Host "Drive $DriveLetter mapped to $SharePath." -ForegroundColor Green
             }
+            # Optionally sync drive label with share name for better Explorer display
+            try {
+                $syncLabel = Get-PreferenceValue -Name "SyncShareNameToDriveLabel" -Default $true -AsBoolean
+                if ($syncLabel) {
+                    $cfg = Get-CachedConfig
+                    $shareObj = $null
+                    if ($cfg -and $cfg.Shares) {
+                        $shareObj = $cfg.Shares | Where-Object { $_.DriveLetter -eq $DriveLetter }
+                    }
+                    $label = if ($shareObj -and $shareObj.Name) { $shareObj.Name } else { $null }
+                    if ($label) {
+                        Set-MappedDriveLabel -DriveLetter $DriveLetter -SharePath $SharePath -Label $label
+                    }
+                }
+            } catch { Write-ActionLog -Message "Failed to sync drive label for $DriveLetter - $_" -Level WARN -Category 'Mapping' }
+
             Write-ActionLog -Message "Mapped $DriveLetter -> $SharePath (Persistent: $persistent, Verified: $verified)" -Category 'Mapping'
             
             if ($ReturnStatus) {
@@ -1937,6 +1974,54 @@ function Disconnect-NetworkShare {
             Write-Host "Error during unmapping: $_" -ForegroundColor Red
         }
         Write-ActionLog -Message "Error during unmapping: $_" -Level ERROR -Category 'Mapping' -Data @{ error = ("$_") }
+    }
+}
+
+function Set-MappedDriveLabel {
+    <#
+    .SYNOPSIS
+        Sets the Explorer display label for a mapped network drive.
+    .DESCRIPTION
+        Updates HKCU MountPoints2 registry keys so that the mapped drive (and its
+        underlying UNC path) display a friendly name matching the Share Name.
+        Safe, user-scope only. Errors are logged as WARN and do not interrupt flow.
+    .PARAMETER DriveLetter
+        The drive letter (single character) without colon, e.g., 'Z'
+    .PARAMETER SharePath
+        The UNC path, e.g., \\server\share
+    .PARAMETER Label
+        The desired display label (typically the Share Name)
+    #>
+    param(
+        [Parameter(Mandatory)][ValidatePattern('^[A-Za-z]$')][string]$DriveLetter,
+        [Parameter()][string]$SharePath,
+        [Parameter(Mandatory)][string]$Label
+    )
+    try {
+        if ([string]::IsNullOrWhiteSpace($Label)) { return }
+        $baseKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2'
+
+        # Set label on UNC mount key if possible
+        $uncKeyName = $null
+        if ($SharePath -and $SharePath -match '^\\\\([^\\]+)\\([^\\]+)') {
+            $server = $Matches[1]; $share = $Matches[2]
+            $uncKeyName = "##$server#$share"
+        }
+        if ($uncKeyName) {
+            $uncKey = Join-Path $baseKey $uncKeyName
+            if (-not (Test-Path $uncKey)) { New-Item -Path $uncKey -Force | Out-Null }
+            New-ItemProperty -Path $uncKey -Name '_LabelFromReg' -Value $Label -PropertyType String -Force | Out-Null
+        }
+
+        # Also set per-letter key to improve reliability
+        $dl = $DriveLetter.ToUpper()
+        $driveKey = Join-Path $baseKey $dl
+        if (-not (Test-Path $driveKey)) { New-Item -Path $driveKey -Force | Out-Null }
+        New-ItemProperty -Path $driveKey -Name '_LabelFromReg' -Value $Label -PropertyType String -Force | Out-Null
+
+        Write-ActionLog -Message "Set Explorer label for drive $dl to '$Label'" -Level DEBUG -Category 'Mapping'
+    } catch {
+        Write-ActionLog -Message "Failed to set Explorer label for drive $DriveLetter - $_" -Level WARN -Category 'Mapping'
     }
 }
 
@@ -2184,12 +2269,22 @@ function Initialize-Config-CLI {
         Write-Host "  Enter 1 or 2." -ForegroundColor Yellow
     } while ($true)
     
+    Write-Host ""
+    $syncLabel = $true
+    do {
+        $yn = Read-Host "  Sync share name to drive label in Explorer? (Y/N) [Y]"
+        if ($yn -eq "" -or $yn -match '^[Yy]$') { $syncLabel = $true; break }
+        if ($yn -match '^[Nn]$') { $syncLabel = $false; break }
+        Write-Host "  Enter Y or N." -ForegroundColor Yellow
+    } while ($true)
+    
     # Save initial preferences
     $config = Get-CachedConfig
     $config.Preferences.PreferredMode = $preferredMode
     $config.Preferences.PersistentMapping = $persistentMapping
     $config.Preferences.UnmapOldMapping = $autoUnmap
     $config.Preferences.Theme = $themeChoice
+    $config.Preferences.SyncShareNameToDriveLabel = $syncLabel
     Save-AllShares -Config $config | Out-Null
     
     Write-Host ""
@@ -2345,6 +2440,9 @@ function Initialize-Config-GUI {
     $config.Preferences.PersistentMapping = $prefValues.PersistentMapping
     $config.Preferences.UnmapOldMapping = $prefValues.UnmapOldMapping
     $config.Preferences.Theme = $prefValues.Theme
+    if ($prefValues.PSObject.Properties['SyncShareNameToDriveLabel']) {
+        $config.Preferences.SyncShareNameToDriveLabel = [bool]$prefValues.SyncShareNameToDriveLabel
+    }
     Save-AllShares -Config $config | Out-Null
     
     # Step 2: Ask if user wants to import from backup or add manually
@@ -2663,18 +2761,51 @@ function Start-CliMode {
 function Show-ManageSharesMenu {
     <#
     .SYNOPSIS
-        Shows submenu for managing existing shares
+        Shows submenu for managing existing shares with filtering and batch operations
     #>
+    $filterText = ""
+    
     do {
         Clear-Host
         Write-Host ""
         Write-Host "  ======[ MANAGE SHARES ]======" -ForegroundColor Cyan
         
-    $shares = @(Get-ShareConfiguration)
+    $allShares = @(Get-ShareConfiguration)
         
-        if ($shares.Count -eq 0) {
+        if ($allShares.Count -eq 0) {
             Write-Host "  No shares configured." -ForegroundColor Yellow
             return
+        }
+        
+        # Apply filter if set
+        if ($filterText) {
+            $shares = @($allShares | Where-Object { 
+                $_.Name -like "*$filterText*" -or $_.SharePath -like "*$filterText*" -or $_.DriveLetter -like "*$filterText*"
+            })
+            Write-Host ""
+            Write-Host "  Filter: " -NoNewline -ForegroundColor Yellow
+            Write-Host "'$filterText'" -ForegroundColor White
+            Write-Host "  Showing $($shares.Count) of $($allShares.Count) shares" -ForegroundColor DarkGray
+        } else {
+            $shares = $allShares
+        }
+        
+        if ($shares.Count -eq 0) {
+            Write-Host ""
+            Write-Host "  No shares match filter." -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "  F" -NoNewline -ForegroundColor White
+            Write-Host " - Clear Filter  " -NoNewline -ForegroundColor Gray
+            Write-Host "B" -NoNewline -ForegroundColor White
+            Write-Host " - Back" -ForegroundColor Gray
+            Write-Host ""
+            Write-Host "  > " -NoNewline -ForegroundColor White
+            $choice = Read-Host
+            $choice = $choice.Trim().ToUpper()
+            
+            if ($choice -eq "F") { $filterText = "" }
+            elseif ($choice -eq "B") { return }
+            continue
         }
         
         Write-Host ""
@@ -2684,24 +2815,35 @@ function Show-ManageSharesMenu {
             $connected = Test-ShareConnection -DriveLetter $share.DriveLetter
             $icon = if ($connected) { "[*]" } else { "[ ]" }
             $color = if ($connected) { "Green" } else { "Red" }
+            $enabledIndicator = if (-not $share.Enabled) { " [DISABLED]" } else { "" }
             
             Write-Host "  $icon $index. " -ForegroundColor $color -NoNewline
             Write-Host "$($share.Name) " -ForegroundColor $(if ($connected) { "White" } else { "Gray" }) -NoNewline
-            Write-Host "[$($share.DriveLetter):]" -ForegroundColor DarkGray
+            Write-Host "[$($share.DriveLetter):]" -ForegroundColor DarkGray -NoNewline
+            if ($enabledIndicator) {
+                Write-Host $enabledIndicator -ForegroundColor Red
+            } else {
+                Write-Host ""
+            }
             Write-Host "      $($share.SharePath)" -ForegroundColor DarkGray
             
             $index++
         }
         
         Write-Host ""
-        Write-Host "  1-$($shares.Count)" -NoNewline -ForegroundColor White
-        Write-Host " - Toggle Connect/Disconnect  " -NoNewline -ForegroundColor Gray
-        Write-Host "E" -NoNewline -ForegroundColor White
-        Write-Host " - Edit  " -NoNewline -ForegroundColor Gray
-        Write-Host "R" -NoNewline -ForegroundColor White
-        Write-Host " - Remove  " -NoNewline -ForegroundColor Gray
+        Write-Host "  Actions:" -ForegroundColor DarkGray
+        Write-Host "    1-$($shares.Count)" -NoNewline -ForegroundColor White
+        Write-Host " - Connect/Disconnect share" -ForegroundColor Gray
+        Write-Host "    E" -NoNewline -ForegroundColor Cyan
+        Write-Host " - Edit share  " -NoNewline -ForegroundColor Gray
+        Write-Host "R" -NoNewline -ForegroundColor Cyan
+        Write-Host " - Remove share  " -NoNewline -ForegroundColor Gray
+        Write-Host "F" -NoNewline -ForegroundColor Cyan
+        Write-Host " - Filter shares" -ForegroundColor Gray
+        Write-Host "    X" -NoNewline -ForegroundColor Yellow
+        Write-Host " - Batch enable/disable  " -NoNewline -ForegroundColor Gray
         Write-Host "B" -NoNewline -ForegroundColor White
-        Write-Host " - Back" -ForegroundColor Gray
+        Write-Host " - Back to main menu" -ForegroundColor Gray
         Write-Host ""
         Write-Host "  > " -NoNewline -ForegroundColor White
         $choice = Read-Host
@@ -2750,9 +2892,43 @@ function Show-ManageSharesMenu {
         }
         elseif ($choice -eq "E") {
             Edit-ShareCli
+            $filterText = ""  # Clear filter after edit
         }
         elseif ($choice -eq "R") {
             Remove-ShareCli
+            $filterText = ""  # Clear filter after remove
+        }
+        elseif ($choice -eq "F") {
+            Write-Host ""
+            Write-Host "  ===[ FILTER SHARES ]===" -ForegroundColor Cyan
+            Write-Host ""
+            if ($filterText) {
+                Write-Host "  Current filter: '$filterText'" -ForegroundColor Yellow
+                Write-Host ""
+            }
+            Write-Host "  Enter search text to filter by:" -ForegroundColor White
+            Write-Host "    - Share name (e.g., 'office', 'backup')" -ForegroundColor DarkGray
+            Write-Host "    - Network path (e.g., 'nas', '192.168')" -ForegroundColor DarkGray
+            Write-Host "    - Drive letter (e.g., 'Z', 'Y')" -ForegroundColor DarkGray
+            Write-Host ""
+            Write-Host "  Leave blank to clear any active filter" -ForegroundColor DarkGray
+            Write-Host ""
+            Write-Host "  > " -NoNewline -ForegroundColor Cyan
+            $newFilter = Read-Host
+            $filterText = $newFilter.Trim()
+            if ($filterText) {
+                Write-Host ""
+                Write-Host "  Filter applied: '$filterText'" -ForegroundColor Green
+                Start-Sleep -Milliseconds 600
+            } elseif ($newFilter -eq "") {
+                Write-Host ""
+                Write-Host "  Filter cleared" -ForegroundColor Yellow
+                Start-Sleep -Milliseconds 600
+            }
+        }
+        elseif ($choice -eq "X") {
+            Show-BatchOperationsMenu -CurrentFilter $filterText
+            $filterText = ""  # Clear filter after batch ops
         }
         elseif ($choice -eq "B") {
             return
@@ -2765,10 +2941,296 @@ function Show-ManageSharesMenu {
     } while ($true)
 }
 
+function Show-BatchOperationsMenu {
+    <#
+    .SYNOPSIS
+        Batch operations menu for enabling/disabling multiple shares
+    #>
+    param([string]$CurrentFilter = "")
+    
+    do {
+        Clear-Host
+        Write-Host ""
+        Write-Host "  ======[ BATCH OPERATIONS ]======" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "  Quickly enable or disable multiple shares at once" -ForegroundColor DarkGray
+        Write-Host ""
+        
+        $allShares = @(Get-ShareConfiguration)
+        
+        if ($allShares.Count -eq 0) {
+            Write-Host "  No shares configured." -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "  Press any key..." -ForegroundColor DarkGray
+            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            return
+        }
+        
+        # Apply filter if provided
+        if ($CurrentFilter) {
+            $shares = @($allShares | Where-Object { 
+                $_.Name -like "*$CurrentFilter*" -or $_.SharePath -like "*$CurrentFilter*" -or $_.DriveLetter -like "*$CurrentFilter*"
+            })
+            Write-Host "  Active filter: " -NoNewline -ForegroundColor Yellow
+            Write-Host "'$CurrentFilter'" -ForegroundColor White
+            Write-Host "  Showing $($shares.Count) of $($allShares.Count) shares" -ForegroundColor DarkGray
+        } else {
+            Write-Host "  All $($allShares.Count) shares available" -ForegroundColor DarkGray
+            $shares = $allShares
+        }
+        
+        if ($shares.Count -eq 0) {
+            Write-Host ""
+            Write-Host "  No shares match current filter." -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "  Press any key..." -ForegroundColor DarkGray
+            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            return
+        }
+        
+        Write-Host ""
+        Write-Host "  Choose an operation:" -ForegroundColor White
+        Write-Host ""
+        Write-Host "  1" -NoNewline -ForegroundColor Cyan
+        Write-Host " - Pick shares to enable" -NoNewline -ForegroundColor Gray
+        Write-Host "   (interactive selection)" -ForegroundColor DarkGray
+        Write-Host "  2" -NoNewline -ForegroundColor Cyan
+        Write-Host " - Pick shares to disable" -NoNewline -ForegroundColor Gray
+        Write-Host "  (interactive selection)" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  3" -NoNewline -ForegroundColor Yellow
+        Write-Host " - Enable all $($shares.Count) $(if ($CurrentFilter) { '(filtered)' } else { '' })" -ForegroundColor Gray
+        Write-Host "  4" -NoNewline -ForegroundColor Yellow
+        Write-Host " - Disable all $($shares.Count) $(if ($CurrentFilter) { '(filtered)' } else { '' })" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "  B" -NoNewline -ForegroundColor White
+        Write-Host " - Back to manage menu" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "  > " -NoNewline -ForegroundColor White
+        $choice = Read-Host
+        $choice = $choice.Trim().ToUpper()
+        
+        switch ($choice) {
+            "1" {
+                # Enable selected
+                $selectedIndices = @(Select-SharesInteractive -Shares $shares -Title "SELECT SHARES TO ENABLE")
+                if ($selectedIndices.Count -gt 0) {
+                    $config = Get-CachedConfig -Force
+                    $enabled = 0
+                    $shareNames = @()
+                    foreach ($index in $selectedIndices) {
+                        $shareName = $shares[$index].Name
+                        $configShare = $config.Shares | Where-Object { $_.Name -eq $shareName } | Select-Object -First 1
+                        if ($configShare) {
+                            $configShare.Enabled = $true
+                            $shareNames += $shareName
+                            $enabled++
+                        }
+                    }
+                    if (Save-AllShares -Config $config) {
+                        Write-Host ""
+                        Write-Host "  [OK] Enabled $enabled share(s):" -ForegroundColor Green
+                        foreach ($name in $shareNames) {
+                            Write-Host "    - $name" -ForegroundColor Gray
+                        }
+                        Write-ActionLog -Message "Batch enabled $enabled shares" -Category 'Config'
+                    }
+                } else {
+                    Write-Host ""
+                    Write-Host "  Operation cancelled - no changes made" -ForegroundColor Yellow
+                }
+                Write-Host ""
+                Write-Host "  Press any key..." -ForegroundColor DarkGray
+                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            }
+            "2" {
+                # Disable selected
+                $selectedIndices = @(Select-SharesInteractive -Shares $shares -Title "SELECT SHARES TO DISABLE")
+                if ($selectedIndices.Count -gt 0) {
+                    $config = Get-CachedConfig -Force
+                    $disabled = 0
+                    $shareNames = @()
+                    foreach ($index in $selectedIndices) {
+                        $shareName = $shares[$index].Name
+                        $configShare = $config.Shares | Where-Object { $_.Name -eq $shareName } | Select-Object -First 1
+                        if ($configShare) {
+                            $configShare.Enabled = $false
+                            $shareNames += $shareName
+                            $disabled++
+                        }
+                    }
+                    if (Save-AllShares -Config $config) {
+                        Write-Host ""
+                        Write-Host "  [OK] Disabled $disabled share(s):" -ForegroundColor Green
+                        foreach ($name in $shareNames) {
+                            Write-Host "    - $name" -ForegroundColor Gray
+                        }
+                        Write-ActionLog -Message "Batch disabled $disabled shares" -Category 'Config'
+                    }
+                } else {
+                    Write-Host ""
+                    Write-Host "  Operation cancelled - no changes made" -ForegroundColor Yellow
+                }
+                Write-Host ""
+                Write-Host "  Press any key..." -ForegroundColor DarkGray
+                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            }
+            "3" {
+                # Enable all
+                Write-Host ""
+                Write-Host "  Enable all $($shares.Count) share(s)? (Y/N) [Y]: " -NoNewline
+                $confirm = Read-Host
+                if ($confirm -eq "" -or $confirm -match '^[Yy]$') {
+                    $config = Get-CachedConfig -Force
+                    $enabled = 0
+                    foreach ($share in $shares) {
+                        $configShare = $config.Shares | Where-Object { $_.Name -eq $share.Name } | Select-Object -First 1
+                        if ($configShare) {
+                            $configShare.Enabled = $true
+                            $enabled++
+                        }
+                    }
+                    if (Save-AllShares -Config $config) {
+                        Write-Host ""
+                        Write-Host "  [OK] Enabled all $enabled share(s)" -ForegroundColor Green
+                        Write-ActionLog -Message "Batch enabled all shares $(if ($CurrentFilter) { "(filtered: $CurrentFilter)" } else { '' })" -Category 'Config'
+                    }
+                } else {
+                    Write-Host ""
+                    Write-Host "  Cancelled" -ForegroundColor Yellow
+                }
+                Write-Host ""
+                Write-Host "  Press any key..." -ForegroundColor DarkGray
+                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            }
+            "4" {
+                # Disable all
+                Write-Host ""
+                Write-Host "  Disable all $($shares.Count) share(s)? (Y/N) [N]: " -NoNewline
+                $confirm = Read-Host
+                if ($confirm -match '^[Yy]$') {
+                    $config = Get-CachedConfig -Force
+                    $disabled = 0
+                    foreach ($share in $shares) {
+                        $configShare = $config.Shares | Where-Object { $_.Name -eq $share.Name } | Select-Object -First 1
+                        if ($configShare) {
+                            $configShare.Enabled = $false
+                            $disabled++
+                        }
+                    }
+                    if (Save-AllShares -Config $config) {
+                        Write-Host ""
+                        Write-Host "  [OK] Disabled all $disabled share(s)" -ForegroundColor Green
+                        Write-ActionLog -Message "Batch disabled all shares $(if ($CurrentFilter) { "(filtered: $CurrentFilter)" } else { '' })" -Category 'Config'
+                    }
+                } else {
+                    Write-Host ""
+                    Write-Host "  Cancelled" -ForegroundColor Yellow
+                }
+                Write-Host ""
+                Write-Host "  Press any key..." -ForegroundColor DarkGray
+                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            }
+            "B" { return }
+            default {
+                Write-Host "  Invalid choice" -ForegroundColor Red
+                Start-Sleep -Milliseconds 800
+            }
+        }
+    } while ($true)
+}
+
+function Select-SharesInteractive {
+    <#
+    .SYNOPSIS
+        Interactive share selection with toggle interface - returns selected indices
+    #>
+    param(
+        [Parameter(Mandatory)][array]$Shares,
+        [string]$Title = "SELECT SHARES"
+    )
+    
+    $selection = @{}
+    for ($i = 0; $i -lt $Shares.Count; $i++) {
+        $selection[$i] = $false
+    }
+    
+    do {
+        Clear-Host
+        Write-Host ""
+        Write-Host "  ======[ $Title ]======" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "  How to use:" -ForegroundColor White
+        Write-Host "    - Type a number to toggle that share on/off" -ForegroundColor DarkGray
+        Write-Host "    - Press " -NoNewline -ForegroundColor DarkGray
+        Write-Host "A" -NoNewline -ForegroundColor Green
+        Write-Host " when done to apply changes" -ForegroundColor DarkGray
+        Write-Host "    - Press " -NoNewline -ForegroundColor DarkGray
+        Write-Host "C" -NoNewline -ForegroundColor Red
+        Write-Host " to cancel without changes" -ForegroundColor DarkGray
+        Write-Host ""
+        
+        for ($i = 0; $i -lt $Shares.Count; $i++) {
+            $share = $Shares[$i]
+            $checkbox = if ($selection[$i]) { "[X]" } else { "[ ]" }
+            $color = if ($selection[$i]) { "Green" } else { "DarkGray" }
+            
+            Write-Host "  $checkbox $($i + 1). " -ForegroundColor $color -NoNewline
+            Write-Host "$($share.Name) " -ForegroundColor $(if ($selection[$i]) { "White" } else { "Gray" }) -NoNewline
+            Write-Host "[$($share.DriveLetter):]" -ForegroundColor DarkGray
+        }
+        
+        Write-Host ""
+        $selectedCount = ($selection.Values | Where-Object { $_ }).Count
+        if ($selectedCount -eq 0) {
+            Write-Host "  No shares selected yet" -ForegroundColor Yellow
+        } else {
+            Write-Host "  Selected: " -NoNewline -ForegroundColor Cyan
+            Write-Host "$selectedCount" -NoNewline -ForegroundColor White
+            Write-Host " of $($Shares.Count)" -ForegroundColor Gray
+        }
+        Write-Host ""
+        Write-Host "  > " -NoNewline -ForegroundColor Cyan
+        $choice = Read-Host
+        $choice = $choice.Trim().ToUpper()
+        
+        # Check for numeric toggle
+        $num = 0
+        if ([int]::TryParse($choice, [ref]$num) -and $num -ge 1 -and $num -le $Shares.Count) {
+            $selection[$num - 1] = -not $selection[$num - 1]
+        }
+        elseif ($choice -eq "A") {
+            # Apply - return selected share indices
+            $result = @()
+            for ($i = 0; $i -lt $Shares.Count; $i++) {
+                if ($selection[$i]) {
+                    $result += $i
+                }
+            }
+            if ($result.Count -eq 0) {
+                Write-Host ""
+                Write-Host "  No shares selected. Press any key to continue..." -ForegroundColor Yellow
+                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+                continue
+            }
+            return ,$result
+        }
+        elseif ($choice -eq "C") {
+            # Cancel
+            return @()
+        }
+        else {
+            Write-Host ""
+            Write-Host "  Invalid choice. Enter a number (1-$($Shares.Count)), A to apply, or C to cancel" -ForegroundColor Red
+            Start-Sleep -Milliseconds 800
+        }
+    } while ($true)
+}
+
 function Edit-ShareCli {
     <#
     .SYNOPSIS
-        Edit an existing share
+        Edit an existing share with full property access
     #>
     Clear-Host
     Write-Host ""
@@ -2795,21 +3257,50 @@ function Edit-ShareCli {
         
         Write-Host ""
         Write-Host "  Editing: $($share.Name)" -ForegroundColor Cyan
-        Write-Host "  (Leave blank to keep current)" -ForegroundColor DarkGray
+        Write-Host "  (Leave blank to keep current value)" -ForegroundColor DarkGray
         Write-Host ""
         
+        # Name
         Write-Host "  Name [$($share.Name)]: " -NoNewline
         $newName = Read-Host
         if (-not [string]::IsNullOrWhiteSpace($newName)) {
             $share.Name = $newName
         }
         
+        # SharePath
+        Write-Host "  Share Path [$($share.SharePath)]: " -NoNewline
+        $newPath = Read-Host
+        if (-not [string]::IsNullOrWhiteSpace($newPath)) {
+            $share.SharePath = $newPath
+        }
+        
+        # DriveLetter
+        Write-Host "  Drive Letter [$($share.DriveLetter)]: " -NoNewline
+        $newDrive = Read-Host
+        if (-not [string]::IsNullOrWhiteSpace($newDrive)) {
+            $newDrive = $newDrive.ToUpper() -replace '[^A-Z]', ''
+            if ($newDrive.Length -eq 1) {
+                $share.DriveLetter = $newDrive
+            } else {
+                Write-Host "  Invalid drive letter, keeping current." -ForegroundColor Yellow
+            }
+        }
+        
+        # Username
+        Write-Host "  Username [$($share.Username)]: " -NoNewline
+        $newUser = Read-Host
+        if (-not [string]::IsNullOrWhiteSpace($newUser)) {
+            $share.Username = $newUser
+        }
+        
+        # Description
         Write-Host "  Description [$($share.Description)]: " -NoNewline
         $newDesc = Read-Host
         if (-not [string]::IsNullOrWhiteSpace($newDesc)) {
             $share.Description = $newDesc
         }
         
+        # Enabled
         Write-Host "  Enabled [$($share.Enabled)] (Y/N/blank): " -NoNewline
         $toggle = Read-Host
         if ($toggle -match '^[Yy]$') {
@@ -2818,21 +3309,22 @@ function Edit-ShareCli {
             $share.Enabled = $false
         }
         
-        # Save changes
-        $config = Get-CachedConfig
-        $shareObj = $config.Shares | Where-Object { $_.Id -eq $share.Id }
-        if ($shareObj) {
-            $shareObj.Name = $share.Name
-            $shareObj.Description = $share.Description
-            $shareObj.Enabled = $share.Enabled
-            
-            if (Save-AllShares -Config $config) {
-                Write-Host ""
-                Write-Host "  [OK] Share updated!" -ForegroundColor Green
-            } else {
-                Write-Host ""
-                Write-Host "  [X] Failed to save" -ForegroundColor Red
-            }
+        # Save changes using Update-ShareConfiguration for proper validation and auto-unmap
+        $result = Update-ShareConfiguration `
+            -ShareId $share.Id `
+            -Name $share.Name `
+            -SharePath $share.SharePath `
+            -DriveLetter $share.DriveLetter `
+            -Username $share.Username `
+            -Description $share.Description `
+            -Enabled $share.Enabled
+        
+        if ($result) {
+            Write-Host ""
+            Write-Host "  [OK] Share updated!" -ForegroundColor Green
+        } else {
+            Write-Host ""
+            Write-Host "  [X] Failed to save (check for conflicts)" -ForegroundColor Red
         }
     } else {
         Write-Host "  Cancelled" -ForegroundColor Gray
@@ -3324,7 +3816,9 @@ function Connect-AllSharesCli {
     Write-Host "  ======[ CONNECT ALL ]======" -ForegroundColor Cyan
     Write-Host ""
     
-    $shares = @(Get-ShareConfiguration | Where-Object { $_.Enabled })
+    # Force reload to ensure we have the latest shares (especially important after adding new shares)
+    $config = Get-CachedConfig -Force
+    $shares = @($config.Shares | Where-Object { $_.Enabled })
     if ($shares.Count -eq 0) {
         Write-Host "  No enabled shares configured." -ForegroundColor Yellow
         return
@@ -3407,7 +3901,9 @@ function Reset-AllSharesCli {
     Write-Host "  ======[ RECONNECT ALL SHARES ]======" -ForegroundColor Cyan
     Write-Host ""
     
-    $shares = @(Get-ShareConfiguration | Where-Object { $_.Enabled })
+    # Force reload to ensure we have the latest shares
+    $config = Get-CachedConfig -Force
+    $shares = @($config.Shares | Where-Object { $_.Enabled })
     if ($shares.Count -eq 0) {
         Write-Host "  No enabled shares configured." -ForegroundColor Yellow
         Write-Host ""
@@ -3502,7 +3998,9 @@ function Disconnect-AllSharesCli {
     Write-Host "  ======[ DISCONNECT ALL ]======" -ForegroundColor Cyan
     Write-Host ""
     
-    $shares = Get-ShareConfiguration
+    # Force reload to ensure we have the latest shares
+    $config = Get-CachedConfig -Force
+    $shares = $config.Shares
     
         # Build array of connected shares
         $connected = @()
@@ -3891,13 +4389,18 @@ function Set-CliPreferences {
     $config = Get-CachedConfig
     if (-not $config) { return }
     
-    # Ensure preferences exist
+    # Ensure preferences exist with all defaults
     if (-not $config.Preferences) {
         $config.Preferences = [PSCustomObject]@{
             UnmapOldMapping = $false
             PreferredMode = "Prompt"
             PersistentMapping = $false
+            SyncShareNameToDriveLabel = $true
         }
+    }
+    # Backfill SyncShareNameToDriveLabel if missing (for configs created before 2.1.1)
+    if (-not $config.Preferences.PSObject.Properties['SyncShareNameToDriveLabel']) {
+        $config.Preferences | Add-Member -MemberType NoteProperty -Name SyncShareNameToDriveLabel -Value $true -Force
     }
     $prefs = $config.Preferences
 
@@ -3908,9 +4411,11 @@ function Set-CliPreferences {
         Write-Host "1. Auto-unmap on drive change: $($prefs.UnmapOldMapping)"
         Write-Host "2. Preferred startup mode    : $($prefs.PreferredMode)"
         Write-Host "3. Persistent mapping        : $($prefs.PersistentMapping)"
-        Write-Host "4. Back"
+        $syncLabelValue = if ($prefs.PSObject.Properties['SyncShareNameToDriveLabel']) { $prefs.SyncShareNameToDriveLabel } else { $true }
+        Write-Host "4. Sync share name to label  : $syncLabelValue"
+        Write-Host "5. Back"
         Write-Host ""
-        $choice = Read-Host "Select (1-4)"
+        $choice = Read-Host "Select (1-5)"
         switch ($choice) {
             "1" {
                 do {
@@ -3969,7 +4474,18 @@ function Set-CliPreferences {
                 Write-Host "Updated." -ForegroundColor Green
                 $prefs = $config.Preferences
             }
-            "4" { return }
+            "4" {
+                do {
+                    $yn = Read-Host "Sync share name to Explorer drive label? (Y/N) [Y]"
+                    if ($yn -eq "" -or $yn -match '^[YyNn]$') { break }
+                    Write-Host "Enter Y or N." -ForegroundColor Yellow
+                } while ($true)
+                $config.Preferences.SyncShareNameToDriveLabel = ($yn -eq "" -or $yn -match '^[Yy]$')
+                Save-AllShares -Config $config | Out-Null
+                Write-Host "Updated." -ForegroundColor Green
+                $prefs = $config.Preferences
+            }
+            "5" { return }
             default { return }
         }
     }
@@ -4335,12 +4851,13 @@ function Show-PreferencesForm {
         PreferredMode   = $CurrentPrefs.PreferredMode
         PersistentMapping = if ($CurrentPrefs.PSObject.Properties["PersistentMapping"]) { [bool]$CurrentPrefs.PersistentMapping } else { $false }
         Theme = if ($CurrentPrefs.PSObject.Properties["Theme"]) { [string]$CurrentPrefs.Theme } else { "Classic" }
+        SyncShareNameToDriveLabel = if ($CurrentPrefs.PSObject.Properties["SyncShareNameToDriveLabel"]) { [bool]$CurrentPrefs.SyncShareNameToDriveLabel } else { $true }
     }
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text            = "Preferences v$version"
     $form.Width           = 420
-    $form.Height          = 430
+    $form.Height          = 470
     $form.StartPosition   = "CenterParent"
     $form.FormBorderStyle = "FixedDialog"
     $form.MaximizeBox     = $false
@@ -4363,10 +4880,19 @@ function Show-PreferencesForm {
     $chkPersist.Checked  = $prefs.PersistentMapping
     $form.Controls.Add($chkPersist)
 
+    # Sync share name to drive label checkbox
+    $chkSync = New-Object System.Windows.Forms.CheckBox
+    $chkSync.Text     = "Sync share name to drive label (Explorer)"
+    $chkSync.AutoSize = $true
+    $chkSync.Top      = 80
+    $chkSync.Left     = 20
+    $chkSync.Checked  = $prefs.SyncShareNameToDriveLabel
+    $form.Controls.Add($chkSync)
+
     # Startup mode group
     $grpStartup = New-Object System.Windows.Forms.GroupBox
     $grpStartup.Text = "Startup mode"
-    $grpStartup.Top = 90
+    $grpStartup.Top = 120
     $grpStartup.Left = 15
     $grpStartup.Width = 380
     $grpStartup.Height = 90
@@ -4403,7 +4929,7 @@ function Show-PreferencesForm {
     if (-not $IsInitial) {
         $grpTheme = New-Object System.Windows.Forms.GroupBox
         $grpTheme.Text = "Theme"
-        $grpTheme.Top = 190
+    $grpTheme.Top = 220
         $grpTheme.Left = 15
         $grpTheme.Width = 380
         $grpTheme.Height = 70
@@ -4431,11 +4957,12 @@ function Show-PreferencesForm {
     $btnSave.Text   = "Save"
     $btnSave.Width  = 100
     $btnSave.Height = 30
-    $btnSave.Top    = 290
+    $btnSave.Top    = 320
     $btnSave.Left   = 70
     $btnSave.Add_Click({
         $prefs.UnmapOldMapping   = $chk.Checked
-        $prefs.PersistentMapping = $chkPersist.Checked
+    $prefs.PersistentMapping = $chkPersist.Checked
+    $prefs.SyncShareNameToDriveLabel = $chkSync.Checked
         if ($rdoCLI.Checked)    { $prefs.PreferredMode = "CLI" }
         elseif ($rdoGUI.Checked) { $prefs.PreferredMode = "GUI" }
         else                     { $prefs.PreferredMode = "Prompt" }
@@ -4457,7 +4984,7 @@ function Show-PreferencesForm {
         $btnCancel.Text   = "Cancel"
         $btnCancel.Width  = 100
         $btnCancel.Height = 30
-        $btnCancel.Top    = 290
+    $btnCancel.Top    = 320
         $btnCancel.Left   = 200
         $btnCancel.Add_Click({ $form.Close() })
         $form.Controls.Add($btnCancel)
@@ -5255,6 +5782,7 @@ function Show-PreferencesDialog {
             PreferredMode = "Prompt"
             PersistentMapping = $false
             Theme = "Classic"
+            SyncShareNameToDriveLabel = $true
         }
     }
     

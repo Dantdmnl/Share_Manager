@@ -143,6 +143,7 @@ $reconnectDelay = Get-PreferenceValue -Config $config -PreferenceName "Reconnect
 - [ ] Verified PSScriptAnalyzer shows no new Errors/Warnings under repo settings
 - [ ] Updated documentation (README/CONTRIBUTING/CHANGELOG) when changing behavior or UX
 - [ ] Considered backward compatibility and migration when changing storage format
+- [ ] If adding new config or preference properties, updated Import-AllShares to auto-add them for old configs (in-memory migration)
 - [ ] Tested both CLI and GUI flows if affected
 - [ ] Used `Get-CachedConfig` instead of direct `Import-AllShares` calls
 - [ ] Used `Get-PreferenceValue` for safe preference access

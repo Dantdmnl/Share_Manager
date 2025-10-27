@@ -4,6 +4,46 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [2.1.1] - 2025-10-27
+
+### Added
+- **Drive label sync preference**: new SyncShareNameToDriveLabel (default: on). When enabled, mapped drive labels in Explorer are set to the share Name via MountPoints2 registry (_LabelFromReg). Safe, user-scope only, non-blocking on errors.
+  - Available in CLI Preferences menu (option 4) and GUI Preferences dialog
+- **Enhanced CLI edit share**: Edit-ShareCli now allows modifying all share properties:
+  - Name, SharePath, DriveLetter, Username, Description, and Enabled status
+  - Uses Update-ShareConfiguration for proper validation and auto-unmap logic
+  - Prevents drive letter conflicts and validates input
+- **CLI share filtering/search**: Filter shares by name, path, or drive letter in Manage Shares menu
+  - Press 'F' to access filter with helpful examples (name, path, drive letter)
+  - Shows "X of Y shares" when filter is active
+  - Filter persists across operations until cleared
+  - Improved prompts show current filter and clear instructions
+- **CLI batch operations menu**: New 'X' option in Manage Shares for bulk operations:
+  - Enable/Disable selected shares (interactive multi-select with checkboxes)
+  - Enable/Disable all shares (with confirmation prompts)
+  - Works with active filters for targeted batch operations
+  - Interactive toggle interface with clear instructions and visual feedback
+  - Shows bullet-list of affected shares after completion
+  - **First-time setup**: Drive label sync preference is now included in CLI initial setup wizard
+
+### Changed
+- CLI Preferences menu now includes option 4 for drive label sync preference (menu option "Back" moved to 5)
+- CLI share editing now provides full property access instead of limited name/description/enabled only
+- Manage Shares menu now shows [DISABLED] indicator for disabled shares
+- Batch operations respect active filters for scoped operations
+- **Improved CLI menu clarity**: Better organized action lists with color coding (Cyan for common, Yellow for batch ops)
+- **Enhanced interactive selection UX**: 
+  - Step-by-step instructions displayed at top ("How to use")
+  - Visual distinction between selected (green) and unselected (gray) items
+  - Prevents accidental empty selection with validation message
+  - Better error messages with specific guidance
+- **Bulk operations cache handling**: Connect All, Disconnect All, and Reconnect All now force reload config to guarantee fresh data (eliminates potential timing issues when performing bulk operations immediately after adding shares)
+
+### Fixed
+- Add Share dialog now honors Enabled=false selection (no longer forcibly enabled on save)
+- Auto-unmap previous drive when changing a share's drive letter (when UnmapOldMapping preference is enabled)
+- CLI Preferences menu ensures SyncShareNameToDriveLabel exists on first run (backfills for older configs)
+
 ## [2.1.0] - 2025-10-26
 
 ### Added
@@ -179,7 +219,12 @@ Major upgrade from the 1.x line (e.g., v1.1.2 in `Old_Share_Manager.ps1`) to a m
 - Event handler closures explicitly capture variables (GetNewClosure) to avoid unexpected behavior.
 - Variable interpolation corrected in strings (for example, using `${username}:` to avoid scope parsing issues).
 
-### Migration Notes (from 1.x)
+## Migration Notes
+
+**v2.1.1:**
+- Config files from older versions (2.0.0, 2.1.0) are automatically upgraded in-memory to add new properties (e.g., Enabled, SyncShareNameToDriveLabel) on every load. No manual migration needed.
+
+**v2.0.0:**
 - On first run of v2.0.0, credentials are migrated from AES (`cred.txt`/`key.bin`) to DPAPI (`creds.json`) where applicable.
 - Configuration moves from `config.json` (single-share) to `shares.json` (multi-share). Import your existing share into the new format, then use Import & Merge/Replace as needed.
 - Exports never include credentials. You will be prompted to add missing credentials when they are referenced.
