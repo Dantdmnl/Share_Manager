@@ -2329,7 +2329,7 @@ function Initialize-Config-CLI {
             Write-Host "  Continuing with manual setup..." -ForegroundColor Cyan
             Write-Host ""
             Write-Host "  Press any key to add your first share..." -ForegroundColor DarkGray
-            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            $null = Read-Host
             Add-NewShareCli
     } elseif (-not (Test-Path $backupPath)) {
             Write-Host ""
@@ -2347,7 +2347,7 @@ function Initialize-Config-CLI {
             Write-Host "  Continuing with manual setup..." -ForegroundColor Cyan
             Write-Host ""
             Write-Host "  Press any key to add your first share..." -ForegroundColor DarkGray
-            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            $null = Read-Host
             Add-NewShareCli
         } else {
             Write-Host ""
@@ -2369,14 +2369,14 @@ function Initialize-Config-CLI {
                 Write-Host "  [!] Import failed. Continuing with manual setup..." -ForegroundColor Yellow
                 Write-Host ""
                 Write-Host "  Press any key to add your first share..." -ForegroundColor DarkGray
-                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+                $null = Read-Host
                 Add-NewShareCli
             }
         }
     } else {
         Write-Host ""
         Write-Host "  Press any key to add your first share..." -ForegroundColor DarkGray
-        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        $null = Read-Host
         Add-NewShareCli
     }
     
@@ -2391,7 +2391,7 @@ function Initialize-Config-CLI {
     }
     Write-Host ""
     Write-Host "  Press any key to continue..." -ForegroundColor DarkGray
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    $null = Read-Host
     return $true
 }
 
@@ -2689,7 +2689,7 @@ function Start-CliMode {
                 Show-ShareStatusCli
                 Write-Host ""
                 Write-Host "  Press any key..." -ForegroundColor DarkGray
-                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+                $null = Read-Host
             }
             
             # Settings & Tools
@@ -2725,7 +2725,7 @@ function Start-CliMode {
                         Get-LogEvents @params
                         Write-Host ""
                         Write-Host "  Press any key to continue..." -ForegroundColor DarkGray
-                        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+                        $null = Read-Host
                     }
                     default { }
                 }
@@ -2753,7 +2753,7 @@ function Start-CliMode {
         if ($choice -notin @("Q", "G", "3", "B", "P", "D", "C", "N") + $autoContinue) { 
             Write-Host ""
             Write-Host "  Press any key..." -ForegroundColor DarkGray
-            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            $null = Read-Host
         }
     } while ($true)
 }
@@ -2962,7 +2962,7 @@ function Show-BatchOperationsMenu {
             Write-Host "  No shares configured." -ForegroundColor Yellow
             Write-Host ""
             Write-Host "  Press any key..." -ForegroundColor DarkGray
-            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            $null = Read-Host
             return
         }
         
@@ -2984,7 +2984,7 @@ function Show-BatchOperationsMenu {
             Write-Host "  No shares match current filter." -ForegroundColor Yellow
             Write-Host ""
             Write-Host "  Press any key..." -ForegroundColor DarkGray
-            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            $null = Read-Host
             return
         }
         
@@ -3041,7 +3041,7 @@ function Show-BatchOperationsMenu {
                 }
                 Write-Host ""
                 Write-Host "  Press any key..." -ForegroundColor DarkGray
-                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+                $null = Read-Host
             }
             "2" {
                 # Disable selected
@@ -3073,7 +3073,7 @@ function Show-BatchOperationsMenu {
                 }
                 Write-Host ""
                 Write-Host "  Press any key..." -ForegroundColor DarkGray
-                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+                $null = Read-Host
             }
             "3" {
                 # Enable all
@@ -3101,7 +3101,7 @@ function Show-BatchOperationsMenu {
                 }
                 Write-Host ""
                 Write-Host "  Press any key..." -ForegroundColor DarkGray
-                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+                $null = Read-Host
             }
             "4" {
                 # Disable all
@@ -3129,7 +3129,7 @@ function Show-BatchOperationsMenu {
                 }
                 Write-Host ""
                 Write-Host "  Press any key..." -ForegroundColor DarkGray
-                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+                $null = Read-Host
             }
             "B" { return }
             default {
@@ -3210,7 +3210,7 @@ function Select-SharesInteractive {
             if ($result.Count -eq 0) {
                 Write-Host ""
                 Write-Host "  No shares selected. Press any key to continue..." -ForegroundColor Yellow
-                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+                $null = Read-Host
                 continue
             }
             return ,$result
@@ -3888,7 +3888,7 @@ function Connect-AllSharesCli {
     Write-Host "  ------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  Press any key to continue..." -ForegroundColor DarkGray
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    $null = Read-Host
 }
 
 function Reset-AllSharesCli {
@@ -3908,7 +3908,7 @@ function Reset-AllSharesCli {
         Write-Host "  No enabled shares configured." -ForegroundColor Yellow
         Write-Host ""
         Write-Host "  Press any key..." -ForegroundColor DarkGray
-        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        $null = Read-Host
         return
     }
     
@@ -3989,7 +3989,7 @@ function Reset-AllSharesCli {
     Write-Host "  ------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  Press any key to continue..." -ForegroundColor DarkGray
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    $null = Read-Host
 }
 
 function Disconnect-AllSharesCli {
@@ -4046,7 +4046,7 @@ function Disconnect-AllSharesCli {
     Write-Host "  ------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  Press any key to continue..." -ForegroundColor DarkGray
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    $null = Read-Host
 }
 
 function Show-ShareStatusCli {
@@ -4147,7 +4147,7 @@ function Import-ExportConfigCli {
             }
             Write-Host ""
             Write-Host "  Press any key..." -ForegroundColor DarkGray
-            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            $null = Read-Host
         }
         "2" {
             Write-Host "  +- IMPORT & REPLACE ---------------------+" -ForegroundColor Yellow
@@ -4191,7 +4191,7 @@ function Import-ExportConfigCli {
                 }
                 Write-Host ""
                 Write-Host "  Press any key..." -ForegroundColor DarkGray
-                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+                $null = Read-Host
             }
         }
         "3" {
@@ -4233,7 +4233,7 @@ function Import-ExportConfigCli {
                 }
                 Write-Host ""
                 Write-Host "  Press any key..." -ForegroundColor DarkGray
-                $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+                $null = Read-Host
             }
         }
     }
@@ -4461,14 +4461,14 @@ function Set-CliPreferences {
                     Write-Host "Shares will reconnect at next logon." -ForegroundColor Green
                     Write-Host ""
                     Write-Host "Press any key to continue..." -ForegroundColor DarkGray
-                    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+                    $null = Read-Host
                 } elseif (-not $config.Preferences.PersistentMapping -and $oldPersistent) {
                     # Disabling persistent mapping - remove logon script
                     Remove-LogonScript
                     Write-Host "Shares will not reconnect at logon." -ForegroundColor Yellow
                     Write-Host ""
                     Write-Host "Press any key to continue..." -ForegroundColor DarkGray
-                    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+                    $null = Read-Host
                 }
                 
                 Write-Host "Updated." -ForegroundColor Green
