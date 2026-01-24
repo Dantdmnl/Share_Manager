@@ -34,7 +34,7 @@ Easily manage and map network shares using this PowerShell script with support f
 - A reachable NAS or network share location.
 - Script execution policy must allow running scripts:
   ```powershell
-  Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Bypass
+  Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
   ```
 
 ## Usage
