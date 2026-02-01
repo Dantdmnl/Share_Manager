@@ -4,6 +4,150 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [2.2.0] - 2026-02-01
+
+### Added - Organization & Search System ⭐ NEW
+- **Favorites System**: Star your most-used shares for quick access
+  - Angle brackets in status column: `<*>` (favorite connected), `< >` (favorite disconnected)
+  - Right-click context menu: "* Toggle Favorite"
+  - Filter checkbox to show favorites only
+  - Persists across sessions in shares.json
+- **Category Organization**: Group shares by Work, Personal, Projects, etc.
+  - Category field in Add/Edit Share dialogs
+  - Dropdown filter in GUI to view shares by category
+  - Default category: "General"
+  - Auto-populated from existing shares
+- **Smart Search**: Real-time filtering as you type
+  - Searches across: Name, Path, Drive Letter, Description
+  - Search box with placeholder text in GUI
+  - `Ctrl+F` keyboard shortcut to focus search
+  - Case-insensitive matching
+- **Multi-Criteria Filtering**: Combine search + category + favorites simultaneously
+  - Status bar shows filtered count vs total shares
+  - All filters work together for precise results
+
+### Added - Analytics & History System ⭐ NEW
+- **Connection History**: Track all connection attempts with timestamps
+  - Every connection logged with ISO 8601 timestamps
+  - Success and failure events recorded
+  - Stored in structured JSONL log file
+  - Query with `Get-LogEvents` tool
+- **Usage Statistics**: View connection patterns per share
+  - `LastConnected`: Timestamp of last successful connection
+  - `ConnectionCount`: Total successful connections tracked
+  - Displayed in ListView tooltips (hover over share)
+  - Auto-incremented on each successful map
+- **Error Tracking**: Last error message stored for troubleshooting
+  - `LastError`: Most recent error message per share
+  - Helps identify recurring connection issues
+  - Visible in share properties and logs
+- **Session-Based Logging**: Correlation across operations
+  - Session IDs link operations in same script run
+  - Correlation IDs connect multi-step operations
+  - Query by session: `Get-LogEvents -SessionId <guid>`
+
+### Added - Logging & Audit Trail
+- **Comprehensive Audit Logging**: Complete operational trail at INFO level
+  - Script startup with version, mode, and share count
+  - Mode entry/exit (CLI/GUI) logging
+  - Mode switching (CLI ↔ GUI) tracked
+  - All share operations (add, update, remove) logged
+  - All mapping operations (map, unmap) logged
+  - Bulk operations logged with result counts (connect all, disconnect all, reconnect all)
+  - AutoMap script installation/updates logged
+
+### Added - CLI Improvements
+- **UNC Path Auto-Correction**: Automatically adds `\\` prefix if missing
+  - Example: `192.168.1.200\backup` → `\\192.168.1.200\backup`
+  - Visual confirmation with green message
+  - Same behavior as GUI for consistency
+- **Read-ValidatedInput Helper**: Centralized input validation
+  - Consistent validation across all CLI inputs
+  - 3-attempt retry limit with quit option
+  - User-friendly escape hatch ("Press Q to quit or any key to continue")
+  - Used for share name, path, drive letter, and username inputs
+- **Credential Prompting**: Interactive password entry when credentials missing
+  - CLI Connect All now prompts for password if credentials not found
+  - CLI Reconnect All prompts for missing credentials
+  - Offers to save credentials after successful connection
+  - Critical for restoring shares after importing credentials from another machine (DPAPI limitation)
+- **Batch Operations Enhancements**:
+  - Status indicators show [ENABLED] (green) or [DISABLED] (red) during selection
+  - Cache refresh at menu start ensures fresh data
+  - Fixed array wrapping bug preventing enable/disable operations
+- **Status Command**: Shows organized view of share states
+  - Groups by Connected, Disconnected, and Disabled
+  - Displays counts for each category
+  - Shows drive letters, names, and paths
+
+### Added - GUI Improvements
+- **Credential Prompting**: Interactive credential entry when missing
+  - Context menu Connect now prompts for credentials if not found
+  - Connect All button prompts for each share missing credentials
+  - Uses Show-CredentialForm for consistent UX
+  - Enables share connection after importing credentials from another machine
+- **Keyboard Shortcuts**:
+  - `Ctrl+N` for Add New Share - Quick access to add share dialog
+  - `Ctrl+D` for Disconnect All - Quick access to bulk disconnection
+  - Consistent keyboard-driven workflow for common operations
+  - All shortcuts documented in tips dialog and README
+
+### Changed - GDPR & Privacy (Log Level Filtering)
+- **Personal Data Protection by Design**: 
+  - Usernames, share paths, and computer names ONLY logged at DEBUG level
+  - Default INFO level shows operations without personal identifiers
+  - Log level filtering enforced in code (`$MANUAL_LOG_LEVEL = 'INFO'` default)
+- **Log Level Changes for Better UX**:
+  - Config saves: INFO → DEBUG (reduced log noise from 4+ messages per operation to 0)
+  - Mapping success: DEBUG → INFO (better visibility: "Mapped G to \\192.168.1.2\backup")
+  - Share add: DEBUG → INFO (audit trail: "Added new share: NAS")
+  - Share update: DEBUG → INFO (audit trail: "Updated share: NAS")
+  - Share remove: DEBUG → INFO (audit trail: "Removed share: NAS")
+- **AutoMap Script Privacy**:
+  - Removed username and computer name from environment logging
+  - Only logs PowerShell version and edition
+  - Personal data only at DEBUG if user explicitly enables it
+
+### Fixed - Security & Critical Bugs
+- **Cmdkey Password Handling**: Fixed special character password failures
+  - Special characters (`&`, `%`, `!`, `^`, etc.) now properly escaped
+  - Uses PowerShell call operator with argument array instead of direct string
+  - Captures output for better debugging
+  - Fixes "exit code: 1" errors when saving credentials
+- **AutoMap Script ANSI Codes**: Removed PowerShell version detection
+  - Was causing ANSI escape codes in CMD log file
+  - Now logs only "Using shell: pwsh" or "Using shell: powershell"
+  - Clean CMD log output
+- **Batch Operations Array Bug**: Fixed enable/disable operations
+  - Removed comma operator wrapping in Select-SharesInteractive return
+  - Was causing "0 enabled" when shares were actually disabled
+  - Fixed iteration to handle individual share indices correctly
+- **Cache Staleness**: Fixed stale data in batch operations
+  - Added Clear-ConfigCache at batch menu start
+  - Ensures enabled/disabled status always fresh
+- **PSScriptAnalyzer Warning**: Fixed $input variable conflict
+  - Renamed to $userInput in Read-ValidatedInput helper
+  - Avoids shadowing PowerShell automatic variable
+
+### Changed - Import/Export UI
+- **CLI Import Feedback**: Changed "Skipped: X duplicate(s)" to "Updated: X existing share(s)"
+  - Matches GUI behavior (merge updates existing shares)
+  - Cyan color for updated count
+  - Clearer terminology
+
+### Documentation
+- Updated script header with v2.2.0 enhancements
+- Updated GDPR-COMPLIANCE.md with detailed log level filtering information
+- Updated README.md security section with cmdkey fix and log level details
+- Updated CHANGELOG.md with accurate v2.2.0 changes from this session
+- Fixed example dates (2025 → 2026)
+
+### Backward Compatibility
+- ✅ Automatic upgrade from v2.1.1
+- ✅ Existing shares.json remains valid
+- ✅ All existing features preserved
+- ✅ Safe to rollback (extra logging doesn't affect data format)
+
 ## [2.1.1] - 2025-10-27
 
 ### Added

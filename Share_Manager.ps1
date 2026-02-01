@@ -1,35 +1,54 @@
 <#
 .SYNOPSIS
-    Share Manager Script - Manage multiple network shares via CLI or GUI,
-    with robust credential persistence using Windows DPAPI (per-user, per-machine).
+    Share Manager Script - Production-ready network share management with CLI/GUI interfaces.
 
 .DESCRIPTION
-    - Interactive management of multiple network shares (SMB) with both CLI and GUI interfaces.
-    - Support for multiple share configurations with profiles
-    - Quick connect/disconnect/reset functionality for shares
-    - Detailed status monitoring and error diagnostics
-    - Import/Export configuration backup
-        - Credentials stored securely using Windows DPAPI in '%APPDATA%\Share_Manager\creds.json'.
-            Legacy AES files (cred.txt/key.bin) are automatically migrated on first use; backups are created.
-    - CLI password entry shows asterisks as you type.
-    - Users can switch between CLI and GUI without losing configuration.
-    - Logs actions to '%APPDATA%\Share_Manager\Share_Manager.log', with automatic rotation.
-    - Preferences pane to toggle auto-unmapping on drive-letter change, select startup mode and persistent mapping.
-    - Version number displayed in title bars and menus.
-    - GDPR Compliance: Standard (INFO) logs contain no personal data. Share names are logged for operational 
-      purposes. Usernames only appear in DEBUG logs (disabled by default) for troubleshooting.
-    - Author: Dantdmnl.
-
+    A comprehensive network share manager featuring:
+    - Interactive CLI and GUI interfaces with seamless switching
+    - Multi-share configuration management with profiles
+    - Secure credential storage using Windows DPAPI (per-user, per-machine)
+    - Automatic credential migration from legacy AES to DPAPI
+    - Quick connect/disconnect/reconnect operations
+    - Detailed status monitoring and diagnostics
+    - Import/Export configuration with automatic backup
+    - Atomic configuration saves with rollback support
+    - Enhanced retry logic with exponential backoff
+    - Comprehensive logging (text and structured JSONL)
+    - GDPR-compliant logging (personal data only at DEBUG level)
+    - Persistent mapping with automatic reconnection at logon
+    - Theme support (Classic/Modern)
+    
+    Security Features:
+    - Credentials encrypted with Windows DPAPI (no password files)
+    - Secure password handling with memory cleanup (ZeroFreeBSTR)
+    - Automatic migration from legacy encryption
+    - Credentials stored per-user, per-machine (non-portable)
+    - Special characters in passwords properly handled via cmdkey
+    
+    Production Enhancements (v2.2.0+):
+    - Atomic file operations prevent configuration corruption
+    - Automatic backup before destructive operations
+    - Enhanced UNC path validation with auto-correction
+    - Comprehensive error messages with troubleshooting guidance
+    - Resource cleanup and disposal handlers
+    - Configuration caching for performance
+    - Complete audit trail logging (startup, operations, shutdown)
+    - Batch operations with status indicators and retry limits
+    - Input validation with user-friendly escape options
+    
 .PARAMETER StartupMode
     Optional. Pass "CLI" or "GUI" to force that mode on launch, bypassing saved preference.
 
 .VERSION
-    2.1.1
+    2.2.0
 
 .NOTES
-    - No administrator permissions are required.
+    - No administrator permissions required
     - GUI mode requires '-STA' when launching PowerShell:
       powershell.exe -ExecutionPolicy Bypass -STA -File "C:\Scripts\Share_Manager.ps1"
+    - Author: Dantdmnl
+    - License: See LICENSE file
+    - Default log level: INFO (personal data only visible at DEBUG level)
 #>
 
 param(
@@ -38,8 +57,20 @@ param(
 
 #region Global Variables (Version, Paths, Defaults)
 
-$version        = '2.1.1'
+$version        = '2.2.0'
 $author         = 'Dantdmnl'
+
+# Configuration constants
+$script:CONFIG_CACHE_MAX_AGE_SECONDS = 5
+$script:MAX_CONNECTION_RETRIES = 3
+$script:LOG_ROTATION_DAYS = 30
+$script:LOG_ROTATION_SIZE_MB = 5
+$script:CONNECTION_RETRY_BACKOFF_BASE = 2  # Exponential backoff base (2^n seconds)
+$script:CONNECTION_HISTORY_MAX = 100  # Maximum connection history entries
+$script:HEALTH_CHECK_INTERVAL_SECONDS = 300  # 5 minutes
+$script:CONNECTION_TIMEOUT_SECONDS = 5  # Timeout for connection tests
+$script:ENABLE_AUTO_RECONNECT = $false  # Set to $true to enable automatic reconnection
+
 $baseFolder     = Join-Path $env:APPDATA "Share_Manager"
 if (-not (Test-Path $baseFolder)) {
     New-Item -Path $baseFolder -ItemType Directory -Force | Out-Null
@@ -131,7 +162,7 @@ function Invoke-LogFileRotation {
     $fileInfo = Get-Item $Path
     $ageDays  = (Get-Date) - $fileInfo.LastWriteTime
     $sizeMB   = [math]::Round($fileInfo.Length / 1MB, 2)
-    if ($ageDays.TotalDays -ge 30 -or $sizeMB -ge 5) {
+    if ($ageDays.TotalDays -ge $script:LOG_ROTATION_DAYS -or $sizeMB -ge $script:LOG_ROTATION_SIZE_MB) {
         $timestamp = (Get-Date).ToString("yyyy-MM-dd_HHmmss")
         $archived  = Join-Path $baseFolder ("$Prefix`_$timestamp" + [System.IO.Path]::GetExtension($Path))
         try {
@@ -272,13 +303,26 @@ function New-ShareEntry {
         Enabled     = $Enabled
         LastConnected = $null
         CredentialId = $Username  # Links to credential storage
+        IsFavorite  = $false  # Quick access flag
+        Category    = "General"  # Share grouping
+        ConnectionCount = 0  # Track usage
+        LastError   = $null  # Last connection error
+        Tags        = @()  # Custom tags for organization
     }
 }
 
 function Import-AllShares {
     <#
     .SYNOPSIS
-        Imports all share configurations from shares.json
+        Imports all share configurations from shares.json with comprehensive validation
+    .DESCRIPTION
+        Loads and validates share configuration, repairing issues and ensuring data integrity.
+        Returns valid configuration object or default template on failure.
+    .NOTES
+        - Validates all required fields per share
+        - Removes duplicates and invalid entries
+        - Auto-repairs missing optional fields
+        - Returns safe defaults if file missing or corrupt
     #>
     if (Test-Path $sharesPath) {
         try {
@@ -293,6 +337,9 @@ function Import-AllShares {
             # Validate and repair shares array
             $validShares = @()
             $duplicateCheck = @{}
+            
+            # Track if we need to save config due to backfills
+            $configModified = $false
             
             foreach ($share in $config.Shares) {
                 # Validate required fields
@@ -343,6 +390,16 @@ function Import-AllShares {
                     $share | Add-Member -MemberType NoteProperty -Name LastConnected -Value ""
                 }
                 
+                # Backfill Category with default 'General' if missing
+                if (-not $share.PSObject.Properties['Category'] -or [string]::IsNullOrWhiteSpace($share.Category)) {
+                    if (-not $share.PSObject.Properties['Category']) {
+                        $share | Add-Member -MemberType NoteProperty -Name Category -Value 'General'
+                    } else {
+                        $share.Category = 'General'
+                    }
+                    $configModified = $true
+                }
+                
                 # Normalize drive letter to uppercase single char
                 $share.DriveLetter = $share.DriveLetter.ToUpper().Substring(0, 1)
                 
@@ -369,6 +426,12 @@ function Import-AllShares {
                 if (-not $config.Preferences.PSObject.Properties['SyncShareNameToDriveLabel']) {
                     $config.Preferences | Add-Member -MemberType NoteProperty -Name SyncShareNameToDriveLabel -Value $true
                 }
+            }
+            
+            # Save config if we backfilled any categories
+            if ($configModified) {
+                Save-AllShares -Config $config | Out-Null
+                Write-ActionLog -Message "Backfilled categories for shares during config import" -Level DEBUG -Category 'Config'
             }
             
             return $config
@@ -422,7 +485,7 @@ function Get-CachedConfig {
     #>
     param (
         [switch]$Force,
-        [int]$MaxAge = 5
+        [int]$MaxAge = $script:CONFIG_CACHE_MAX_AGE_SECONDS
     )
     
     $now = Get-Date
@@ -519,7 +582,12 @@ function Get-PreferenceValue {
     
     $config = Get-CachedConfig
     
-    if (-not $config -or -not $config.PSObject.Properties['Preferences']) {
+    # Handle null config safely
+    if ($null -eq $config) {
+        return $Default
+    }
+    
+    if (-not $config.PSObject.Properties['Preferences']) {
         return $Default
     }
     
@@ -554,10 +622,47 @@ function Save-AllShares {
             Write-ActionLog -Message "Save skipped: shares configuration unchanged" -Level DEBUG -Category 'Config'
             return $true
         }
-        $newJson | Set-Content -Path $sharesPath -Encoding UTF8 -Force
-        Write-ActionLog -Message "Saved all shares configuration" -Level INFO -Category 'Config'
-        Clear-ConfigCache  # Invalidate cache after save
-        return $true
+        
+        # Atomic write: write to temp file, then rename (prevents corruption)
+        $tempPath = "$sharesPath.tmp"
+        $backupPath = "$sharesPath.backup"
+        
+        try {
+            # Write to temp file
+            $newJson | Set-Content -Path $tempPath -Encoding UTF8 -Force
+            
+            # Create backup of existing config if it exists
+            if (Test-Path $sharesPath) {
+                Copy-Item -Path $sharesPath -Destination $backupPath -Force
+            }
+            
+            # Atomic rename (overwrites destination)
+            Move-Item -Path $tempPath -Destination $sharesPath -Force
+            
+            # Clean up backup on success
+            if (Test-Path $backupPath) {
+                Remove-Item -Path $backupPath -Force -ErrorAction SilentlyContinue
+            }
+            
+            Write-ActionLog -Message "Saved all shares configuration (atomic write)" -Level DEBUG -Category 'Config'
+            Clear-ConfigCache  # Invalidate cache after save
+            return $true
+        }
+        catch {
+            # Restore from backup if write failed
+            if (Test-Path $backupPath) {
+                Copy-Item -Path $backupPath -Destination $sharesPath -Force
+                Remove-Item -Path $backupPath -Force -ErrorAction SilentlyContinue
+                Write-ActionLog -Message "Restored config from backup after failed write" -Level WARN -Category 'Config'
+            }
+            throw
+        }
+        finally {
+            # Clean up temp file if it still exists
+            if (Test-Path $tempPath) {
+                Remove-Item -Path $tempPath -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
     catch {
         Write-ActionLog -Message "Failed to save shares config: $_" -Level ERROR -Category 'Config' -Data @{ error = ("$_") }
@@ -576,7 +681,14 @@ function Save-AllShares {
 function Add-ShareConfiguration {
     <#
     .SYNOPSIS
-        Adds a new share to the configuration
+        Adds a new share to the configuration with validation
+    .DESCRIPTION
+        Creates a new share entry with duplicate detection and atomic save.
+        Returns the created share object on success, null on failure.
+    .NOTES
+        - Validates drive letter availability across all shares (enabled or disabled)
+        - Uses atomic save to prevent configuration corruption
+        - Automatically invalidates cache after successful save
     #>
     param (
         [string]$Name,
@@ -604,12 +716,13 @@ function Add-ShareConfiguration {
         } else {
             Write-Host "Warning: Drive $DriveLetter already assigned to '$($existing.Name)'" -ForegroundColor Yellow
         }
-        return $null
+        Write-ActionLog -Message "Rejected duplicate drive letter assignment: $DriveLetter" -Level WARN -Category 'Config'
+        return $null  # FIXED: Prevent adding duplicate drive letter
     }
     
     $config.Shares += $newShare
     if (Save-AllShares -Config $config) {
-    Write-ActionLog -Message "Added new share: $Name ($SharePath -> $DriveLetter)" -Category 'Config'
+    Write-ActionLog -Message "Added new share: $Name" -Level INFO -Category 'Config'
         return $newShare
     }
     return $null
@@ -618,9 +731,17 @@ function Add-ShareConfiguration {
 function Update-ShareConfiguration {
     <#
     .SYNOPSIS
-        Updates an existing share by ID
+        Updates an existing share by ID with validation
+    .DESCRIPTION
+        Safely updates share properties with conflict detection and auto-unmapping.
+        Validates drive letter conflicts before applying changes.
+    .NOTES
+        - Prevents drive letter conflicts with other enabled shares
+        - Auto-unmaps old drive if letter changed (when preference enabled)
+        - Uses atomic save for configuration integrity
     #>
     param (
+        [Parameter(Mandatory)]
         [string]$ShareId,
         [string]$Name,
         [string]$SharePath,
@@ -685,10 +806,83 @@ function Update-ShareConfiguration {
         } catch {
             Write-ActionLog -Message "Failed to auto-unmap previous drive $oldDriveLetter after letter change: $_" -Level WARN -Category 'Mapping'
         }
-    Write-ActionLog -Message "Updated share: $($share.Name) ($ShareId)" -Category 'Config'
+    Write-ActionLog -Message "Updated share: $($share.Name)" -Level INFO -Category 'Config'
         return $true
     }
     return $false
+}
+
+function Set-ShareFavorite {
+    <#
+    .SYNOPSIS
+        Toggles favorite status for a share
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$ShareId,
+        [Parameter(Mandatory)]
+        [bool]$IsFavorite
+    )
+    
+    $config = Get-CachedConfig -Force
+    $share = $config.Shares | Where-Object { $_.Id -eq $ShareId }
+    
+    if ($share) {
+        # Add property if missing (for shares created before this feature)
+        if (-not $share.PSObject.Properties['IsFavorite']) {
+            $share | Add-Member -MemberType NoteProperty -Name IsFavorite -Value $IsFavorite
+        } else {
+            $share.IsFavorite = $IsFavorite
+        }
+        
+        Save-AllShares -Config $config | Out-Null
+        Write-ActionLog -Message "Set favorite status for share: $($share.Name) = $IsFavorite" -Level DEBUG -Category 'Config'
+        return $true
+    }
+    return $false
+}
+
+function Set-ShareCategory {
+    <#
+    .SYNOPSIS
+        Sets category for a share
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$ShareId,
+        [Parameter(Mandatory)]
+        [string]$Category
+    )
+    
+    $config = Get-CachedConfig -Force
+    $share = $config.Shares | Where-Object { $_.Id -eq $ShareId }
+    
+    if ($share) {
+        if (-not $share.PSObject.Properties['Category']) {
+            $share | Add-Member -MemberType NoteProperty -Name Category -Value $Category
+        } else {
+            $share.Category = $Category
+        }
+        
+        Save-AllShares -Config $config | Out-Null
+        Write-ActionLog -Message "Set category for share: $($share.Name) = $Category" -Level DEBUG -Category 'Config'
+        return $true
+    }
+    return $false
+}
+
+function Get-ShareCategories {
+    <#
+    .SYNOPSIS
+        Gets list of all unique categories
+    #>
+    $config = Get-CachedConfig
+    if ($config -and $config.Shares) {
+        $categories = @($config.Shares | Where-Object { $_.PSObject.Properties['Category'] -and -not [string]::IsNullOrWhiteSpace($_.Category) } | Select-Object -ExpandProperty Category -Unique | Sort-Object)
+        if ($categories.Count -eq 0) { return @('General') }
+        return $categories
+    }
+    return @('General')
 }
 
 function Remove-ShareConfiguration {
@@ -711,7 +905,7 @@ function Remove-ShareConfiguration {
     $config.Shares = @($config.Shares | Where-Object { $_.Id -ne $ShareId })
     
     if (Save-AllShares -Config $config) {
-    Write-ActionLog -Message "Removed share: $($share.Name)" -Category 'Config'
+    Write-ActionLog -Message "Removed share: $($share.Name)" -Level INFO -Category 'Config'
         return $true
     }
     return $false
@@ -728,6 +922,18 @@ function Get-ShareConfiguration {
     
     $config = Get-CachedConfig
     
+    # Handle null config safely
+    if ($null -eq $config) {
+        if ($ShareId) { return $null }
+        return @()
+    }
+    
+    # Handle null shares array
+    if ($null -eq $config.Shares) {
+        if ($ShareId) { return $null }
+        return @()
+    }
+    
     if ($ShareId) {
         # When a specific ID is requested, return the single matching object
         return ($config.Shares | Where-Object { $_.Id -eq $ShareId })
@@ -735,6 +941,78 @@ function Get-ShareConfiguration {
     
     # Always return an array when no ShareId is provided to avoid .Count/$index issues
     return @($config.Shares)
+}
+
+function Add-ConnectionHistory {
+    <#
+    .SYNOPSIS
+        Records connection event to history
+    .DESCRIPTION
+        Maintains a rolling history of connection events for analytics and troubleshooting.
+    #>
+    param(
+        [string]$ShareId,
+        [string]$ShareName,
+        [string]$Action,  # Connect, Disconnect, Failed
+        [string]$Result,  # Success, Failed
+        [string]$ErrorMessage = ""
+    )
+    
+    try {
+        $historyPath = Join-Path $baseFolder "connection_history.jsonl"
+        $entry = [PSCustomObject]@{
+            Timestamp = (Get-Date).ToString("o")
+            ShareId = $ShareId
+            ShareName = $ShareName
+            Action = $Action
+            Result = $Result
+            ErrorMessage = $ErrorMessage
+            SessionId = $script:SessionId
+        }
+        
+        ($entry | ConvertTo-Json -Compress) | Out-File -FilePath $historyPath -Encoding UTF8 -Append
+        
+        # Rotate history if too large
+        if (Test-Path $historyPath) {
+            $lines = @(Get-Content $historyPath)
+            if ($lines.Count -gt $script:CONNECTION_HISTORY_MAX) {
+                $lines[-$script:CONNECTION_HISTORY_MAX..-1] | Set-Content -Path $historyPath -Encoding UTF8
+            }
+        }
+    }
+    catch {
+        Write-ActionLog -Message "Failed to record connection history: $_" -Level DEBUG -Category 'History'
+    }
+}
+
+function Get-ConnectionHistory {
+    <#
+    .SYNOPSIS
+        Retrieves connection history with optional filtering
+    #>
+    param(
+        [string]$ShareId,
+        [int]$Last = 10
+    )
+    
+    $historyPath = Join-Path $baseFolder "connection_history.jsonl"
+    if (-not (Test-Path $historyPath)) { return @() }
+    
+    try {
+        $history = Get-Content $historyPath -Encoding UTF8 | ForEach-Object {
+            try { $_ | ConvertFrom-Json } catch { $null }
+        } | Where-Object { $_ -ne $null }
+        
+        if ($ShareId) {
+            $history = $history | Where-Object { $_.ShareId -eq $ShareId }
+        }
+        
+        return @($history | Select-Object -Last $Last)
+    }
+    catch {
+        Write-ActionLog -Message "Failed to read connection history: $_" -Level WARN -Category 'History'
+        return @()
+    }
 }
 
 function Test-ShareConnection {
@@ -876,22 +1154,45 @@ function Import-ShareConfiguration {
         $added = 0
         $skipped = 0
         
+        # Auto-backup existing config before destructive operations (non-merge imports)
+        if (-not $Merge -and (Test-Path $sharesPath)) {
+            $timestamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
+            $autoBackupPath = Join-Path $baseFolder "shares_preimport_$timestamp.json"
+            try {
+                Copy-Item -Path $sharesPath -Destination $autoBackupPath -Force
+                Write-ActionLog -Message "Auto-backup created before import: $autoBackupPath" -Category 'BackupRestore'
+                if ($UseGUI) {
+                    # Inform user about auto-backup (non-intrusive)
+                    Write-ActionLog -Message "Config backed up to: $autoBackupPath" -Level INFO -Category 'BackupRestore'
+                }
+            }
+            catch {
+                Write-ActionLog -Message "Warning: Could not create auto-backup: $_" -Level WARN -Category 'BackupRestore'
+                # Continue with import even if backup fails (user was warned)
+            }
+        }
+        
         if ($Merge) {
-            # Merge with existing (skip duplicates)
+            # Merge with existing (update duplicates, add new)
             $config = Get-CachedConfig
             
             foreach ($share in $importData.Shares) {
                 # Check if duplicate exists (same SharePath OR same DriveLetter)
-                $isDuplicate = $config.Shares | Where-Object {
+                $existing = $config.Shares | Where-Object {
                     $_.SharePath -eq $share.SharePath -or $_.DriveLetter -eq $share.DriveLetter
                 }
                 
-                if (-not $isDuplicate) {
+                if (-not $existing) {
                     # Generate new ID to avoid conflicts
                     $share.Id = [guid]::NewGuid().ToString()
                     $config.Shares += $share
                     $added++
                 } else {
+                    # Update existing share with imported properties (IsFavorite, Category, Description, etc.)
+                    if ($share.PSObject.Properties['IsFavorite']) { $existing.IsFavorite = $share.IsFavorite }
+                    if ($share.PSObject.Properties['Category']) { $existing.Category = $share.Category }
+                    if ($share.PSObject.Properties['Description']) { $existing.Description = $share.Description }
+                    if ($share.PSObject.Properties['Enabled']) { $existing.Enabled = $share.Enabled }
                     $skipped++
                 }
             }
@@ -907,6 +1208,7 @@ function Import-ShareConfiguration {
         }
         
         if (Save-AllShares -Config $config) {
+            Clear-ConfigCache  # Force refresh so GUI shows imported shares immediately
             Write-ActionLog -Message "Imported configuration from $ImportPath (Merge: $Merge)" -Category 'BackupRestore' -Data @{ path = $ImportPath; merge = $Merge; added = $added }
             return @{ Success = $true; Added = $added; Skipped = $skipped }
         }
@@ -930,14 +1232,21 @@ function Import-ShareConfiguration {
 function Get-DetailedShareStatus {
     <#
     .SYNOPSIS
-        Gets detailed status information for a share
+        Gets detailed status information for a share with diagnostics
+    .DESCRIPTION
+        Provides comprehensive status including connection state, host availability,
+        credentials, and diagnostic information for troubleshooting.
     #>
     param (
+        [Parameter(Mandatory)]
         [string]$ShareId
     )
     
     $share = Get-ShareConfiguration -ShareId $ShareId
-    if (-not $share) { return $null }
+    if (-not $share) { 
+        Write-ActionLog -Message "Get-DetailedShareStatus: Share not found: $ShareId" -Level WARN -Category 'Status'
+        return $null 
+    }
     
     $status = [PSCustomObject]@{
         Share = $share
@@ -1180,7 +1489,7 @@ function Save-Credential {
         if (-not $UseGUI) {
             Write-Host "  [OK] Credentials saved for $user" -ForegroundColor Green
         }
-        Write-ActionLog -Message "Saved credential for $user" -Category 'Credentials'
+        Write-ActionLog -Message "Saved credential for $user" -Level DEBUG -Category 'Credentials'
     }
     catch {
         if ($UseGUI) {
@@ -1200,8 +1509,23 @@ function Save-Credential {
 
 # Utility: Get-StartupFolder (returns user's Startup folder)
 function Get-StartupFolder {
-    $shell = New-Object -ComObject WScript.Shell
-    return $shell.SpecialFolders.Item('Startup')
+    # Use direct path for Windows 11+ compatibility (COM object can be unreliable)
+    $startupPath = [System.IO.Path]::Combine($env:APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
+    if (-not (Test-Path $startupPath)) {
+        try {
+            New-Item -Path $startupPath -ItemType Directory -Force | Out-Null
+        } catch {
+            # Fallback to COM object if direct path fails
+            try {
+                $shell = New-Object -ComObject WScript.Shell
+                return $shell.SpecialFolders.Item('Startup')
+            } catch {
+                # Last resort: use well-known path
+                return [System.IO.Path]::Combine($env:USERPROFILE, 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
+            }
+        }
+    }
+    return $startupPath
 }
 
 # Utility: Add Ctrl+A support to textbox for select all
@@ -1320,9 +1644,25 @@ function Get-AllCredentials {
 }
 
 function Remove-Credential {
+    <#
+    .SYNOPSIS
+        Removes stored credentials with validation
+    .DESCRIPTION
+        Safely removes credentials from the store with proper error handling.
+        Supports removing single credential by username or all credentials.
+    #>
     param([string]$Username)
 
     $removed = $false
+
+    # Validate credential store exists before attempting removal
+    if (-not (Test-Path $credentialsStorePath) -and -not (Test-Path $credentialPath)) {
+        if (-not $UseGUI) {
+            Write-Host "No credentials stored." -ForegroundColor Yellow
+        }
+        Write-ActionLog -Message "No credential files found to remove" -Level DEBUG -Category 'Credentials'
+        return $false
+    }
 
     # Prefer removing from JSON store
     if (Test-Path $credentialsStorePath) {
@@ -1595,11 +1935,31 @@ function Read-Password {
 
 #region Network Check & Mapping Functions
 
+function Test-ValidUncPath {
+    <#
+    .SYNOPSIS
+        Validates UNC path format
+    .DESCRIPTION
+        Checks if path is a valid UNC format: \\server\share
+        Server name must be at least 2 characters, share name at least 1 character
+    #>
+    param ([string]$Path)
+    
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    
+    # Valid UNC: \\servername\sharename (minimum lengths enforced)
+    # Server: 2+ chars, Share: 1+ chars
+    return ($Path -match '^\\\\[^\\]{2,}\\[^\\]+.*$')
+}
+
 function Test-ShareOnline {
     param ([string]$SharePath)
-    if ($SharePath -notmatch '^\\\\([^\\]+)\\') {
+    
+    # Validate UNC format first
+    if (-not (Test-ValidUncPath -Path $SharePath)) {
         return $false
     }
+    
     if ($SharePath -match '^\\\\([^\\]+)\\') {
         $shareHost = $Matches[1]
     }
@@ -1670,7 +2030,7 @@ function Connect-NetworkShare {
         elseif (-not $UseGUI) {
             Write-Host "Share host not reachable. Skipping mapping." -ForegroundColor Yellow
         }
-        Write-ActionLog "Skipped mapping $DriveLetter -> $SharePath (offline)"
+        Write-ActionLog "Skipped mapping $DriveLetter -> $SharePath (offline)" -Level DEBUG
         if ($ReturnStatus) {
             return @{ Success = $false; ErrorType = "Offline"; ErrorMessage = "Share host not reachable" }
         }
@@ -1678,10 +2038,22 @@ function Connect-NetworkShare {
     }
 
     try {
-        $user          = $Credential.UserName
-        $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-            [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
-        )
+        $user = $Credential.UserName
+        $bstrPtr = [IntPtr]::Zero
+        $plainPassword = $null
+        
+        try {
+            # Securely extract password
+            $bstrPtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
+            $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstrPtr)
+        }
+        finally {
+            # CRITICAL: Always zero and free the BSTR to prevent password leaks
+            if ($bstrPtr -ne [IntPtr]::Zero) {
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstrPtr)
+            }
+        }
+        
         # If persistent, store credentials in Windows Credential Manager (smart update)
         if ($persistent) {
             # Extract only the server name from the UNC path (e.g., \\server)
@@ -1714,19 +2086,23 @@ function Connect-NetworkShare {
             if ($needsUpdate) {
                 # Remove any existing credentials for this server
                 cmdkey /delete:$target 2>&1 | Out-Null
-                # Add credentials for the server
-                cmdkey /add:$target /user:$user /pass:$plainPassword 2>&1 | Out-Null
+                # Add credentials for the server - use quoted arguments to handle special characters
+                $cmdkeyArgs = @('/add:' + $target, '/user:' + $user, '/pass:' + $plainPassword)
+                $cmdkeyOutput = & cmdkey $cmdkeyArgs 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    Write-ActionLog -Message "Cmdkey failed to store credentials for $target (exit code: $LASTEXITCODE)" -Level WARN -Category 'Credentials' -Data @{ output = ($cmdkeyOutput | Out-String) }
+                }
             }
         }
         
         # Enhanced retry logic with exponential backoff
-        $maxAttempts = 3
+        $maxAttempts = $script:MAX_CONNECTION_RETRIES
         $mapped = $false
         $lastError = $null
         
         for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
             if ($attempt -gt 1) {
-                $backoff = [math]::Pow(2, $attempt - 1)  # 2s, 4s
+                $backoff = [math]::Pow($script:CONNECTION_RETRY_BACKOFF_BASE, $attempt - 1)  # 2s, 4s, 8s
                 Write-ActionLog -Message "Retry attempt $attempt/$maxAttempts after ${backoff}s delay" -Level DEBUG -Category 'Mapping'
                 Start-Sleep -Seconds $backoff
             }
@@ -1774,21 +2150,33 @@ function Connect-NetworkShare {
                 Write-ActionLog -Message "Connection verification failed: $_" -Level WARN -Category 'Mapping'
             }
             
-            if ($persistent) { Install-LogonScript -Silent:$Silent }
-            if ($UseGUI -and -not $Silent) {
-                $msg = "Mapped $DriveLetter -> $SharePath"
-                if ($persistent) { $msg += " (persistent)" }
-                [System.Windows.Forms.MessageBox]::Show(
-                    $msg,
-                    "Share Manager v$version",
-                    [System.Windows.Forms.MessageBoxButtons]::OK,
-                    [System.Windows.Forms.MessageBoxIcon]::Information
-                )
+            # Update connection statistics
+            try {
+                $config = Get-CachedConfig -Force
+                $shareObj = $config.Shares | Where-Object { $_.DriveLetter -eq $DriveLetter }
+                if ($shareObj) {
+                    # Increment connection count
+                    if (-not $shareObj.PSObject.Properties['ConnectionCount']) {
+                        $shareObj | Add-Member -MemberType NoteProperty -Name ConnectionCount -Value 1
+                    } else {
+                        $shareObj.ConnectionCount++
+                    }
+                    
+                    # Clear last error
+                    if ($shareObj.PSObject.Properties['LastError']) {
+                        $shareObj.LastError = $null
+                    }
+                    
+                    Save-AllShares -Config $config | Out-Null
+                    
+                    # Record to history
+                    Add-ConnectionHistory -ShareId $shareObj.Id -ShareName $shareObj.Name -Action "Connect" -Result "Success"
+                }
+            } catch {
+                Write-ActionLog -Message "Failed to update connection stats: $_" -Level DEBUG -Category 'Mapping'
             }
-            elseif (-not $UseGUI -and -not $Silent) {
-                Write-Host "Drive $DriveLetter mapped to $SharePath." -ForegroundColor Green
-            }
-            # Optionally sync drive label with share name for better Explorer display
+            
+            # Sync drive label
             try {
                 $syncLabel = Get-PreferenceValue -Name "SyncShareNameToDriveLabel" -Default $true -AsBoolean
                 if ($syncLabel) {
@@ -1802,9 +2190,11 @@ function Connect-NetworkShare {
                         Set-MappedDriveLabel -DriveLetter $DriveLetter -SharePath $SharePath -Label $label
                     }
                 }
-            } catch { Write-ActionLog -Message "Failed to sync drive label for $DriveLetter - $_" -Level WARN -Category 'Mapping' }
+            } catch {
+                Write-ActionLog -Message "Failed to sync drive label for $DriveLetter - $_" -Level WARN -Category 'Mapping'
+            }
 
-            Write-ActionLog -Message "Mapped $DriveLetter -> $SharePath (Persistent: $persistent, Verified: $verified)" -Category 'Mapping'
+            Write-ActionLog -Message "Mapped $DriveLetter to $SharePath" -Level INFO -Category 'Mapping'
             
             if ($ReturnStatus) {
                 return @{ Success = $true; ErrorType = $null; Verified = $verified }
@@ -1812,27 +2202,31 @@ function Connect-NetworkShare {
         }
         else {
             # Classify final error for user message
-            $errorMsg = "Mapping failed. Check path/credentials."
+            $errorMsg = "Connection failed after $maxAttempts attempts. Check path and credentials."
             $errorType = "Unknown"
             if ($lastError -match "1326|Logon failure") { 
-                $errorMsg = "Authentication failed. Check username/password." 
+                $errorMsg = "Authentication failed. Verify username and password are correct." 
                 $errorType = "Authentication"
             }
             elseif ($lastError -match "53|network path") { 
-                $errorMsg = "Network path not found. Check share path." 
+                $errorMsg = "Network path not found. Verify the share path is correct and accessible." 
                 $errorType = "PathNotFound"
             }
             elseif ($lastError -match "67|network name") { 
-                $errorMsg = "Invalid network path format." 
+                $errorMsg = "Invalid network path format. Check UNC path syntax." 
                 $errorType = "InvalidPath"
             }
             elseif ($lastError -match "1219|multiple connections") { 
-                $errorMsg = "Multiple connections to server not allowed. Disconnect other shares first." 
+                $errorMsg = "Multiple connections to server not allowed with different credentials. Disconnect other shares from this server first." 
                 $errorType = "MultipleConnections"
             }
             elseif ($lastError -match "85|local device.*in use") { 
-                $errorMsg = "Drive letter already in use." 
+                $errorMsg = "Drive letter already in use by another resource." 
                 $errorType = "DriveInUse"
+            }
+            elseif ($lastError -match "1203|1231|network busy|timeout") {
+                $errorMsg = "Network timeout or server busy. Verify server is online and try again."
+                $errorType = "NetworkTimeout"
             }
             
             if ($UseGUI -and -not $Silent) {
@@ -1851,6 +2245,25 @@ function Connect-NetworkShare {
                 share = $SharePath
                 attempts = $maxAttempts
                 lastError = $lastError
+            }
+            
+            # Record failure in share metadata
+            try {
+                $config = Get-CachedConfig -Force
+                $shareObj = $config.Shares | Where-Object { $_.DriveLetter -eq $DriveLetter }
+                if ($shareObj) {
+                    if (-not $shareObj.PSObject.Properties['LastError']) {
+                        $shareObj | Add-Member -MemberType NoteProperty -Name LastError -Value $errorMsg
+                    } else {
+                        $shareObj.LastError = $errorMsg
+                    }
+                    Save-AllShares -Config $config | Out-Null
+                    
+                    # Record to history
+                    Add-ConnectionHistory -ShareId $shareObj.Id -ShareName $shareObj.Name -Action "Connect" -Result "Failed" -ErrorMessage $errorMsg
+                }
+            } catch {
+                Write-ActionLog -Message "Failed to update error status: $_" -Level DEBUG -Category 'Mapping'
             }
             
             if ($ReturnStatus) {
@@ -2291,6 +2704,21 @@ function Initialize-Config-CLI {
     Write-Host "  [OK] Preferences saved!" -ForegroundColor Green
     Write-Host ""
     
+    # Show quick tips for new features
+    Write-Host "  ======[ QUICK TIPS ]======" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Key Features:" -ForegroundColor White
+    Write-Host "    * Favorites    - Mark important shares (shown with <> brackets)" -ForegroundColor Gray
+    Write-Host "    * Categories   - Organize shares by type/purpose" -ForegroundColor Gray
+    Write-Host "    * Search       - Quick search by name or path" -ForegroundColor Gray
+    Write-Host "    * Filter       - View by category or favorites only" -ForegroundColor Gray
+    Write-Host "    * Statistics   - Track connection history and usage" -ForegroundColor Gray
+    Write-Host "    * Shortcuts    - Use C (connect all), D (disconnect all), N (reconnect all)" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "  Press any key to continue..." -ForegroundColor DarkGray
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    Write-Host ""
+    
     # Offer to import from backup or add manually
     Write-Host "  ======[ SETUP OPTIONS ]======" -ForegroundColor Cyan
     Write-Host ""
@@ -2310,7 +2738,7 @@ function Initialize-Config-CLI {
     if ($setupChoice -eq "Import") {
         Write-Host ""
         Write-Host "  Enter the full path to your backup file:" -ForegroundColor White
-        Write-Host "  (e.g., C:\Backups\shares_backup_2025-10-25.json)" -ForegroundColor DarkGray
+        Write-Host "  (e.g., C:\Backups\shares_backup_2026-02-01.json)" -ForegroundColor DarkGray
         $backupPath = Read-Host "  Path"
         
     if ([string]::IsNullOrWhiteSpace($backupPath)) {
@@ -2356,9 +2784,9 @@ function Initialize-Config-CLI {
             # Import the backup (Merge mode to preserve preferences)
             $importResult = Import-ShareConfiguration -ImportPath $backupPath -Merge:$true
             
-            if ($importResult) {
+            if ($importResult -and $importResult.Success) {
                 $cfg = Import-AllShares
-                $shareCount = $cfg.Shares.Count
+                $shareCount = if ($cfg -and $cfg.Shares) { $cfg.Shares.Count } else { 0 }
                 Write-Host ""
                 Write-Host "  [OK] Imported $shareCount share(s) from backup!" -ForegroundColor Green
                 Write-Host ""
@@ -2366,7 +2794,7 @@ function Initialize-Config-CLI {
                 Write-Host "  You'll be prompted for credentials when connecting shares." -ForegroundColor Yellow
             } else {
                 Write-Host ""
-                Write-Host "  [!] Import failed. Continuing with manual setup..." -ForegroundColor Yellow
+                Write-Host "  [!] Import failed or returned no data. Continuing with manual setup..." -ForegroundColor Yellow
                 Write-Host ""
                 Write-Host "  Press any key to add your first share..." -ForegroundColor DarkGray
                 $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
@@ -2466,11 +2894,18 @@ function Initialize-Config-GUI {
             # Import the backup (Merge mode to preserve preferences)
             $importResult = Import-ShareConfiguration -ImportPath $backupPath -Merge:$true
             
-            if ($importResult) {
+            if ($importResult -and $importResult.Success) {
                 $cfg = Import-AllShares
-                $shareCount = $cfg.Shares.Count
+                $totalShares = $cfg.Shares.Count
+                $msgParts = @("Import complete!")
+                if ($importResult.Added -gt 0) { $msgParts += "$($importResult.Added) new share(s) added" }
+                if ($importResult.Skipped -gt 0) { $msgParts += "$($importResult.Skipped) existing share(s) updated" }
+                $msgParts += "`nTotal shares: $totalShares"
+                $msgParts += "`nNote: Credentials were not included in the backup."
+                $msgParts += "You'll be prompted for credentials when connecting shares."
+                
                 [System.Windows.Forms.MessageBox]::Show(
-                    "Successfully imported $shareCount share(s) from backup!`n`nNote: Credentials were not included in the backup.`nYou'll be prompted for credentials when connecting shares.",
+                    ($msgParts -join "`n"),
                     "Share Manager v$version - Import Complete",
                     [System.Windows.Forms.MessageBoxButtons]::OK,
                     [System.Windows.Forms.MessageBoxIcon]::Information
@@ -2508,6 +2943,25 @@ function Initialize-Config-GUI {
         }
     }
     
+    # Show Quick Tips for key features
+    [void][System.Windows.Forms.MessageBox]::Show(
+        "Quick Tips - Key Features:`n`n" +
+        "* FAVORITES - Right-click any share, select 'Toggle Favorite'`n" +
+        "  (Favorites show with <> brackets)`n`n" +
+        "* CATEGORIES - Organize shares by type/purpose`n" +
+        "  (Set category when adding/editing shares)`n`n" +
+        "* SEARCH & FILTER - Use Ctrl+F to search, filter by category/favorites`n`n" +
+        "* KEYBOARD SHORTCUTS:`n" +
+        "  - Ctrl+N: Add New  - Ctrl+F: Search  - Ctrl+R: Refresh`n" +
+        "  - Ctrl+A: Connect All  - Ctrl+D: Disconnect All  - Delete: Remove`n" +
+        "  - Delete: Remove selected share`n`n" +
+        "* STATISTICS - Track connection history and usage per share`n`n" +
+        "Ready to continue?",
+        "Share Manager v$version - Quick Tips",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Information
+    )
+    
     # Final completion message
     [System.Windows.Forms.MessageBox]::Show(
         "Setup complete!`n`nYou're all set to use Share Manager.`n`nYou can:`n- Add more shares`n- Connect/disconnect shares`n- Manage credentials`n- Configure settings`n`nEnjoy!",
@@ -2523,10 +2977,23 @@ function Initialize-Config-GUI {
 
 #region Credential GUI Form
 
+function Get-RecentUsernames {
+    <#
+    .SYNOPSIS
+        Gets list of recently used usernames from credential store
+    #>
+    $store = Import-CredentialStore
+    if ($store -and $store.Entries) {
+        return @($store.Entries | Select-Object -ExpandProperty Username | Sort-Object -Unique)
+    }
+    return @()
+}
+
 function Show-CredentialForm {
     param(
         [string]$Username = "",
-        [string]$Message = "Enter credentials"
+        [string]$Message = "Enter credentials",
+        [switch]$ShowUsernameDropdown
     )
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
@@ -2545,11 +3012,25 @@ function Show-CredentialForm {
     $lblUser.Width = 80
     $form.Controls.Add($lblUser)
 
-    $txtUser = New-Object System.Windows.Forms.TextBox
+    # Use ComboBox for smart username suggestions
+    $txtUser = New-Object System.Windows.Forms.ComboBox
     $txtUser.Left = 110
     $txtUser.Top = 18
     $txtUser.Width = 200
-    $txtUser.Text = $Username
+    $txtUser.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown
+    $txtUser.AutoCompleteMode = [System.Windows.Forms.AutoCompleteMode]::SuggestAppend
+    $txtUser.AutoCompleteSource = [System.Windows.Forms.AutoCompleteSource]::ListItems
+    
+    if ($ShowUsernameDropdown) {
+        $recentUsers = Get-RecentUsernames
+        foreach ($user in $recentUsers) {
+            [void]$txtUser.Items.Add($user)
+        }
+    }
+    
+    if ($Username) {
+        $txtUser.Text = $Username
+    }
     $form.Controls.Add($txtUser)
 
     $lblPass = New-Object System.Windows.Forms.Label
@@ -2621,8 +3102,17 @@ function Show-CredentialForm {
 
 #region CLI Interface
 function Start-CliMode {
+    Write-ActionLog -Message "Entering CLI mode" -Level INFO -Category 'Startup'
+    
     # Migrate legacy config if needed
     Convert-LegacyConfig
+    
+    # Ensure automap scripts exist if persistent mapping is enabled
+    $persistent = Get-PreferenceValue -Name "PersistentMapping" -Default $false -AsBoolean
+    if ($persistent) {
+        # Always call Install-LogonScript to ensure scripts are up-to-date
+        Install-LogonScript -Silent
+    }
     
     do {
         Show-CLI-Menu
@@ -2734,12 +3224,14 @@ function Start-CliMode {
             # Navigation
             "G" {
                 Write-Host "  Switching to GUI mode..." -ForegroundColor Cyan
+                Write-ActionLog -Message "Switching from CLI to GUI mode" -Level INFO -Category 'Startup'
                 Start-Process -FilePath "powershell.exe" `
                     -ArgumentList "-ExecutionPolicy Bypass -STA -File `"$PSCommandPath`" -StartupMode GUI" `
                     -WindowStyle Normal
                 exit
             }
             "Q" { 
+                Write-ActionLog -Message "User exited CLI mode" -Level INFO -Category 'Startup'
                 exit 
             }
             
@@ -2809,23 +3301,33 @@ function Show-ManageSharesMenu {
         }
         
         Write-Host ""
+        Write-Host "  Status  #  Name" -ForegroundColor DarkGray
+        Write-Host "  ------  -- ----" -ForegroundColor DarkGray
         # Show shares with quick actions
         $index = 1
         foreach ($share in $shares) {
             $connected = Test-ShareConnection -DriveLetter $share.DriveLetter
-            $icon = if ($connected) { "[*]" } else { "[ ]" }
-            $color = if ($connected) { "Green" } else { "Red" }
+            $statusText = if ($connected) { "MAPPED" } else { " ---- " }
+            $statusColor = if ($connected) { "Green" } else { "DarkGray" }
+            $nameColor = if ($connected) { "White" } else { if ($share.Enabled) { "Gray" } else { "DarkGray" } }
             $enabledIndicator = if (-not $share.Enabled) { " [DISABLED]" } else { "" }
             
-            Write-Host "  $icon $index. " -ForegroundColor $color -NoNewline
-            Write-Host "$($share.Name) " -ForegroundColor $(if ($connected) { "White" } else { "Gray" }) -NoNewline
-            Write-Host "[$($share.DriveLetter):]" -ForegroundColor DarkGray -NoNewline
+            # Format: [STATUS] # Name [X:] (\\path)
+            Write-Host "  [" -NoNewline -ForegroundColor DarkGray
+            Write-Host $statusText -NoNewline -ForegroundColor $statusColor
+            Write-Host "] " -NoNewline -ForegroundColor DarkGray
+            
+            $idxStr = $index.ToString().PadLeft(2)
+            Write-Host "$idxStr " -NoNewline -ForegroundColor White
+            
+            Write-Host "$($share.Name)" -NoNewline -ForegroundColor $nameColor
             if ($enabledIndicator) {
-                Write-Host $enabledIndicator -ForegroundColor Red
-            } else {
-                Write-Host ""
+                Write-Host $enabledIndicator -NoNewline -ForegroundColor Red
             }
-            Write-Host "      $($share.SharePath)" -ForegroundColor DarkGray
+            Write-Host " " -NoNewline
+            Write-Host "[$($share.DriveLetter):]" -NoNewline -ForegroundColor DarkCyan
+            Write-Host " " -NoNewline
+            Write-Host "$($share.SharePath)" -ForegroundColor DarkGray
             
             $index++
         }
@@ -2833,7 +3335,9 @@ function Show-ManageSharesMenu {
         Write-Host ""
         Write-Host "  Actions:" -ForegroundColor DarkGray
         Write-Host "    1-$($shares.Count)" -NoNewline -ForegroundColor White
-        Write-Host " - Connect/Disconnect share" -ForegroundColor Gray
+        Write-Host " - Toggle connect/disconnect  " -NoNewline -ForegroundColor Gray
+        Write-Host "S" -NoNewline -ForegroundColor Green
+        Write-Host " - Show status" -ForegroundColor Gray
         Write-Host "    E" -NoNewline -ForegroundColor Cyan
         Write-Host " - Edit share  " -NoNewline -ForegroundColor Gray
         Write-Host "R" -NoNewline -ForegroundColor Cyan
@@ -2848,6 +3352,53 @@ function Show-ManageSharesMenu {
         Write-Host "  > " -NoNewline -ForegroundColor White
         $choice = Read-Host
         $choice = $choice.Trim().ToUpper()
+        
+        # Status command
+        if ($choice -eq "S") {
+            Clear-Host
+            Write-Host ""
+            Write-Host "  ======[ CONNECTION STATUS ]======" -ForegroundColor Green
+            Write-Host ""
+            
+            $connected = @($shares | Where-Object { Test-ShareConnection -DriveLetter $_.DriveLetter })
+            $disconnected = @($shares | Where-Object { -not (Test-ShareConnection -DriveLetter $_.DriveLetter) -and $_.Enabled })
+            $disabled = @($shares | Where-Object { -not $_.Enabled })
+            
+            Write-Host "  Connected: " -NoNewline -ForegroundColor Green
+            Write-Host "$($connected.Count)" -ForegroundColor White
+            if ($connected.Count -gt 0) {
+                foreach ($s in $connected) {
+                    Write-Host "    [$($s.DriveLetter):] " -NoNewline -ForegroundColor DarkCyan
+                    Write-Host "$($s.Name) " -NoNewline -ForegroundColor White
+                    Write-Host "-> $($s.SharePath)" -ForegroundColor DarkGray
+                }
+            }
+            
+            Write-Host ""
+            Write-Host "  Disconnected: " -NoNewline -ForegroundColor Yellow
+            Write-Host "$($disconnected.Count)" -ForegroundColor White
+            if ($disconnected.Count -gt 0) {
+                foreach ($s in $disconnected) {
+                    Write-Host "    [$($s.DriveLetter):] " -NoNewline -ForegroundColor DarkGray
+                    Write-Host "$($s.Name)" -ForegroundColor Gray
+                }
+            }
+            
+            if ($disabled.Count -gt 0) {
+                Write-Host ""
+                Write-Host "  Disabled: " -NoNewline -ForegroundColor Red
+                Write-Host "$($disabled.Count)" -ForegroundColor White
+                foreach ($s in $disabled) {
+                    Write-Host "    [$($s.DriveLetter):] " -NoNewline -ForegroundColor DarkGray
+                    Write-Host "$($s.Name)" -ForegroundColor DarkGray
+                }
+            }
+            
+            Write-Host ""
+            Write-Host "  Press any key..." -ForegroundColor DarkGray
+            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            continue
+        }
         
         # Check if numeric choice
         $num = 0
@@ -2956,7 +3507,10 @@ function Show-BatchOperationsMenu {
         Write-Host "  Quickly enable or disable multiple shares at once" -ForegroundColor DarkGray
         Write-Host ""
         
+        # Always get fresh data to show current enabled/disabled states
         $allShares = @(Get-ShareConfiguration)
+        Clear-ConfigCache
+        $allShares = @(Get-CachedConfig -Force).Shares
         
         if ($allShares.Count -eq 0) {
             Write-Host "  No shares configured." -ForegroundColor Yellow
@@ -3013,27 +3567,33 @@ function Show-BatchOperationsMenu {
         switch ($choice) {
             "1" {
                 # Enable selected
-                $selectedIndices = @(Select-SharesInteractive -Shares $shares -Title "SELECT SHARES TO ENABLE")
+                $selectedIndices = @(Select-SharesInteractive -Shares $shares -Title "SELECT SHARES TO ENABLE" -ShowStatus)
                 if ($selectedIndices.Count -gt 0) {
+                    # Force reload to get absolute latest state
+                    Clear-ConfigCache
                     $config = Get-CachedConfig -Force
                     $enabled = 0
                     $shareNames = @()
-                    foreach ($index in $selectedIndices) {
-                        $shareName = $shares[$index].Name
+                    foreach ($index in @($selectedIndices)) {
+                        $selectedShare = $shares[$index]
+                        $shareName = $selectedShare.Name
                         $configShare = $config.Shares | Where-Object { $_.Name -eq $shareName } | Select-Object -First 1
-                        if ($configShare) {
+                        if ($configShare -and -not $configShare.Enabled) {
                             $configShare.Enabled = $true
                             $shareNames += $shareName
                             $enabled++
                         }
                     }
-                    if (Save-AllShares -Config $config) {
+                    if ($enabled -gt 0 -and (Save-AllShares -Config $config)) {
                         Write-Host ""
                         Write-Host "  [OK] Enabled $enabled share(s):" -ForegroundColor Green
                         foreach ($name in $shareNames) {
                             Write-Host "    - $name" -ForegroundColor Gray
                         }
                         Write-ActionLog -Message "Batch enabled $enabled shares" -Category 'Config'
+                    } elseif ($enabled -eq 0) {
+                        Write-Host ""
+                        Write-Host "  [!] Selected shares are already enabled" -ForegroundColor Yellow
                     }
                 } else {
                     Write-Host ""
@@ -3045,27 +3605,34 @@ function Show-BatchOperationsMenu {
             }
             "2" {
                 # Disable selected
-                $selectedIndices = @(Select-SharesInteractive -Shares $shares -Title "SELECT SHARES TO DISABLE")
+                $selectedIndices = @(Select-SharesInteractive -Shares $shares -Title "SELECT SHARES TO DISABLE" -ShowStatus)
                 if ($selectedIndices.Count -gt 0) {
+                    # Force reload to get absolute latest state
+                    Clear-ConfigCache
                     $config = Get-CachedConfig -Force
                     $disabled = 0
                     $shareNames = @()
-                    foreach ($index in $selectedIndices) {
-                        $shareName = $shares[$index].Name
+                    # Ensure we iterate through individual indices, not arrays
+                    foreach ($index in @($selectedIndices)) {
+                        $selectedShare = $shares[$index]
+                        $shareName = $selectedShare.Name
                         $configShare = $config.Shares | Where-Object { $_.Name -eq $shareName } | Select-Object -First 1
-                        if ($configShare) {
+                        if ($configShare -and $configShare.Enabled) {
                             $configShare.Enabled = $false
                             $shareNames += $shareName
                             $disabled++
                         }
                     }
-                    if (Save-AllShares -Config $config) {
+                    if ($disabled -gt 0 -and (Save-AllShares -Config $config)) {
                         Write-Host ""
                         Write-Host "  [OK] Disabled $disabled share(s):" -ForegroundColor Green
                         foreach ($name in $shareNames) {
                             Write-Host "    - $name" -ForegroundColor Gray
                         }
                         Write-ActionLog -Message "Batch disabled $disabled shares" -Category 'Config'
+                    } elseif ($disabled -eq 0) {
+                        Write-Host ""
+                        Write-Host "  [!] Selected shares are already disabled" -ForegroundColor Yellow
                     }
                 } else {
                     Write-Host ""
@@ -3147,7 +3714,8 @@ function Select-SharesInteractive {
     #>
     param(
         [Parameter(Mandatory)][array]$Shares,
-        [string]$Title = "SELECT SHARES"
+        [string]$Title = "SELECT SHARES",
+        [switch]$ShowStatus
     )
     
     $selection = @{}
@@ -3177,7 +3745,17 @@ function Select-SharesInteractive {
             
             Write-Host "  $checkbox $($i + 1). " -ForegroundColor $color -NoNewline
             Write-Host "$($share.Name) " -ForegroundColor $(if ($selection[$i]) { "White" } else { "Gray" }) -NoNewline
-            Write-Host "[$($share.DriveLetter):]" -ForegroundColor DarkGray
+            Write-Host "[$($share.DriveLetter):] " -NoNewline -ForegroundColor DarkGray
+            
+            if ($ShowStatus) {
+                if ($share.Enabled) {
+                    Write-Host "[ENABLED]" -ForegroundColor Green
+                } else {
+                    Write-Host "[DISABLED]" -ForegroundColor Red
+                }
+            } else {
+                Write-Host ""
+            }
         }
         
         Write-Host ""
@@ -3213,7 +3791,7 @@ function Select-SharesInteractive {
                 $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
                 continue
             }
-            return ,$result
+            return $result
         }
         elseif ($choice -eq "C") {
             # Cancel
@@ -3300,6 +3878,14 @@ function Edit-ShareCli {
             $share.Description = $newDesc
         }
         
+        # Category
+        $currentCategory = if ($share.PSObject.Properties['Category']) { $share.Category } else { "General" }
+        Write-Host "  Category [$currentCategory]: " -NoNewline
+        $newCategory = Read-Host
+        if (-not [string]::IsNullOrWhiteSpace($newCategory)) {
+            Set-ShareCategory -ShareId $share.Id -Category $newCategory
+        }
+        
         # Enabled
         Write-Host "  Enabled [$($share.Enabled)] (Y/N/blank): " -NoNewline
         $toggle = Read-Host
@@ -3362,6 +3948,74 @@ function Show-AllSharesCli {
     }
 }
 
+function Read-ValidatedInput {
+    <#
+    .SYNOPSIS
+        Prompts for input with validation and retry limit
+    .PARAMETER Prompt
+        The prompt message to display
+    .PARAMETER ValidationScript
+        Script block that returns $true if input is valid
+    .PARAMETER ErrorMessage
+        Message to show on validation failure
+    .PARAMETER MaxAttempts
+        Maximum failed attempts before offering quit option (default: 3)
+    .PARAMETER AllowEmpty
+        Whether empty input is acceptable (default: $false)
+    .PARAMETER DefaultValue
+        Value to use if input is empty and AllowEmpty is true
+    #>
+    param(
+        [string]$Prompt,
+        [scriptblock]$ValidationScript,
+        [string]$ErrorMessage = "Invalid input",
+        [int]$MaxAttempts = 3,
+        [switch]$AllowEmpty,
+        [string]$DefaultValue = ""
+    )
+    
+    $attempts = 0
+    $firstAttempt = $true
+    
+    do {
+        if (-not $firstAttempt) {
+            Write-Host "  $ErrorMessage. Try again: " -ForegroundColor Yellow -NoNewline
+        } else {
+            Write-Host "  > " -ForegroundColor Cyan -NoNewline
+            $firstAttempt = $false
+        }
+        
+        $userInput = Read-Host
+        
+        # Handle empty input
+        if ([string]::IsNullOrWhiteSpace($userInput)) {
+            if ($AllowEmpty) {
+                return $DefaultValue
+            }
+            $attempts++
+        } else {
+            # Validate with script block
+            if ($null -eq $ValidationScript -or (& $ValidationScript $userInput)) {
+                return $userInput
+            }
+            $attempts++
+        }
+        
+        # Check if max attempts reached
+        if ($attempts -ge $MaxAttempts) {
+            Write-Host ""
+            Write-Host "  Too many invalid attempts. Press Q to quit or any key to continue..." -ForegroundColor Red
+            $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            if ($key.Character -match '[Qq]') {
+                return $null
+            }
+            $attempts = 0
+            Write-Host ""
+            $firstAttempt = $true
+        }
+    } while ($true)
+}
+
 function Add-NewShareCli {
     Clear-Host
     Write-Host ""
@@ -3380,12 +4034,12 @@ function Add-NewShareCli {
         if ([string]::IsNullOrWhiteSpace($name)) {
             Write-Host "  Share Name" -ForegroundColor White
             Write-Host "  (A friendly name for this share, e.g., 'Office Files')" -ForegroundColor DarkGray
-            Write-Host "  > " -ForegroundColor Cyan -NoNewline
-            do {
-                $name = Read-Host
-                if (-not [string]::IsNullOrWhiteSpace($name)) { break }
-                Write-Host "  Name cannot be empty. Try again: " -ForegroundColor Yellow -NoNewline
-            } while ($true)
+            $name = Read-ValidatedInput -ErrorMessage "Name cannot be empty"
+            if ($null -eq $name) {
+                Write-Host ""
+                Write-Host "  [!] Operation cancelled" -ForegroundColor Yellow
+                return
+            }
             Write-Host ""
         }
         
@@ -3397,12 +4051,24 @@ function Add-NewShareCli {
             Write-Host "    \\192.168.1.100\share" -ForegroundColor Cyan
             Write-Host "    \\server\folder" -ForegroundColor Cyan
             Write-Host "    \\DESKTOP-NAME\Documents" -ForegroundColor Cyan
-            Write-Host "  > " -ForegroundColor Cyan -NoNewline
-            do {
-                $sharePath = Read-Host
-                if ($sharePath -match '^\\\\[^\\]+\\') { break }
-                Write-Host "  Invalid UNC path. Must start with \\ (e.g., \\server\share) - Try again: " -ForegroundColor Yellow -NoNewline
-            } while ($true)
+            $sharePath = Read-ValidatedInput `
+                -ValidationScript { 
+                    param($p) 
+                    # Auto-correct: add \\ if missing
+                    if ($p -notmatch '^\\\\' -and $p -match '^[^\\]') {
+                        $script:sharePath = "\\$p"
+                        Write-Host ""
+                        Write-Host "  [Auto-corrected to: $script:sharePath]" -ForegroundColor Green
+                        return $true
+                    }
+                    $p -match '^\\\\[^\\]+\\'
+                } `
+                -ErrorMessage "Invalid UNC path. Must start with \\"
+            if ($null -eq $sharePath) {
+                Write-Host ""
+                Write-Host "  [!] Operation cancelled" -ForegroundColor Yellow
+                return
+            }
             Write-Host ""
         }
         
@@ -3424,14 +4090,17 @@ function Add-NewShareCli {
             Write-Host "  (The drive letter to map this share to, press Enter for " -NoNewline -ForegroundColor DarkGray
             Write-Host "$($availableLetters[0])" -NoNewline -ForegroundColor Green
             Write-Host ")" -ForegroundColor DarkGray
-            Write-Host "  > " -ForegroundColor Cyan -NoNewline
-            do {
-                $driveLetter = Read-Host
-                $driveLetter = $driveLetter.ToUpper().Trim()
-                if ([string]::IsNullOrWhiteSpace($driveLetter)) { $driveLetter = $availableLetters[0] }
-                if ($driveLetter.Length -eq 1 -and $driveLetter -match '^[A-Z]$' -and $driveLetter -notin $usedLetters) { break }
-                Write-Host "  Invalid or in-use. Choose another: " -ForegroundColor Yellow -NoNewline
-            } while ($true)
+            $driveLetter = Read-ValidatedInput `
+                -ValidationScript { param($d) $d = $d.ToUpper().Trim(); $d.Length -eq 1 -and $d -match '^[A-Z]$' -and $d -notin $usedLetters } `
+                -ErrorMessage "Invalid or in-use letter" `
+                -AllowEmpty `
+                -DefaultValue $availableLetters[0]
+            if ($null -eq $driveLetter) {
+                Write-Host ""
+                Write-Host "  [!] Operation cancelled" -ForegroundColor Yellow
+                return
+            }
+            $driveLetter = $driveLetter.ToUpper().Trim()
             Write-Host ""
         }
         
@@ -3439,12 +4108,12 @@ function Add-NewShareCli {
         if ([string]::IsNullOrWhiteSpace($username)) {
             Write-Host "  Username" -ForegroundColor White
             Write-Host "  (Username for authentication, e.g., DOMAIN\user or user)" -ForegroundColor DarkGray
-            Write-Host "  > " -ForegroundColor Cyan -NoNewline
-            do {
-                $username = Read-Host
-                if (-not [string]::IsNullOrWhiteSpace($username)) { break }
-                Write-Host "  Username required. Try again: " -ForegroundColor Yellow -NoNewline
-            } while ($true)
+            $username = Read-ValidatedInput -ErrorMessage "Username required"
+            if ($null -eq $username) {
+                Write-Host ""
+                Write-Host "  [!] Operation cancelled" -ForegroundColor Yellow
+                return
+            }
             Write-Host ""
         }
         
@@ -3536,6 +4205,15 @@ function Add-NewShareCli {
     
     # Clean description (remove marker if it was optional and empty)
     if ($description.Trim().Length -eq 0) { $description = "" }
+    
+    # Final validation: check for conflicts one more time (race condition prevention)
+    $preCheckConfig = Get-CachedConfig -Force
+    $conflict = $preCheckConfig.Shares | Where-Object { $_.DriveLetter -eq $driveLetter }
+    if ($conflict) {
+        Write-Host ""
+        Write-Host "  [!] Drive letter $driveLetter was assigned by another process. Please try again." -ForegroundColor Red
+        return
+    }
     
     # Add the share
     $result = Add-ShareConfiguration -Name $name -SharePath $sharePath -DriveLetter $driveLetter -Username $username -Description $description
@@ -3843,9 +4521,16 @@ function Connect-AllSharesCli {
         
         $cred = Get-CredentialForShare -Username $share.Username
         if (-not $cred) {
-            Write-Host "[X] No credentials" -ForegroundColor Yellow
-            $failed++
-            continue
+            Write-Host "" # New line
+            Write-Host "  [!] No saved credentials for $($share.Username)" -ForegroundColor Yellow
+            $password = Read-Password "  Enter password: "
+            if ($password.Length -eq 0) {
+                Write-Host "  [X] Skipped (no password)" -ForegroundColor Red
+                $failed++
+                continue
+            }
+            $cred = New-Object System.Management.Automation.PSCredential($share.Username, $password)
+            Write-Host "  [*] Connecting $($share.Name)... " -NoNewline -ForegroundColor Cyan
         }
         
         try {
@@ -3853,6 +4538,15 @@ function Connect-AllSharesCli {
             if (Test-ShareConnection -DriveLetter $share.DriveLetter) {
                 Write-Host "[OK]" -ForegroundColor Green
                 $success++
+                
+                # Offer to save credentials if they weren't saved
+                if (-not (Get-CredentialForShare -Username $share.Username)) {
+                    Write-Host "  Save credentials for $($share.Username)? (Y/N) [Y]: " -NoNewline
+                    $save = Read-Host
+                    if ($save -eq "" -or $save -match '^[Yy]$') {
+                        Save-Credential -Credential $cred
+                    }
+                }
                 
                 # Update last connected
                 $config = Get-CachedConfig
@@ -3887,6 +4581,9 @@ function Connect-AllSharesCli {
     Write-Host ""
     Write-Host "  ------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
+    
+    Write-ActionLog -Message "Connect All completed: $success connected, $failed failed, $skipped skipped" -Level INFO -Category 'Mapping'
+    
     Write-Host "  Press any key to continue..." -ForegroundColor DarkGray
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
 }
@@ -3948,9 +4645,16 @@ function Reset-AllSharesCli {
         
         $cred = Get-CredentialForShare -Username $share.Username
         if (-not $cred) {
-            Write-Host "[X] No credentials" -ForegroundColor Yellow
-            $failed++
-            continue
+            Write-Host "" # New line
+            Write-Host "  [!] No saved credentials for $($share.Username)" -ForegroundColor Yellow
+            $password = Read-Password "  Enter password: "
+            if ($password.Length -eq 0) {
+                Write-Host "  [X] Skipped (no password)" -ForegroundColor Red
+                $failed++
+                continue
+            }
+            $cred = New-Object System.Management.Automation.PSCredential($share.Username, $password)
+            Write-Host "  [*] Connecting $($share.Name)... " -NoNewline -ForegroundColor Cyan
         }
         
         try {
@@ -3958,6 +4662,15 @@ function Reset-AllSharesCli {
             if (Test-ShareConnection -DriveLetter $share.DriveLetter) {
                 Write-Host "[OK]" -ForegroundColor Green
                 $success++
+                
+                # Offer to save credentials if they weren't saved
+                if (-not (Get-CredentialForShare -Username $share.Username)) {
+                    Write-Host "  Save credentials for $($share.Username)? (Y/N) [Y]: " -NoNewline
+                    $save = Read-Host
+                    if ($save -eq "" -or $save -match '^[Yy]$') {
+                        Save-Credential -Credential $cred
+                    }
+                }
                 
                 # Update last connected
                 $config = Get-CachedConfig
@@ -4000,15 +4713,17 @@ function Disconnect-AllSharesCli {
     
     # Force reload to ensure we have the latest shares
     $config = Get-CachedConfig -Force
-    $shares = $config.Shares
+    $shares = if ($config -and $config.Shares) { $config.Shares } else { @() }
     
-        # Build array of connected shares
-        $connected = @()
+    # Build array of connected shares (properly initialized)
+    $connected = @()
+    if ($shares.Count -gt 0) {
         foreach ($share in $shares) {
             if (Test-ShareConnection -DriveLetter $share.DriveLetter) {
                 $connected += $share
             }
         }
+    }
     
     if ($connected.Count -eq 0) {
         Write-Host "  No shares are currently connected." -ForegroundColor Yellow
@@ -4045,6 +4760,9 @@ function Disconnect-AllSharesCli {
     Write-Host " share(s)" -ForegroundColor Gray
     Write-Host "  ------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
+    
+    Write-ActionLog -Message "Disconnect All completed: $disconnected disconnected" -Level INFO -Category 'Mapping'
+    
     Write-Host "  Press any key to continue..." -ForegroundColor DarkGray
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
 }
@@ -4221,11 +4939,11 @@ function Import-ExportConfigCli {
                     Write-Host "  [OK] Configuration merged successfully!" -ForegroundColor Green
                     Write-Host "  Added: " -NoNewline -ForegroundColor DarkGray
                     Write-Host "$($result.Added)" -NoNewline -ForegroundColor White
-                    Write-Host " share(s)" -ForegroundColor DarkGray
-                    if ($result.Skipped -gt 0) {
-                        Write-Host "  Skipped: " -NoNewline -ForegroundColor DarkGray
-                        Write-Host "$($result.Skipped)" -NoNewline -ForegroundColor Yellow
-                        Write-Host " duplicate(s)" -ForegroundColor DarkGray
+                    Write-Host " new share(s)" -ForegroundColor DarkGray
+                    if ($result.Updated -gt 0) {
+                        Write-Host "  Updated: " -NoNewline -ForegroundColor DarkGray
+                        Write-Host "$($result.Updated)" -NoNewline -ForegroundColor Cyan
+                        Write-Host " existing share(s)" -ForegroundColor DarkGray
                     }
                 } else {
                     Write-Host ""
@@ -4402,6 +5120,7 @@ function Set-CliPreferences {
     if (-not $config.Preferences.PSObject.Properties['SyncShareNameToDriveLabel']) {
         $config.Preferences | Add-Member -MemberType NoteProperty -Name SyncShareNameToDriveLabel -Value $true -Force
     }
+    
     $prefs = $config.Preferences
 
     while ($true) {
@@ -4585,7 +5304,8 @@ function Install-LogonScript {
     $ps1Path = Join-Path $baseFolder 'Share_Manager_AutoMap.ps1'
     $cmdPath = Join-Path $startupFolder 'Share_Manager_AutoMap.cmd'
     $logonScript = @'
-# Auto-generated by Share Manager v2 (multi-share, DPAPI-protected)
+# Auto-generated by Share Manager v2.2.0 (multi-share, DPAPI-protected)
+# Production-ready with enhanced error handling, network checks, and retry logic
 param()
 $baseFolder = Join-Path $env:APPDATA "Share_Manager"
 $keyPath    = Join-Path $baseFolder "key.bin"
@@ -4593,7 +5313,7 @@ $sharesPath = Join-Path $baseFolder "shares.json"
 $credsPath  = Join-Path $baseFolder "creds.json"
 $logPath    = Join-Path $baseFolder "LogonScript.log"
 
-# Added structured events log and session id
+# Structured events log and session tracking
 $eventsPath = Join-Path $baseFolder "LogonScript.events.jsonl"
 $sessionId  = [guid]::NewGuid().ToString()
 
@@ -4634,22 +5354,78 @@ function Write-Log {
         correlationId = $null
         sessionId     = $sessionId
         pid           = $PID
-    ver           = '2.1.0'
+        ver           = '2.2.0'
         data          = $Data
     }
     ($evt | ConvertTo-Json -Compress) | Out-File -FilePath $eventsPath -Encoding UTF8 -Append
 }
 
+function Test-NetworkAvailable {
+    # Quick check if network is available
+    try {
+        $adapters = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
+        return ($null -ne $adapters -and $adapters.Count -gt 0)
+    } catch {
+        # Fallback: check if any IP address is assigned
+        try {
+            $ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' }
+            return ($null -ne $ips -and $ips.Count -gt 0)
+        } catch {
+            return $false
+        }
+    }
+}
+
 # Rotate and write a start marker
 Invoke-LogFileRotation -Path $logPath -Prefix 'LogonScript'
 Invoke-LogFileRotation -Path $eventsPath -Prefix 'LogonScript.events'
-Write-Log -Message "AutoMap start" -Category 'AutoMap'
 
-if (!(Test-Path $sharesPath)) { Write-Log "Missing shares.json"; return }
+# Track script execution time
+$scriptStartTime = Get-Date
+$psVersion = "$($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor).$($PSVersionTable.PSVersion.Patch)"
+$psEditionInfo = $PSVersionTable.PSEdition
+
+Write-Log -Message "========================================" -Category 'AutoMap'
+Write-Log -Message "AutoMap start (v2.2.0)" -Category 'AutoMap' -Data @{ psVersion = $psVersion; psEdition = $psEditionInfo }
+Write-Log -Message "Environment: PowerShell $psVersion ($psEditionInfo)" -Level DEBUG -Category 'AutoMap'
+
+# Check network availability first
+if (-not (Test-NetworkAvailable)) {
+    Write-Log -Message "No network connection detected, skipping automap" -Level WARN -Category 'AutoMap'
+    Write-Log -Message "AutoMap aborted (no network)" -Category 'AutoMap'
+    Write-Log -Message "========================================" -Category 'AutoMap'
+    return
+}
+
+Write-Log -Message "Network connection detected" -Level INFO -Category 'AutoMap'
+
+if (!(Test-Path $sharesPath)) { 
+    Write-Log "Missing shares.json at $sharesPath" -Level WARN -Category 'AutoMap'
+    Write-Log -Message "AutoMap aborted (no config)" -Category 'AutoMap'
+    Write-Log -Message "========================================" -Category 'AutoMap'
+    return 
+}
 
 $cfg = $null
-try { $cfg = (Get-Content -Path $sharesPath -Raw) | ConvertFrom-Json } catch { Write-Log "shares.json parse error"; return }
-if (-not $cfg -or -not $cfg.Shares) { Write-Log "No shares in config"; return }
+try { 
+    $cfg = (Get-Content -Path $sharesPath -Raw) | ConvertFrom-Json 
+} catch { 
+    Write-Log "shares.json parse error: $_" -Level ERROR -Category 'AutoMap'
+    Write-Log -Message "AutoMap aborted (parse error)" -Category 'AutoMap'
+    Write-Log -Message "========================================" -Category 'AutoMap'
+    return 
+}
+
+if (-not $cfg -or -not $cfg.Shares) { 
+    Write-Log "No shares in config" -Level INFO -Category 'AutoMap'
+    Write-Log -Message "AutoMap complete (no shares)" -Category 'AutoMap'
+    Write-Log -Message "========================================" -Category 'AutoMap'
+    return 
+}
+
+$totalShares = $cfg.Shares.Count
+$enabledShares = ($cfg.Shares | Where-Object { $_.Enabled }).Count
+Write-Log -Message "Found $totalShares total shares ($enabledShares enabled, $($totalShares - $enabledShares) disabled)" -Level INFO -Category 'AutoMap'
 
 # Load credential map (username -> SecureString) with DPAPI/legacy AES support
 $credMap = @{}
@@ -4660,6 +5436,8 @@ if (Test-Path $credsPath) {
             $aesKey = $null
             if (Test-Path $keyPath) { $aesKey = [System.IO.File]::ReadAllBytes($keyPath) }
             
+            $credLoadSuccess = 0
+            $credLoadFail = 0
             foreach ($e in $store.Entries) {
                 try { 
                     if ($e.EncryptionType -eq "DPAPI") {
@@ -4672,47 +5450,103 @@ if (Test-Path $credsPath) {
                         # Try DPAPI anyway
                         $credMap[$e.Username] = ($e.Encrypted | ConvertTo-SecureString)
                     }
-                } catch { Write-Log "Failed to decrypt credential" -Level WARN -Category 'AutoMap' }
+                    $credLoadSuccess++
+                } catch { 
+                    Write-Log "Failed to decrypt credential for user: $($e.Username)" -Level WARN -Category 'AutoMap'
+                    $credLoadFail++
+                }
             }
+            Write-Log -Message "Loaded $credLoadSuccess credential(s), $credLoadFail failed to decrypt" -Level INFO -Category 'AutoMap'
+        } else {
+            Write-Log -Message "Credential store is empty" -Level WARN -Category 'AutoMap'
         }
-    } catch { Write-Log "Failed to load creds store" }
+    } catch { 
+        Write-Log "Failed to load creds store: $_" -Level ERROR -Category 'AutoMap'
+    }
+} else {
+    Write-Log -Message "No credential store found at $credsPath" -Level INFO -Category 'AutoMap'
 }
 
+$successCount = 0
+$failCount = 0
+$skipCount = 0
+
 foreach ($s in $cfg.Shares) {
-    if (-not $s.Enabled) { continue }
+    if (-not $s.Enabled) { 
+        Write-Log "Skipping disabled share: $($s.Name)" -Level INFO -Category 'AutoMap'
+        $skipCount++
+        continue 
+    }
+    
     $drive = "$($s.DriveLetter):"
     $share = $s.SharePath
     $user  = $s.Username
+    $name  = $s.Name
 
-    # Remove existing mapping silently
-    cmd /c "net use `"$drive`" /delete /y >nul 2>&1"
+    # Check if drive is already in use by something else
+    if (Test-Path $drive) {
+        try {
+            $existing = net use $drive 2>&1 | Out-String
+            if ($existing -match [regex]::Escape($share)) {
+                Write-Log "Drive $drive already mapped to $share, skipping" -Level INFO -Category 'AutoMap'
+                $skipCount++
+                continue
+            } else {
+                # Drive in use by different share/source
+                Write-Log "Drive $drive in use by different resource, unmapping first" -Level INFO -Category 'AutoMap'
+                cmd /c "net use `"$drive`" /delete /y >nul 2>&1"
+            }
+        } catch {
+            # Can't determine, try to unmap anyway
+            cmd /c "net use `"$drive`" /delete /y >nul 2>&1"
+        }
+    } else {
+        # Clean unmap just in case
+        cmd /c "net use `"$drive`" /delete /y >nul 2>&1"
+    }
 
     $plainPW = $null
     if ($user -and $credMap.ContainsKey($user)) {
-        $plainPW = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-            [Runtime.InteropServices.Marshal]::SecureStringToBSTR($credMap[$user])
-        )
+        try {
+            $plainPW = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                [Runtime.InteropServices.Marshal]::SecureStringToBSTR($credMap[$user])
+            )
+        } catch {
+            Write-Log "Failed to decrypt password for $user" -Level ERROR -Category 'AutoMap'
+        }
     }
 
-    # Enhanced retry with exponential backoff (2s, 4s)
+    # Enhanced retry with exponential backoff (2s, 4s, 8s)
     $mapped = $false
     $maxAttempts = 3
     for ($i=1; $i -le $maxAttempts; $i++) {
         if ($i -gt 1) {
-            $backoff = [math]::Pow(2, $i - 1)
-            Write-Log -Message "Retry attempt $i/$maxAttempts after ${backoff}s delay" -Level DEBUG -Category 'AutoMap' -Data @{ attempt = $i; backoff = $backoff }
+            $backoff = [math]::Pow(2, $i - 1)  # Exponential backoff
+            Write-Log -Message "Retry attempt $i/$maxAttempts after ${backoff}s delay for $name" -Level INFO -Category 'AutoMap' -Data @{ attempt = $i; backoff = $backoff }
             Start-Sleep -Seconds $backoff
         }
         
-        Write-Log -Message "Mapping attempt $i for $drive -> $share" -Level DEBUG -Category 'AutoMap'
+        Write-Log -Message "Mapping attempt ${i}: $drive -> $share ($name)" -Level INFO -Category 'AutoMap'
         if ($plainPW) {
             $result = cmd /c "net use `"$drive`" `"$share`" /user:$user $plainPW /persistent:yes 2>&1"
         } else {
             $result = cmd /c "net use `"$drive`" `"$share`" /persistent:yes 2>&1"
         }
         
-        if ($LASTEXITCODE -eq 0) { 
-            Write-Log -Message "Mapped $drive to $share" -Category 'AutoMap'
+        if ($LASTEXITCODE -eq 0) {
+            # Verify the mapping actually worked
+            $verified = $false
+            try {
+                $verified = Test-Path $drive
+                if ($verified) {
+                    Write-Log -Message "Mapped $drive to $share ($name)" -Category 'AutoMap'
+                    $successCount++
+                } else {
+                    Write-Log -Message "Mapping succeeded but drive not accessible: $drive" -Level WARN -Category 'AutoMap'
+                }
+            } catch {
+                Write-Log -Message "Mapping succeeded but verification failed: $_" -Level WARN -Category 'AutoMap'
+            }
             $mapped = $true
             break 
         } else {
@@ -4724,31 +5558,103 @@ foreach ($s in $cfg.Shares) {
             elseif ($resultStr -match "67|network name") { $errorType = "InvalidPath" }
             elseif ($resultStr -match "1219|multiple connections") { $errorType = "MultipleConnections" }
             elseif ($resultStr -match "1203|1231|network busy|timeout") { $errorType = "NetworkTimeout" }
+            elseif ($resultStr -match "85|local device.*in use") { $errorType = "DriveInUse" }
             
-            Write-Log -Message "Attempt $i failed: $errorType" -Level WARN -Category 'AutoMap' -Data @{ attempt = $i; errorType = $errorType; exitCode = $LASTEXITCODE }
+            Write-Log -Message "Attempt $i failed for $name`: $errorType" -Level WARN -Category 'AutoMap' -Data @{ attempt = $i; errorType = $errorType; exitCode = $LASTEXITCODE; share = $name }
         }
     }
     if (-not $mapped) { 
-        Write-Log -Message "Failed mapping $drive -> $share after $maxAttempts attempts" -Level ERROR -Category 'AutoMap' -Data @{ drive = $drive; share = $share; attempts = $maxAttempts }
+        Write-Log -Message "Failed mapping $drive -> $share ($name) after $maxAttempts attempts" -Level ERROR -Category 'AutoMap' -Data @{ drive = $drive; share = $share; name = $name; attempts = $maxAttempts }
+        $failCount++
     }
 }
-Write-Log -Message "AutoMap end" -Category 'AutoMap'
+
+$scriptEndTime = Get-Date
+$duration = ($scriptEndTime - $scriptStartTime).TotalSeconds
+
+Write-Log -Message "AutoMap complete: $successCount success, $failCount failed, $skipCount skipped (duration: ${duration}s)" -Category 'AutoMap' -Data @{ 
+    success = $successCount; 
+    failed = $failCount; 
+    skipped = $skipCount; 
+    totalEnabled = $enabledShares; 
+    durationSeconds = $duration;
+    startTime = $scriptStartTime.ToString("o");
+    endTime = $scriptEndTime.ToString("o")
+}
+Write-Log -Message "========================================" -Category 'AutoMap'
 '@
     $cmdScript = @"
 @echo off
+REM Auto-generated by Share Manager v2.2.0 - Logon Script Launcher
+REM This wrapper launches the PowerShell automap script with proper error handling
+REM Windows 11 25H2+ compatible (no wmic dependency)
+
+REM Hide CMD window immediately by relaunching minimized if not already hidden
+if not "%1"=="HIDDEN" (
+    start /min "" "%~f0" HIDDEN
+    exit
+)
+
+setlocal enabledelayedexpansion
+
+REM Configuration
 set SCRIPT=%APPDATA%\Share_Manager\Share_Manager_AutoMap.ps1
-set LOG=%APPDATA%\Share_Manager\LogonScript_cmd.log
-for /F "tokens=1-3 delims=/ " %%a in ("%date%") do set DATE=%%a-%%b-%%c
-for /F "tokens=1-2 delims=. " %%a in ("%time%") do set TIME=%%a
-echo %DATE% %TIME%   [INFO][AutoMap] Launching logon script >>"%LOG%"
+set LOG=%APPDATA%\Share_Manager\LogonScript.log
+set TEMP_LOG=%TEMP%\ShareManager_AutoMap_%RANDOM%.log
+
+REM Generate ISO 8601 timestamp using PowerShell (wmic removed in Windows 11 25H2+)
+for /f "delims=" %%a in ('powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-dd HH:mm:ss'"') do set "TIMESTAMP=%%a"
+
+REM Log start
+echo %TIMESTAMP%	[INFO][CMD] ======================================== >>"%LOG%"
+echo %TIMESTAMP%	[INFO][CMD] AutoMap launcher started >>"%LOG%"
+echo %TIMESTAMP%	[INFO][CMD] User: %USERNAME% Computer: %COMPUTERNAME% >>"%LOG%"
+
+REM Check if script exists
+if not exist "%SCRIPT%" (
+    for /f "delims=" %%a in ('powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-dd HH:mm:ss'"') do set "TIMESTAMP=%%a"
+    echo %TIMESTAMP%	[ERROR][CMD] Script not found: %SCRIPT% >>"%LOG%"
+    echo %TIMESTAMP%	[INFO][CMD] AutoMap launcher failed >>"%LOG%"
+    echo %TIMESTAMP%	[INFO][CMD] ======================================== >>"%LOG%"
+    exit /b 1
+)
+
+REM Detect PowerShell version (prefer pwsh)
 where pwsh >nul 2>nul
 if %errorlevel%==0 (
-    echo %DATE% %TIME%   [INFO][AutoMap] Using shell: pwsh >>"%LOG%"
-    start "" pwsh -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""%SCRIPT%"" >>""%LOG%"" 2>&1
+    set SHELL=pwsh
 ) else (
-    echo %DATE% %TIME%   [INFO][AutoMap] Using shell: powershell >>"%LOG%"
-    start "" powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""%SCRIPT%"" >>""%LOG%"" 2>&1
+    set SHELL=powershell
 )
+
+echo %TIMESTAMP%	[INFO][CMD] Using shell: !SHELL! >>"%LOG%"
+
+REM Execute script and capture exit code
+!SHELL! -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%SCRIPT%" >"%TEMP_LOG%" 2>&1
+set EXIT_CODE=!errorlevel!
+
+REM Append temporary output to main log (if any errors occurred)
+if exist "%TEMP_LOG%" (
+    if !EXIT_CODE! neq 0 (
+        for /f "delims=" %%a in ('powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-dd HH:mm:ss'"') do set "TIMESTAMP=%%a"
+        echo %TIMESTAMP%	[WARN][CMD] Script execution failed with exit code !EXIT_CODE! >>"%LOG%"
+        echo %TIMESTAMP%	[DEBUG][CMD] Script output: >>"%LOG%"
+        type "%TEMP_LOG%" >>"%LOG%" 2>nul
+    )
+    del "%TEMP_LOG%" 2>nul
+)
+
+REM Log completion
+for /f "delims=" %%a in ('powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-dd HH:mm:ss'"') do set "TIMESTAMP=%%a"
+
+if !EXIT_CODE!==0 (
+    echo %TIMESTAMP%	[INFO][CMD] AutoMap launcher completed successfully >>"%LOG%"
+) else (
+    echo %TIMESTAMP%	[WARN][CMD] AutoMap launcher completed with exit code !EXIT_CODE! >>"%LOG%"
+)
+echo %TIMESTAMP%	[INFO][CMD] ======================================== >>"%LOG%"
+
+exit /b !EXIT_CODE!
 "@
     if (-not (Test-Path $baseFolder)) {
         New-Item -Path $baseFolder -ItemType Directory -Force | Out-Null
@@ -5154,6 +6060,28 @@ function Show-AddShareDialog {
     $lblDescHint.Font = New-Object System.Drawing.Font($lblDescHint.Font.FontFamily, 8)
     $form.Controls.Add($lblDescHint)
     
+    $y += 30
+    
+    # Category
+    $lblCategory = New-Object System.Windows.Forms.Label
+    $lblCategory.Text = "Category:"
+    $lblCategory.Top = $y
+    $lblCategory.Left = 20
+    $lblCategory.Width = 120
+    $form.Controls.Add($lblCategory)
+    
+    $cmbCategoryAdd = New-Object System.Windows.Forms.ComboBox
+    $cmbCategoryAdd.Top = $y
+    $cmbCategoryAdd.Left = 150
+    $cmbCategoryAdd.Width = 310
+    $cmbCategoryAdd.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown
+    $categories = Get-ShareCategories
+    foreach ($cat in $categories) {
+        [void]$cmbCategoryAdd.Items.Add($cat)
+    }
+    $cmbCategoryAdd.Text = "General"
+    $form.Controls.Add($cmbCategoryAdd)
+    
     $y += 35
     
     # Enabled checkbox
@@ -5184,7 +6112,15 @@ function Show-AddShareDialog {
             [System.Windows.Forms.MessageBox]::Show("Share name is required.", "Validation Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
             return
         }
-        if ($txtPath.Text -notmatch '^\\\\[^\\]+\\') {
+        
+        # Auto-format UNC path if missing \\
+        $path = $txtPath.Text.Trim()
+        if ($path -and -not $path.StartsWith("\\")) {
+            $path = "\\$path"
+            $txtPath.Text = $path
+        }
+        
+        if ($path -notmatch '^\\\\[^\\]+\\') {
             [System.Windows.Forms.MessageBox]::Show("Invalid UNC path. Must start with \\ (e.g., \\server\share)", "Validation Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
             return
         }
@@ -5192,24 +6128,50 @@ function Show-AddShareDialog {
             [System.Windows.Forms.MessageBox]::Show("Invalid drive letter. Enter a single letter (A-Z).", "Validation Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
             return
         }
+        
+        $driveLetter = $txtDrive.Text.ToUpper()
+        
+        # Check if drive letter is in use by local drives or already mapped
+        if (Test-Path "${driveLetter}:") {
+            $psDrive = Get-PSDrive -Name $driveLetter -ErrorAction SilentlyContinue
+            if ($psDrive) {
+                $driveType = if ($psDrive.Provider.Name -eq 'FileSystem' -and $psDrive.Root -match '^[A-Z]:\\$') { "local drive" } else { "mapped drive" }
+                [System.Windows.Forms.MessageBox]::Show("Drive letter ${driveLetter}: is already in use by a $driveType.", "Validation Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                return
+            }
+        }
+        
         if ([string]::IsNullOrWhiteSpace($txtUser.Text)) {
             [System.Windows.Forms.MessageBox]::Show("Username is required.", "Validation Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
             return
         }
+        
         # Prevent drive-letter conflicts with other enabled shares
         $cfgCheck = Import-AllShares
-    # Check conflicts against all shares (enabled or not) to avoid later enablement conflicts
-    $conflict = $cfgCheck.Shares | Where-Object { $_.DriveLetter -eq $txtDrive.Text.ToUpper() }
+        # Check conflicts against all shares (enabled or not) to avoid later enablement conflicts
+        $conflict = $cfgCheck.Shares | Where-Object { $_.DriveLetter -eq $driveLetter }
         if ($conflict) {
-            [System.Windows.Forms.MessageBox]::Show("Drive letter $($txtDrive.Text.ToUpper()) is already assigned to share '$($conflict.Name)'.", "Validation Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+            [System.Windows.Forms.MessageBox]::Show("Drive letter $driveLetter is already assigned to share '$($conflict.Name)'.", "Validation Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+            return
+        }
+        
+        # Check for duplicate UNC path
+        $pathConflict = $cfgCheck.Shares | Where-Object { $_.SharePath -eq $path }
+        if ($pathConflict) {
+            [System.Windows.Forms.MessageBox]::Show("This network path is already configured as share '$($pathConflict.Name)' (Drive $($pathConflict.DriveLetter):)`n`nYou cannot add the same path twice.", "Duplicate Path", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
             return
         }
         
         $username = $txtUser.Text.Trim()
         
-        $result = Add-ShareConfiguration -Name $txtName.Text -SharePath $txtPath.Text `
-            -DriveLetter $txtDrive.Text.ToUpper() -Username $username `
+        $result = Add-ShareConfiguration -Name $txtName.Text -SharePath $path `
+            -DriveLetter $driveLetter -Username $username `
             -Description $txtDesc.Text -Enabled $chkEnabled.Checked
+        
+        # Set category after creation
+        if ($result -and $cmbCategoryAdd.Text) {
+            Set-ShareCategory -ShareId $result.Id -Category $cmbCategoryAdd.Text
+        }
         
         if ($result) {
             $shareName = $txtName.Text
@@ -5217,7 +6179,14 @@ function Show-AddShareDialog {
             $driveLetter = $txtDrive.Text.ToUpper()
             
             # Check if credentials exist for this username
-            $existingCred = Get-CredentialForShare -Username $username
+            $existingCred = $null
+            try {
+                $existingCred = Get-CredentialForShare -Username $username
+            }
+            catch {
+                Write-ActionLog -Message "Error checking credentials: $_" -Level WARN -Category 'Credentials'
+            }
+            
             $credentialSaved = $false
             
             if (-not $existingCred) {
@@ -5347,7 +6316,7 @@ function Show-ManageShareDialog {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "Manage Share - $($share.Name)"
     $form.Width = 500
-    $form.Height = 450
+    $form.Height = 490
     $form.StartPosition = "CenterParent"
     $form.FormBorderStyle = "FixedDialog"
     $form.MaximizeBox = $false
@@ -5440,6 +6409,30 @@ function Show-ManageShareDialog {
     
     $y += 35
     
+    # Category
+    $lblCategory = New-Object System.Windows.Forms.Label
+    $lblCategory.Text = "Category:"
+    $lblCategory.Top = $y
+    $lblCategory.Left = 20
+    $lblCategory.AutoSize = $true
+    $form.Controls.Add($lblCategory)
+    
+    $cmbCategoryEdit = New-Object System.Windows.Forms.ComboBox
+    $cmbCategoryEdit.Top = $y
+    $cmbCategoryEdit.Left = 150
+    $cmbCategoryEdit.Width = 300
+    $cmbCategoryEdit.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown
+    $categories = Get-ShareCategories
+    foreach ($cat in $categories) {
+        [void]$cmbCategoryEdit.Items.Add($cat)
+    }
+    # Set current category or default to General
+    $currentCategory = if ($share.PSObject.Properties['Category']) { $share.Category } else { "General" }
+    $cmbCategoryEdit.Text = $currentCategory
+    $form.Controls.Add($cmbCategoryEdit)
+    
+    $y += 35
+    
     # Enabled checkbox
     $chkEnabled = New-Object System.Windows.Forms.CheckBox
     $chkEnabled.Text = "Enabled"
@@ -5470,8 +6463,8 @@ function Show-ManageShareDialog {
             [System.Windows.Forms.MessageBox]::Show("Name is required", "Validation Error")
             return
         }
-        if ($txtPath.Text -notmatch '^\\\\[^\\]+\\') {
-            [System.Windows.Forms.MessageBox]::Show("Invalid UNC path", "Validation Error")
+        if (-not (Test-ValidUncPath -Path $txtPath.Text)) {
+            [System.Windows.Forms.MessageBox]::Show("Invalid UNC path. Must be \\\\servername\\sharename`n(Server name must be at least 2 characters)", "Validation Error")
             return
         }
         if ($txtDrive.Text -notmatch '^[A-Za-z]$') {
@@ -5493,6 +6486,11 @@ function Show-ManageShareDialog {
         $result = Update-ShareConfiguration -ShareId $ShareId -Name $txtName.Text `
             -SharePath $txtPath.Text -DriveLetter $txtDrive.Text.ToUpper() `
             -Username $txtUser.Text -Description $txtDesc.Text -Enabled $chkEnabled.Checked
+        
+        # Update category if changed
+        if ($cmbCategoryEdit.Text) {
+            Set-ShareCategory -ShareId $ShareId -Category $cmbCategoryEdit.Text
+        }
         
         if ($result) {
             [System.Windows.Forms.MessageBox]::Show("Share updated successfully!", "Success")
@@ -5713,6 +6711,8 @@ function Show-BackupDialog {
             if ($dialog.ShowDialog() -eq 'OK') {
                 $importResult = Import-ShareConfiguration -ImportPath $dialog.FileName -Merge $false
                 if ($importResult.Success) {
+                    Clear-ConfigCache
+                    Update-ShareList  # Refresh GUI immediately
                     [System.Windows.Forms.MessageBox]::Show(
                         "Configuration replaced successfully!`n`nImported: $($importResult.Added) share(s)",
                         "Replace Successful",
@@ -5743,9 +6743,11 @@ function Show-BackupDialog {
         if ($dialog.ShowDialog() -eq 'OK') {
             $importResult = Import-ShareConfiguration -ImportPath $dialog.FileName -Merge $true
             if ($importResult.Success) {
+                Clear-ConfigCache
+                Update-ShareList  # Refresh GUI immediately
                 $msg = "Configuration merged successfully!`n`nAdded: $($importResult.Added) share(s)"
                 if ($importResult.Skipped -gt 0) {
-                    $msg += "`nSkipped: $($importResult.Skipped) duplicate(s)"
+                    $msg += "`nUpdated: $($importResult.Skipped) existing share(s)"
                 }
                 [System.Windows.Forms.MessageBox]::Show(
                     $msg,
@@ -5832,15 +6834,16 @@ function Show-PreferencesDialog {
             if ($restart -eq 'Yes') {
                 try {
                     $scriptPath = $PSCommandPath
-                    Start-Process -FilePath "powershell.exe" `
-                        -ArgumentList "-ExecutionPolicy Bypass -File `"$scriptPath`" -StartupMode GUI" `
-                        -WindowStyle Normal
-                    # Close all open forms (e.g., Settings, Preferences, Main)
+                    # Close all forms immediately to provide clean transition
                     $forms = @()
                     foreach ($f in [System.Windows.Forms.Application]::OpenForms) { $forms += $f }
                     foreach ($f in $forms) { try { $f.Close() } catch { Write-ActionLog -Message "Failed to close form during restart: $_" -Level 'DEBUG' -Category 'Lifecycle' -OncePerSeconds 5 } }
-                    # As a fallback, exit the app
-                    [System.Windows.Forms.Application]::Exit()
+                    # Start new process and immediately exit current one
+                    Start-Process -FilePath "powershell.exe" `
+                        -ArgumentList "-ExecutionPolicy Bypass -File `"$scriptPath`" -StartupMode GUI" `
+                        -WindowStyle Normal
+                    # Exit immediately for clean transition
+                    [System.Environment]::Exit(0)
                 } catch {
                     [System.Windows.Forms.MessageBox]::Show("Please relaunch Share Manager to apply theme.", "Info")
                 }
@@ -5854,6 +6857,7 @@ function Show-PreferencesDialog {
 }
 
 function Show-GUI {
+    Write-ActionLog -Message "Entering GUI mode" -Level INFO -Category 'Startup'
 
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
@@ -5945,6 +6949,40 @@ public class ListViewItemComparer : IComparer {
     $lblTitle.Top      = 15
     $lblTitle.Left     = 15
     $form.Controls.Add($lblTitle)
+    
+    # Search/Filter Box
+    $txtSearch = New-Object System.Windows.Forms.TextBox
+    $txtSearch.Width = 200
+    $txtSearch.Top = 15
+    $txtSearch.Left = 370
+    $txtSearch.Text = "Search shares..."
+    $txtSearch.ForeColor = [System.Drawing.Color]::Gray
+    
+    # Category Filter
+    $cmbCategory = New-Object System.Windows.Forms.ComboBox
+    $cmbCategory.Width = 120
+    $cmbCategory.Top = 15
+    $cmbCategory.Left = 240
+    $cmbCategory.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    [void]$cmbCategory.Items.Add("All Categories")
+    
+    # Add categories from shares
+    $categories = Get-ShareCategories
+    foreach ($cat in $categories) {
+        [void]$cmbCategory.Items.Add($cat)
+    }
+    $cmbCategory.SelectedIndex = 0
+    $form.Controls.Add($cmbCategory)
+    
+    # Checkbox for favorites only
+    $chkFavoritesOnly = New-Object System.Windows.Forms.CheckBox
+    $chkFavoritesOnly.Text = "<> Favorites"
+    $chkFavoritesOnly.Width = 110
+    $chkFavoritesOnly.Top = 15
+    $chkFavoritesOnly.Left = 580
+    $form.Controls.Add($chkFavoritesOnly)
+    
+    $form.Controls.Add($txtSearch)
 
     # Hint Label
     $lblHint = New-Object System.Windows.Forms.Label
@@ -5952,20 +6990,21 @@ public class ListViewItemComparer : IComparer {
     $lblHint.Font     = New-Object System.Drawing.Font("Segoe UI",8,[System.Drawing.FontStyle]::Italic)
     $lblHint.ForeColor = [System.Drawing.Color]::Gray
     $lblHint.AutoSize = $true
-    $lblHint.Top      = 28
-    $lblHint.Left     = 200
+    $lblHint.Top      = 45
+    $lblHint.Left     = 15
     $form.Controls.Add($lblHint)
 
     # ListView for shares
     $listView = New-Object System.Windows.Forms.ListView
     $listView.View = 'Details'
     $listView.FullRowSelect = $true
+    $listView.MultiSelect = $true
     $listView.GridLines = $true
     $listView.HeaderStyle = [System.Windows.Forms.ColumnHeaderStyle]::Clickable
     $listView.AllowColumnReorder = ($cfgTheme -eq 'Modern')
     # Owner-draw header for Modern theme (items remain default for gridlines)
     if ($cfgTheme -eq 'Modern') { $listView.OwnerDraw = $true } else { $listView.OwnerDraw = $false }
-    $listView.Top = 50
+    $listView.Top = 70
     $listView.Left = 15
     $listView.Width = 660
     $listView.Height = 350
@@ -5978,36 +7017,41 @@ public class ListViewItemComparer : IComparer {
 
     $colName = New-Object System.Windows.Forms.ColumnHeader
     $colName.Text = "Name"
-    $colName.Width = 165
+    $colName.Width = 140
     $colName.TextAlign = [System.Windows.Forms.HorizontalAlignment]::Left
 
     $colDrive = New-Object System.Windows.Forms.ColumnHeader
     $colDrive.Text = "Drive"
-    $colDrive.Width = 60
+    $colDrive.Width = 50
     $colDrive.TextAlign = [System.Windows.Forms.HorizontalAlignment]::Center
+
+    $colCategory = New-Object System.Windows.Forms.ColumnHeader
+    $colCategory.Text = "Category"
+    $colCategory.Width = 80
+    $colCategory.TextAlign = [System.Windows.Forms.HorizontalAlignment]::Left
 
     $colPath = New-Object System.Windows.Forms.ColumnHeader
     $colPath.Text = "Path"
-    $colPath.Width = 270
+    $colPath.Width = 200
     $colPath.TextAlign = [System.Windows.Forms.HorizontalAlignment]::Left
 
     $colEnabled = New-Object System.Windows.Forms.ColumnHeader
     $colEnabled.Text = "Enabled"
-    $colEnabled.Width = 83
+    $colEnabled.Width = 65
     $colEnabled.TextAlign = [System.Windows.Forms.HorizontalAlignment]::Center
 
-    $listView.Columns.AddRange(@($colStatus, $colName, $colDrive, $colPath, $colEnabled))
+    $listView.Columns.AddRange(@($colStatus, $colName, $colDrive, $colCategory, $colPath, $colEnabled))
     $form.Controls.Add($listView)
 
     # Dynamically fit columns to avoid horizontal scrollbar while using available width
     $padding = 1  # tiny fudge to avoid the horizontal scrollbar while minimizing empty space
-    $fixedStatus = 70; $fixedDrive = 60; $fixedEnabled = 83
-    $ratioName = 165.0; $ratioPath = 270.0
+    $fixedStatus = 70; $fixedDrive = 60; $fixedCategory = 80; $fixedEnabled = 65
+    $ratioName = 140.0; $ratioPath = 200.0
     function Set-ListViewColumns {
         try {
             $clientW = $listView.ClientSize.Width
             if ($clientW -le 0) { return }
-            $fixedSum = $fixedStatus + $fixedDrive + $fixedEnabled
+            $fixedSum = $fixedStatus + $fixedDrive + $fixedCategory + $fixedEnabled
             $available = $clientW - $fixedSum - $padding
             if ($available -lt 100) { $available = 100 }
             $nameW = [int][Math]::Round($available * ($ratioName / ($ratioName + $ratioPath)))
@@ -6016,6 +7060,7 @@ public class ListViewItemComparer : IComparer {
 
             $colStatus.Width = $fixedStatus
             $colDrive.Width = $fixedDrive
+            $colCategory.Width = $fixedCategory
             $colEnabled.Width = $fixedEnabled
             $colName.Width = [Math]::Max(100, $nameW)
             $colPath.Width = [Math]::Max(150, $pathW)
@@ -6102,11 +7147,34 @@ public class ListViewItemComparer : IComparer {
         
         $cred = Get-CredentialForShare -Username $share.Username
         if (-not $cred) {
-            [System.Windows.Forms.MessageBox]::Show("No credentials found for $($share.Username)", "Error")
-            return
+            # Prompt for credentials
+            $result = [System.Windows.Forms.MessageBox]::Show(
+                "No saved credentials found for $($share.Username).`n`nWould you like to enter credentials now?",
+                "Share Manager v$version",
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Question
+            )
+            if ($result -eq [System.Windows.Forms.DialogResult]::No) {
+                return
+            }
+            
+            # Show credential form
+            $newCred = Show-CredentialForm -Username $share.Username
+            if (-not $newCred) {
+                return
+            }
+            $cred = $newCred
         }
         
-        Connect-NetworkShare -SharePath $share.SharePath -DriveLetter $share.DriveLetter -Credential $cred -Silent
+        $result = Connect-NetworkShare -SharePath $share.SharePath -DriveLetter $share.DriveLetter -Credential $cred -ReturnStatus -Silent
+        if (-not $result.Success) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Connection failed: $($result.ErrorMessage)",
+                "Connection Error",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            )
+        }
         Update-ShareList
     })
     [void]$contextMenu.Items.Add($menuConnect)
@@ -6156,6 +7224,22 @@ public class ListViewItemComparer : IComparer {
     })
     [void]$contextMenu.Items.Add($menuToggle)
     
+    $menuFavorite = New-Object System.Windows.Forms.ToolStripMenuItem
+    $menuFavorite.Text = "* Toggle Favorite"
+    $menuFavorite.Add_Click({
+        if ($listView.SelectedItems.Count -eq 0) { return }
+        $shareId = $listView.SelectedItems[0].Tag
+        
+        $config = Get-CachedConfig -Force
+        $shareObj = $config.Shares | Where-Object { $_.Id -eq $shareId }
+        if ($shareObj) {
+            $currentFav = if ($shareObj.PSObject.Properties['IsFavorite']) { $shareObj.IsFavorite } else { $false }
+            Set-ShareFavorite -ShareId $shareId -IsFavorite (-not $currentFav)
+            Update-ShareList
+        }
+    })
+    [void]$contextMenu.Items.Add($menuFavorite)
+    
     [void]$contextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     
     $menuDelete = New-Object System.Windows.Forms.ToolStripMenuItem
@@ -6163,17 +7247,28 @@ public class ListViewItemComparer : IComparer {
     $menuDelete.ForeColor = [System.Drawing.Color]::Red
     $menuDelete.Add_Click({
         if ($listView.SelectedItems.Count -eq 0) { return }
-        $shareId = $listView.SelectedItems[0].Tag
-        $share = Get-ShareConfiguration -ShareId $shareId
+        
+        $selectedCount = $listView.SelectedItems.Count
+        $shareIds = @($listView.SelectedItems | ForEach-Object { $_.Tag })
+        
+        $confirmMsg = if ($selectedCount -eq 1) {
+            $share = Get-ShareConfiguration -ShareId $shareIds[0]
+            "Delete share '$($share.Name)'?"
+        } else {
+            "Delete $selectedCount selected shares?"
+        }
         
         $result = [System.Windows.Forms.MessageBox]::Show(
-            "Delete share '$($share.Name)'?",
+            $confirmMsg,
             "Confirm Delete",
             [System.Windows.Forms.MessageBoxButtons]::YesNo,
             [System.Windows.Forms.MessageBoxIcon]::Warning
         )
+        
         if ($result -eq 'Yes') {
-            Remove-ShareConfiguration -ShareId $shareId
+            foreach ($shareId in $shareIds) {
+                Remove-ShareConfiguration -ShareId $shareId
+            }
             Update-ShareList
         }
     })
@@ -6192,7 +7287,15 @@ public class ListViewItemComparer : IComparer {
         } else {
             $cred = Get-CredentialForShare -Username $share.Username
             if ($cred) {
-                Connect-NetworkShare -SharePath $share.SharePath -DriveLetter $share.DriveLetter -Credential $cred -Silent
+                $result = Connect-NetworkShare -SharePath $share.SharePath -DriveLetter $share.DriveLetter -Credential $cred -ReturnStatus -Silent
+                if (-not $result.Success) {
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "Connection failed: $($result.ErrorMessage)",
+                        "Connection Error",
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
+                        [System.Windows.Forms.MessageBoxIcon]::Error
+                    )
+                }
             } else {
                 [System.Windows.Forms.MessageBox]::Show("No credentials found for $($share.Username)", "Error")
             }
@@ -6201,7 +7304,8 @@ public class ListViewItemComparer : IComparer {
     })
 
     # Toolbar panel (below ListView)
-    $toolbarY = 410
+    # ListView: Top=70, Height=350, so bottom is at 420
+    $toolbarY = 430
     
     # Group: Share Actions
     $grpShares = New-Object System.Windows.Forms.GroupBox
@@ -6254,11 +7358,30 @@ public class ListViewItemComparer : IComparer {
             }
             $cred = Get-CredentialForShare -Username $share.Username
             if (-not $cred) {
-                Write-ActionLog -Message "Connect All: No credentials for $shareName" -Level WARN -Category 'Connection'
-                Write-ActionLog -Message "Connect All: No credentials for $shareName (Username: $($share.Username))" -Level DEBUG -Category 'Connection'
-                $failed++
-                $failedShares += $shareName
-                continue
+                # Prompt for credentials
+                $result = [System.Windows.Forms.MessageBox]::Show(
+                    "No saved credentials found for $($share.Username) (Share: $shareName).`n`nWould you like to enter credentials now?",
+                    "Share Manager v$version",
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Question
+                )
+                if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+                    $newCred = Show-CredentialForm -Username $share.Username
+                    if ($newCred) {
+                        $cred = $newCred
+                    } else {
+                        Write-ActionLog -Message "Connect All: User cancelled credential entry for $shareName" -Level WARN -Category 'Connection'
+                        $failed++
+                        $failedShares += $shareName
+                        continue
+                    }
+                } else {
+                    Write-ActionLog -Message "Connect All: No credentials for $shareName" -Level WARN -Category 'Connection'
+                    Write-ActionLog -Message "Connect All: No credentials for $shareName (Username: $($share.Username))" -Level DEBUG -Category 'Connection'
+                    $failed++
+                    $failedShares += $shareName
+                    continue
+                }
             }
             try {
                 Connect-NetworkShare -SharePath $share.SharePath -DriveLetter $share.DriveLetter -Credential $cred -Silent
@@ -6542,7 +7665,7 @@ public class ListViewItemComparer : IComparer {
     $grpSystem.Controls.Add($btnAbout)
     
     # Bottom buttons (CLI/Exit) - position below the taller of the two groups
-    $bottomY = $toolbarY + ([Math]::Max($grpShares.Height, $grpSystem.Height)) + 10
+    $bottomY = $toolbarY + ([Math]::Max($grpShares.Height, $grpSystem.Height)) + 2
     
     $btnCLI = New-Object System.Windows.Forms.Button
     $btnCLI.Text = "Switch to CLI"
@@ -6553,10 +7676,12 @@ public class ListViewItemComparer : IComparer {
     $btnCLI.Anchor = 'Bottom,Left'
     $btnCLI.Add_Click({
         $scriptPath = $PSCommandPath
-        Start-Process -FilePath "powershell.exe" `
-            -ArgumentList "-ExecutionPolicy Bypass -File `"$scriptPath`" -StartupMode CLI" `
-            -WindowStyle Normal
-        $form.Close()
+        if ($scriptPath) {
+            # Use cmd /c start for reliable process creation
+            $form.Close()
+            $cmdArgs = "/c start `"Share Manager CLI`" powershell.exe -ExecutionPolicy Bypass -NoProfile -File `"$scriptPath`" -StartupMode CLI"
+            Start-Process -FilePath "cmd.exe" -ArgumentList $cmdArgs -WindowStyle Hidden
+        }
     })
     $form.Controls.Add($btnCLI)
 
@@ -6581,7 +7706,59 @@ public class ListViewItemComparer : IComparer {
     function Update-ShareList {
         $listView.Items.Clear()
         # Force cache refresh to ensure we see latest config state
-        $shares = @(Get-ShareConfiguration)
+        $allShares = @(Get-ShareConfiguration)
+        
+        # Temporarily remove event handler to prevent cascading updates
+        $cmbCategory.remove_SelectedIndexChanged($script:categoryChangedHandler)
+        
+        # Refresh category dropdown with latest categories
+        $currentSelection = $cmbCategory.SelectedItem
+        $cmbCategory.Items.Clear()
+        [void]$cmbCategory.Items.Add("All Categories")
+        $categories = Get-ShareCategories
+        foreach ($cat in $categories) {
+            [void]$cmbCategory.Items.Add($cat)
+        }
+        # Restore selection or default to "All Categories"
+        if ($currentSelection -and $cmbCategory.Items.Contains($currentSelection)) {
+            $cmbCategory.SelectedItem = $currentSelection
+        } else {
+            $cmbCategory.SelectedIndex = 0
+        }
+        
+        # Re-attach event handler
+        $cmbCategory.Add_SelectedIndexChanged($script:categoryChangedHandler)
+        
+        # Apply filters
+        $shares = $allShares
+        
+        # Category filter
+        if ($cmbCategory.SelectedItem -and $cmbCategory.SelectedItem -ne "All Categories") {
+            $selectedCat = $cmbCategory.SelectedItem
+            $shares = @($shares | Where-Object { 
+                $cat = if ($_.PSObject.Properties['Category']) { $_.Category } else { 'General' }
+                $cat -eq $selectedCat
+            })
+        }
+        
+        # Favorites filter
+        if ($chkFavoritesOnly.Checked) {
+            $shares = @($shares | Where-Object { 
+                $isFav = if ($_.PSObject.Properties['IsFavorite']) { $_.IsFavorite } else { $false }
+                $isFav -eq $true
+            })
+        }
+        
+        # Search filter
+        $searchText = $txtSearch.Text
+        if ($searchText -and $searchText -ne "Search shares..." -and $searchText.Trim().Length -gt 0) {
+            $shares = @($shares | Where-Object {
+                $_.Name -like "*$searchText*" -or
+                $_.SharePath -like "*$searchText*" -or
+                $_.DriveLetter -like "*$searchText*" -or
+                $_.Description -like "*$searchText*"
+            })
+        }
         
         $shareCount = if ($shares) { $shares.Count } else { 0 }
         Write-ActionLog -Message "Update-ShareList: Refreshing list with $shareCount shares" -Level DEBUG -Category 'GUI'
@@ -6589,16 +7766,32 @@ public class ListViewItemComparer : IComparer {
         foreach ($share in $shares) {
             $item = New-Object System.Windows.Forms.ListViewItem
             
-            # Status column
+            # Status column with favorite indicator
             $isConnected = Test-ShareConnection -DriveLetter $share.DriveLetter
-            $item.Text = if ($isConnected) { "[*]" } else { "[ ]" }
+            $isFavorite = if ($share.PSObject.Properties['IsFavorite']) { $share.IsFavorite } else { $false }
+            # Use angle brackets for favorites, square brackets for regular
+            if ($isFavorite) {
+                $statusText = if ($isConnected) { "<*>" } else { "< >" }
+            } else {
+                $statusText = if ($isConnected) { "[*]" } else { "[ ]" }
+            }
+            $item.Text = $statusText
             $item.ForeColor = if ($isConnected) { [System.Drawing.Color]::Green } else { [System.Drawing.Color]::Red }
+            
+            # Add tooltip with connection info
+            $lastConnected = if ($share.LastConnected) { $share.LastConnected } else { "Never" }
+            $connCount = if ($share.PSObject.Properties['ConnectionCount']) { $share.ConnectionCount } else { 0 }
+            $item.ToolTipText = "Last Connected: $lastConnected`nConnection Count: $connCount"
             
             # Name column
             [void]$item.SubItems.Add($share.Name)
             
             # Drive column
             [void]$item.SubItems.Add("$($share.DriveLetter):")
+            
+            # Category column
+            $category = if ($share.PSObject.Properties['Category'] -and -not [string]::IsNullOrWhiteSpace($share.Category)) { $share.Category } else { 'General' }
+            [void]$item.SubItems.Add($category)
             
             # Path column
             [void]$item.SubItems.Add($share.SharePath)
@@ -6668,8 +7861,118 @@ public class ListViewItemComparer : IComparer {
         }
     })
 
+    # Search box events
+    $txtSearch.Add_Enter({
+        if ($txtSearch.Text -eq "Search shares...") {
+            $txtSearch.Text = ""
+            $txtSearch.ForeColor = [System.Drawing.Color]::Black
+        }
+    })
+    $txtSearch.Add_Leave({
+        if ([string]::IsNullOrWhiteSpace($txtSearch.Text)) {
+            $txtSearch.Text = "Search shares..."
+            $txtSearch.ForeColor = [System.Drawing.Color]::Gray
+        }
+    })
+    $txtSearch.Add_TextChanged({ Update-ShareList })
+    
+    # Category filter event
+    # Event handlers
+    $script:categoryChangedHandler = { Update-ShareList }
+    $cmbCategory.Add_SelectedIndexChanged($script:categoryChangedHandler)
+    
+    # Favorites checkbox event
+    $chkFavoritesOnly.Add_CheckedChanged({ Update-ShareList })
+    
+    # Keyboard shortcuts
+    $form.KeyPreview = $true
+    $form.Add_KeyDown({
+        param($eventSender, $e)
+        
+        # Ctrl+N: Add New Share
+        if ($e.Control -and $e.KeyCode -eq 'N') {
+            $btnAdd.PerformClick()
+            $e.Handled = $true
+        }
+        # Ctrl+F: Focus search
+        elseif ($e.Control -and $e.KeyCode -eq 'F') {
+            $txtSearch.Focus()
+            $e.Handled = $true
+        }
+        # Ctrl+R: Refresh
+        elseif ($e.Control -and $e.KeyCode -eq 'R') {
+            Clear-ConfigCache
+            Update-ShareList
+            $e.Handled = $true
+        }
+        # F5: Refresh (alternative)
+        elseif ($e.KeyCode -eq 'F5') {
+            Clear-ConfigCache
+            Update-ShareList
+            $e.Handled = $true
+        }
+        # Ctrl+A: Connect All
+        elseif ($e.Control -and $e.KeyCode -eq 'A') {
+            $btnConnectAll.PerformClick()
+            $e.Handled = $true
+        }
+        # Ctrl+D: Disconnect All
+        elseif ($e.Control -and $e.KeyCode -eq 'D') {
+            $btnDisconnectAll.PerformClick()
+            $e.Handled = $true
+        }
+        # Delete: Remove selected share(s)
+        elseif ($e.KeyCode -eq 'Delete' -and $listView.SelectedItems.Count -gt 0) {
+            $selectedCount = $listView.SelectedItems.Count
+            $shareIds = @($listView.SelectedItems | ForEach-Object { $_.Tag })
+            
+            $confirmMsg = if ($selectedCount -eq 1) {
+                $share = Get-ShareConfiguration -ShareId $shareIds[0]
+                "Delete share '$($share.Name)'?"
+            } else {
+                "Delete $selectedCount selected shares?"
+            }
+            
+            $result = [System.Windows.Forms.MessageBox]::Show(
+                $confirmMsg,
+                "Confirm Delete",
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            
+            if ($result -eq 'Yes') {
+                foreach ($shareId in $shareIds) {
+                    Remove-ShareConfiguration -ShareId $shareId
+                }
+                Update-ShareList
+            }
+            $e.Handled = $true
+        }
+    })
+    
     # Initial population
     Update-ShareList
+
+    # Add form disposal handler for proper resource cleanup
+    $form.Add_FormClosing({
+        Write-ActionLog -Message "User closed GUI" -Level INFO -Category 'Startup'
+        try {
+            # Dispose of context menu and its items
+            if ($contextMenu) { $contextMenu.Dispose() }
+            # ListView will be disposed automatically by form
+        }
+        catch {
+            Write-ActionLog -Message "Error during form cleanup: $_" -Level DEBUG -Category 'GUI'
+        }
+    })
+
+    # Bring window to front on launch
+    $form.Add_Shown({
+        $form.TopMost = $true
+        $form.Activate()
+        $form.BringToFront()
+        $form.TopMost = $false
+    })
 
     [void]$form.ShowDialog()
 }
@@ -6678,11 +7981,20 @@ public class ListViewItemComparer : IComparer {
 
 #region Mode Selection (Entry Point)
 
+# Log script startup
+Write-ActionLog -Message "Share Manager v$version starting" -Level INFO -Category 'Startup' -Data @{ 
+    mode = if ($StartupMode) { $StartupMode } else { "Auto" }
+    psVersion = "$($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor).$($PSVersionTable.PSVersion.Patch)"
+    psEdition = $PSVersionTable.PSEdition
+}
+
 # Migrate legacy config first time
 Convert-LegacyConfig
 
 $cfg = Import-AllShares
 $hasShares = ($cfg.Shares.Count -gt 0)
+
+Write-ActionLog -Message "Configuration loaded: $($cfg.Shares.Count) share(s)" -Level INFO -Category 'Startup'
 
 # If StartupMode parameter is provided, override preference
 if ($StartupMode -eq "CLI" -or $StartupMode -eq "GUI") {
@@ -6704,6 +8016,12 @@ if ($StartupMode -eq "CLI" -or $StartupMode -eq "GUI") {
                 return
             }
         }
+        # Ensure automap scripts exist if persistent mapping is enabled
+        $persistent = Get-PreferenceValue -Name "PersistentMapping" -Default $false -AsBoolean
+        if ($persistent) {
+            # Always call Install-LogonScript to ensure scripts are up-to-date
+            Install-LogonScript -Silent
+        }
         Show-GUI
         return
     }
@@ -6719,6 +8037,13 @@ if ($hasShares) {
         }
         "GUI" {
             $script:UseGUI = $true
+            # Ensure automap scripts exist if persistent mapping is enabled
+            $persistent = Get-PreferenceValue -Name "PersistentMapping" -Default $false -AsBoolean
+            if ($persistent) {
+                # Always call Install-LogonScript to ensure scripts are up-to-date
+                # The function will only write files if content changed or files are missing
+                Install-LogonScript -Silent
+            }
             Show-GUI
             return
         }
@@ -6752,6 +8077,12 @@ $mode = Read-Host "Enter 1 or 2"
                 Write-Host "Setup cancelled. Exiting..." -ForegroundColor Yellow
                 return
             }
+        }
+        # Ensure automap scripts exist if persistent mapping is enabled
+        $persistent = Get-PreferenceValue -Name "PersistentMapping" -Default $false -AsBoolean
+        if ($persistent) {
+            # Always call Install-LogonScript to ensure scripts are up-to-date
+            Install-LogonScript -Silent
         }
         Show-GUI
     }
