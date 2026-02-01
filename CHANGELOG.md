@@ -118,6 +118,22 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   - Was causing ANSI escape codes in CMD log file
   - Now logs only "Using shell: pwsh" or "Using shell: powershell"
   - Clean CMD log output
+- **AutoMap Network Detection (Emergency Fix)**: Fixed false-negative network detection on multi-adapter systems
+  - Issue: Systems with Ethernet + WiFi (one disconnected, one connected) incorrectly reported "no network connection"
+  - Root cause: Only checked adapter Status='Up', didn't verify actual IP connectivity
+  - Impact: AutoMap would abort prematurely, preventing share mapping at Windows logon
+  - Solution: Enhanced Test-NetworkAvailable with robust multi-method detection:
+    - Primary: Check for valid IPv4 addresses (excludes localhost/APIPA/WellKnown)
+    - Secondary: Verify each physical adapter has Status='Up' AND valid IP configuration
+    - Per-adapter validation: Loop through adapters checking individual IP configs
+    - Fallback: Test-Connection to 8.8.8.8 if network cmdlets fail
+  - Added retry logic with exponential backoff for slow WiFi connections:
+    - 6 attempts over ~26 seconds maximum
+    - Retry delays: 2s → 3s → 4.5s → 6.75s → 10s (capped at 10s)
+    - Handles WiFi authentication and DHCP negotiation during Windows logon
+    - Typical WiFi connection succeeds by attempt 2-3 (~3-5s wait)
+  - Why not caught earlier: Single-adapter development environment with instant network didn't trigger the bug
+  - Production verified: Network detection now works correctly on multi-adapter systems and slow WiFi
 - **Batch Operations Array Bug**: Fixed enable/disable operations
   - Removed comma operator wrapping in Select-SharesInteractive return
   - Was causing "0 enabled" when shares were actually disabled

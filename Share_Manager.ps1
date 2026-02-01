@@ -5361,15 +5361,34 @@ function Write-Log {
 }
 
 function Test-NetworkAvailable {
-    # Quick check if network is available
+    # Robust network check - works with multiple adapters (Ethernet + WiFi)
     try {
+        # Method 1: Check for valid IP addresses (most reliable)
+        $ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | 
+               Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' -and $_.PrefixOrigin -ne 'WellKnown' }
+        if ($ips -and $ips.Count -gt 0) {
+            return $true
+        }
+        
+        # Method 2: Check for adapters with status 'Up' AND valid IP configuration
         $adapters = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
-        return ($null -ne $adapters -and $adapters.Count -gt 0)
+        if ($adapters -and $adapters.Count -gt 0) {
+            # Verify at least one has a valid IP (not APIPA)
+            foreach ($adapter in $adapters) {
+                $adapterIPs = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                              Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' }
+                if ($adapterIPs -and $adapterIPs.Count -gt 0) {
+                    return $true
+                }
+            }
+        }
+        
+        return $false
     } catch {
-        # Fallback: check if any IP address is assigned
+        # Fallback: Try basic connectivity test
         try {
-            $ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' }
-            return ($null -ne $ips -and $ips.Count -gt 0)
+            $result = Test-Connection -ComputerName 8.8.8.8 -Count 1 -Quiet -ErrorAction SilentlyContinue
+            return $result
         } catch {
             return $false
         }
@@ -5389,15 +5408,35 @@ Write-Log -Message "========================================" -Category 'AutoMap
 Write-Log -Message "AutoMap start (v2.2.0)" -Category 'AutoMap' -Data @{ psVersion = $psVersion; psEdition = $psEditionInfo }
 Write-Log -Message "Environment: PowerShell $psVersion ($psEditionInfo)" -Level DEBUG -Category 'AutoMap'
 
-# Check network availability first
-if (-not (Test-NetworkAvailable)) {
-    Write-Log -Message "No network connection detected, skipping automap" -Level WARN -Category 'AutoMap'
+# Check network availability with retry logic (for slow WiFi connections during logon)
+$networkAvailable = $false
+$maxRetries = 6  # 6 attempts over ~30 seconds
+$retryDelay = 2  # Start with 2 seconds
+
+for ($i = 1; $i -le $maxRetries; $i++) {
+    if (Test-NetworkAvailable) {
+        $networkAvailable = $true
+        if ($i -gt 1) {
+            Write-Log -Message "Network connection detected (attempt $i/$maxRetries)" -Level INFO -Category 'AutoMap'
+        } else {
+            Write-Log -Message "Network connection detected" -Level INFO -Category 'AutoMap'
+        }
+        break
+    }
+    
+    if ($i -lt $maxRetries) {
+        Write-Log -Message "No network connection yet, waiting ${retryDelay}s (attempt $i/$maxRetries)" -Level INFO -Category 'AutoMap'
+        Start-Sleep -Seconds $retryDelay
+        $retryDelay = [Math]::Min($retryDelay * 1.5, 10)  # Exponential backoff, max 10s
+    }
+}
+
+if (-not $networkAvailable) {
+    Write-Log -Message "No network connection detected after $maxRetries attempts, skipping automap" -Level WARN -Category 'AutoMap'
     Write-Log -Message "AutoMap aborted (no network)" -Category 'AutoMap'
     Write-Log -Message "========================================" -Category 'AutoMap'
     return
 }
-
-Write-Log -Message "Network connection detected" -Level INFO -Category 'AutoMap'
 
 if (!(Test-Path $sharesPath)) { 
     Write-Log "Missing shares.json at $sharesPath" -Level WARN -Category 'AutoMap'
