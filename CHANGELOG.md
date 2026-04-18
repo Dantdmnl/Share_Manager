@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [2.3.0] - 2026-04-18
+
+### Added
+- **Grouped keyboard shortcut reference dialog (GUI)**
+  - Help -> Keyboard Shortcuts now opens a structured dialog with grouped sections:
+    - Navigation & Filters
+    - Selection & Share Actions
+    - Credentials
+  - Improved readability and spacing versus the previous plain text popup.
+
+### Changed
+- **Keyboard shortcut behavior updated for expected Select All semantics**
+  - `Ctrl+A` now selects all visible shares (or all text in the active text input).
+  - `Ctrl+Shift+A` is now the Connect All shortcut.
+- **CLI terminal presentation**
+  - Added startup color enforcement so CLI flows use a black terminal background with readable foreground text.
+
+### Fixed
+- **Context action state instability in GUI**
+  - Fixed delayed status-message timer behavior that could trigger a full list refresh and unexpectedly clear selection.
+  - Connect/Disconnect actions no longer grey out after a short delay due to timer-driven refresh side effects.
+- **Disabled-share action safety**
+  - Connect/Disconnect actions are now blocked for disabled shares in context menu and double-click toggle paths.
+  - Selection-state evaluation for Connect/Disconnect now consistently follows the primary selected share.
+
+### Documentation
+- Updated release documentation for version `2.3.0`.
+
 ## [2.2.0] - 2026-02-01
 
 ### Added - Organization & Search System ⭐ NEW

@@ -166,7 +166,7 @@ try {
         $results += @{ Test = "Script Complexity"; Status = "SKIPPED"; Details = "AST parse failed"; Critical = $false }
     }
 } catch {
-    Write-Host "      [!] INFO - Complexity analysis skipped" -ForegroundColor Cyan
+    Write-Host "      [i] INFO - Complexity analysis skipped" -ForegroundColor Cyan
     $results += @{ Test = "Script Complexity"; Status = "INFO"; Details = "Analysis skipped"; Critical = $false }
 }
 
@@ -214,7 +214,7 @@ try {
         $results += @{ Test = "Security Check"; Status = "PASSED"; Details = "Clean"; Critical = $false }
     }
 } catch {
-    Write-Host "      [!] INFO - Security check skipped" -ForegroundColor Cyan
+    Write-Host "      [i] INFO - Security check skipped" -ForegroundColor Cyan
     $results += @{ Test = "Security Check"; Status = "INFO"; Details = "Check skipped"; Critical = $false }
 }
 
@@ -279,7 +279,7 @@ try {
         $docPercentage = if ($functions.Count -gt 0) { [Math]::Round(($documented / $functions.Count) * 100, 1) } else { 0 }
         
         Write-Host "      [OK] Documentation: $documented/$($functions.Count) functions ($docPercentage%)" -ForegroundColor Green
-        Write-Host "      [!] INFO - Main user-facing functions are documented (internal helpers optional)" -ForegroundColor Cyan
+        Write-Host "      [i] INFO - Main user-facing functions are documented (internal helpers optional)" -ForegroundColor Cyan
         
         if ($undocumented.Count -gt 0 -and $undocumented.Count -le 5) {
             Write-Host "      [i] Undocumented functions (not required for internal helpers):" -ForegroundColor DarkGray
@@ -294,7 +294,7 @@ try {
         $results += @{ Test = "Documentation"; Status = "SKIPPED"; Details = "AST parse failed"; Critical = $false }
     }
 } catch {
-    Write-Host "      [!] INFO - Documentation check skipped" -ForegroundColor Cyan
+    Write-Host "      [i] INFO - Documentation check skipped" -ForegroundColor Cyan
     $results += @{ Test = "Documentation"; Status = "INFO"; Details = "Check skipped"; Critical = $false }
 }
 
@@ -324,7 +324,7 @@ try {
     
     # Info if file is getting large
     if ($sizeMB -gt 0.5) {
-        Write-Host "      [!] INFO - File is $sizeMB MB (consider modularization if grows beyond 1 MB)" -ForegroundColor Cyan
+        Write-Host "      [i] INFO - File is $sizeMB MB (consider modularization if grows beyond 1 MB)" -ForegroundColor Cyan
     }
     
     $results += @{ Test = "File Encoding"; Status = "INFO"; Details = "$encoding, $sizeKB KB"; Critical = $false }

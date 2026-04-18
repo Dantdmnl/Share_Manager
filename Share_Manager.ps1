@@ -25,7 +25,7 @@
     - Credentials stored per-user, per-machine (non-portable)
     - Special characters in passwords properly handled via cmdkey
     
-    Production Enhancements (v2.2.0+):
+    Production Enhancements (v2.3.0+):
     - Atomic file operations prevent configuration corruption
     - Automatic backup before destructive operations
     - Enhanced UNC path validation with auto-correction
@@ -40,7 +40,7 @@
     Optional. Pass "CLI" or "GUI" to force that mode on launch, bypassing saved preference.
 
 .VERSION
-    2.2.0
+    2.3.0
 
 .NOTES
     - No administrator permissions required
@@ -57,7 +57,7 @@ param(
 
 #region Global Variables (Version, Paths, Defaults)
 
-$version        = '2.2.0'
+$version        = '2.3.0'
 $author         = 'Dantdmnl'
 
 # Configuration constants
@@ -151,6 +151,35 @@ function Show-InputBox {
     )
     Add-Type -AssemblyName Microsoft.VisualBasic
     return [Microsoft.VisualBasic.Interaction]::InputBox($Prompt, $Title, $DefaultValue)
+}
+
+function Set-TerminalBlackBackground {
+    param([switch]$Refresh)
+
+    try {
+        $rawUI = $Host.UI.RawUI
+        if (-not $rawUI) { return }
+
+        $needsRefresh = $false
+        if ($rawUI.BackgroundColor -ne [System.ConsoleColor]::Black) {
+            $rawUI.BackgroundColor = [System.ConsoleColor]::Black
+            $needsRefresh = $true
+        }
+
+        # Keep text readable if a host starts with black-on-black defaults.
+        if ($rawUI.ForegroundColor -eq [System.ConsoleColor]::Black) {
+            $rawUI.ForegroundColor = [System.ConsoleColor]::Gray
+            $needsRefresh = $true
+        }
+
+        if ($Refresh -or $needsRefresh) {
+            Clear-Host
+        }
+    }
+    catch {
+        # Non-console hosts may not support RawUI color manipulation.
+        Write-ActionLog -Message "Terminal background update skipped: $_" -Level DEBUG -Category 'Theme' -OncePerSeconds 60
+    }
 }
 
 function Invoke-LogFileRotation {
@@ -545,6 +574,48 @@ function Clear-ConfigCache {
 #   - Single source of truth for preference access logic
 # ================================================================================
 
+function ConvertTo-SafeBoolean {
+    <#
+    .SYNOPSIS
+        Converts common boolean representations to true/false with fallback
+    #>
+    param(
+        [AllowNull()]
+        [object]$Value,
+        [bool]$Default = $false
+    )
+
+    if ($Value -is [bool]) { return $Value }
+    if ($null -eq $Value) { return $Default }
+
+    if ($Value -is [byte] -or
+        $Value -is [sbyte] -or
+        $Value -is [int16] -or
+        $Value -is [uint16] -or
+        $Value -is [int32] -or
+        $Value -is [uint32] -or
+        $Value -is [int64] -or
+        $Value -is [uint64] -or
+        $Value -is [decimal] -or
+        $Value -is [double] -or
+        $Value -is [single]) {
+        return ([double]$Value -ne 0)
+    }
+
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return $Default }
+
+    switch ($text.Trim().ToLowerInvariant()) {
+        'true'  { return $true }
+        'false' { return $false }
+        'yes'   { return $true }
+        'no'    { return $false }
+        '1'     { return $true }
+        '0'     { return $false }
+        default { return $Default }
+    }
+}
+
 function Get-PreferenceValue {
     <#
     .SYNOPSIS
@@ -598,9 +669,18 @@ function Get-PreferenceValue {
     $value = $config.Preferences.$Name
     
     if ($AsBoolean) {
-        return [bool]$value
+        $defaultBool = ConvertTo-SafeBoolean -Value $Default -Default $false
+        return (ConvertTo-SafeBoolean -Value $value -Default $defaultBool)
     } elseif ($AsInteger) {
-        return [int]$value
+        $intValue = 0
+        if ([int]::TryParse([string]$value, [ref]$intValue)) {
+            return $intValue
+        }
+        $defaultInt = 0
+        if ([int]::TryParse([string]$Default, [ref]$defaultInt)) {
+            return $defaultInt
+        }
+        return 0
     } else {
         return $value
     }
@@ -1135,7 +1215,7 @@ function Import-ShareConfiguration {
     .SYNOPSIS
         Imports configuration from a backup file
     .OUTPUTS
-        Returns hashtable with Success, Added, Skipped properties for merge operations
+        Returns hashtable with Success, Added, Skipped, Updated properties for merge operations
     #>
     param (
         [string]$ImportPath,
@@ -1144,7 +1224,7 @@ function Import-ShareConfiguration {
     
     if (-not (Test-Path $ImportPath)) {
         Write-Host "Import file not found: $ImportPath" -ForegroundColor Red
-        return @{ Success = $false; Added = 0; Skipped = 0 }
+        return @{ Success = $false; Added = 0; Skipped = 0; Updated = 0 }
     }
     
     try {
@@ -1178,21 +1258,50 @@ function Import-ShareConfiguration {
             
             foreach ($share in $importData.Shares) {
                 # Check if duplicate exists (same SharePath OR same DriveLetter)
-                $existing = $config.Shares | Where-Object {
+                $existingMatches = @($config.Shares | Where-Object {
                     $_.SharePath -eq $share.SharePath -or $_.DriveLetter -eq $share.DriveLetter
-                }
+                })
                 
-                if (-not $existing) {
+                if ($existingMatches.Count -eq 0) {
                     # Generate new ID to avoid conflicts
                     $share.Id = [guid]::NewGuid().ToString()
                     $config.Shares += $share
                     $added++
                 } else {
+                    $existing = $existingMatches | Select-Object -First 1
+                    if ($existingMatches.Count -gt 1) {
+                        Write-ActionLog -Message "Multiple merge targets found for import share '$($share.Name)'; updating first match only" -Level WARN -Category 'BackupRestore' -Data @{ shareName = $share.Name; matchCount = $existingMatches.Count }
+                    }
+
                     # Update existing share with imported properties (IsFavorite, Category, Description, etc.)
-                    if ($share.PSObject.Properties['IsFavorite']) { $existing.IsFavorite = $share.IsFavorite }
-                    if ($share.PSObject.Properties['Category']) { $existing.Category = $share.Category }
-                    if ($share.PSObject.Properties['Description']) { $existing.Description = $share.Description }
-                    if ($share.PSObject.Properties['Enabled']) { $existing.Enabled = $share.Enabled }
+                    if ($share.PSObject.Properties['IsFavorite']) {
+                        if (-not $existing.PSObject.Properties['IsFavorite']) {
+                            $existing | Add-Member -MemberType NoteProperty -Name IsFavorite -Value $share.IsFavorite
+                        } else {
+                            $existing.IsFavorite = $share.IsFavorite
+                        }
+                    }
+                    if ($share.PSObject.Properties['Category']) {
+                        if (-not $existing.PSObject.Properties['Category']) {
+                            $existing | Add-Member -MemberType NoteProperty -Name Category -Value $share.Category
+                        } else {
+                            $existing.Category = $share.Category
+                        }
+                    }
+                    if ($share.PSObject.Properties['Description']) {
+                        if (-not $existing.PSObject.Properties['Description']) {
+                            $existing | Add-Member -MemberType NoteProperty -Name Description -Value $share.Description
+                        } else {
+                            $existing.Description = $share.Description
+                        }
+                    }
+                    if ($share.PSObject.Properties['Enabled']) {
+                        if (-not $existing.PSObject.Properties['Enabled']) {
+                            $existing | Add-Member -MemberType NoteProperty -Name Enabled -Value ([bool]$share.Enabled)
+                        } else {
+                            $existing.Enabled = [bool]$share.Enabled
+                        }
+                    }
                     $skipped++
                 }
             }
@@ -1210,7 +1319,7 @@ function Import-ShareConfiguration {
         if (Save-AllShares -Config $config) {
             Clear-ConfigCache  # Force refresh so GUI shows imported shares immediately
             Write-ActionLog -Message "Imported configuration from $ImportPath (Merge: $Merge)" -Category 'BackupRestore' -Data @{ path = $ImportPath; merge = $Merge; added = $added }
-            return @{ Success = $true; Added = $added; Skipped = $skipped }
+            return @{ Success = $true; Added = $added; Skipped = $skipped; Updated = $skipped }
         }
     }
     catch {
@@ -1223,10 +1332,10 @@ function Import-ShareConfiguration {
                 [System.Windows.Forms.MessageBoxIcon]::Error
             )
         }
-        return @{ Success = $false; Added = 0; Skipped = 0 }
+        return @{ Success = $false; Added = 0; Skipped = 0; Updated = 0 }
     }
     
-    return @{ Success = $false; Added = 0; Skipped = 0 }
+    return @{ Success = $false; Added = 0; Skipped = 0; Updated = 0 }
 }
 
 function Get-DetailedShareStatus {
@@ -1947,9 +2056,9 @@ function Test-ValidUncPath {
     
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
     
-    # Valid UNC: \\servername\sharename (minimum lengths enforced)
+    # Valid UNC: \\servername\sharename with optional subfolders
     # Server: 2+ chars, Share: 1+ chars
-    return ($Path -match '^\\\\[^\\]{2,}\\[^\\]+.*$')
+    return ($Path -match '^\\\\[^\\]{2,}\\[^\\]+(\\[^\\]+)*\\?$')
 }
 
 function Test-ShareOnline {
@@ -2030,69 +2139,132 @@ function Connect-NetworkShare {
         elseif (-not $UseGUI) {
             Write-Host "Share host not reachable. Skipping mapping." -ForegroundColor Yellow
         }
-        Write-ActionLog "Skipped mapping $DriveLetter -> $SharePath (offline)" -Level DEBUG
+        Write-ActionLog -Message "Skipped mapping $DriveLetter -> $SharePath (offline)" -Level DEBUG
         if ($ReturnStatus) {
             return @{ Success = $false; ErrorType = "Offline"; ErrorMessage = "Share host not reachable" }
         }
         return
     }
 
+    $target = $null
+    $plainPassword = $null
+    $temporaryCmdkeyAdded = $false
     try {
         $user = $Credential.UserName
-        $bstrPtr = [IntPtr]::Zero
-        $plainPassword = $null
-        
-        try {
-            # Securely extract password
-            $bstrPtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
-            $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstrPtr)
+
+        # Extract only the server name from UNC (e.g., \\server)
+        if ($SharePath -match '^\\\\([^\\]+)') {
+            $target = "\\$($Matches[1])"
+        } else {
+            $target = $SharePath
         }
-        finally {
-            # CRITICAL: Always zero and free the BSTR to prevent password leaks
-            if ($bstrPtr -ne [IntPtr]::Zero) {
-                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstrPtr)
-            }
+
+        # Inspect existing Credential Manager entry for this target.
+        $existingCreds = cmdkey /list:$target 2>&1 | Out-String
+        $hasStoredCredential = ($existingCreds -match "Target: $([regex]::Escape($target))")
+        $hasSameUserCredential = $false
+        if ($hasStoredCredential) {
+            $hasSameUserCredential = ($existingCreds -match "User: $([regex]::Escape($user))")
         }
-        
-        # If persistent, store credentials in Windows Credential Manager (smart update)
+
+        $needsCmdkeyUpdate = $false
+
+        # Decide credential strategy:
+        # - Use cmdkey + net use without password argument
+        # - For non-persistent mappings, avoid overwriting an existing different-user entry
         if ($persistent) {
-            # Extract only the server name from the UNC path (e.g., \\server)
-            $target = $null
-            if ($SharePath -match '^\\\\([^\\]+)') {
-                $target = "\\$($Matches[1])"
+            if ($hasSameUserCredential) {
+                Write-ActionLog -Message "Cmdkey credentials already exist for $target with same username (reusing)" -Level DEBUG -Category 'Credentials'
             } else {
-                $target = $SharePath
-            }
-            
-            # Check if credentials already exist for this target with same username
-            $existingCreds = cmdkey /list:$target 2>&1 | Out-String
-            $needsUpdate = $true
-            
-            if ($existingCreds -match "Target: $([regex]::Escape($target))") {
-                # Credentials exist, check if username matches
-                if ($existingCreds -match "User: $([regex]::Escape($user))") {
-                    # Same username - skip update (assume password unchanged for performance)
-                    # Note: If password changed, user should disconnect/reconnect to update
-                    $needsUpdate = $false
-                    Write-ActionLog -Message "Cmdkey credentials already exist for $target with same username (skipping update)" -Level DEBUG -Category 'Credentials'
-                } else {
+                $needsCmdkeyUpdate = $true
+                if ($hasStoredCredential) {
                     Write-ActionLog -Message "Updating cmdkey credentials for $target (username changed)" -Level DEBUG -Category 'Credentials'
+                } else {
+                    Write-ActionLog -Message "Adding new cmdkey credentials for $target" -Level DEBUG -Category 'Credentials'
                 }
-            } else {
-                # No existing credentials
-                Write-ActionLog -Message "Adding new cmdkey credentials for $target" -Level DEBUG -Category 'Credentials'
             }
-            
-            if ($needsUpdate) {
-                # Remove any existing credentials for this server
+        }
+        else {
+            if (-not $hasStoredCredential) {
+                # Non-persistent mode with no prior cmdkey entry: add a temporary one.
+                $needsCmdkeyUpdate = $true
+                $temporaryCmdkeyAdded = $true
+                Write-ActionLog -Message "Adding temporary cmdkey credentials for non-persistent mapping" -Level DEBUG -Category 'Credentials'
+            }
+            elseif ($hasSameUserCredential) {
+                Write-ActionLog -Message "Reusing existing cmdkey credentials for non-persistent mapping" -Level DEBUG -Category 'Credentials'
+            }
+            else {
+                $conflictMsg = "Credential Manager already has an entry for $target with a different username. To continue, remove the existing credential for this server or enable persistent mapping for this connection."
+                if ($UseGUI -and -not $Silent) {
+                    [System.Windows.Forms.MessageBox]::Show(
+                        $conflictMsg,
+                        "Share Manager v$version",
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
+                        [System.Windows.Forms.MessageBoxIcon]::Warning
+                    )
+                }
+                elseif (-not $UseGUI -and -not $Silent) {
+                    Write-Host $conflictMsg -ForegroundColor Yellow
+                }
+
+                Write-ActionLog -Message "Credential conflict for ${target}: existing different username and non-persistent mode" -Level WARN -Category 'Credentials'
+                if ($ReturnStatus) {
+                    return @{ Success = $false; ErrorType = "CredentialConflict"; ErrorMessage = $conflictMsg }
+                }
+                return
+            }
+        }
+
+        if ($needsCmdkeyUpdate) {
+            $bstrPtr = [IntPtr]::Zero
+            try {
+                # Securely extract password only when required.
+                $bstrPtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
+                $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstrPtr)
+            }
+            finally {
+                # CRITICAL: Always zero and free the BSTR to prevent password leaks.
+                if ($bstrPtr -ne [IntPtr]::Zero) {
+                    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstrPtr)
+                }
+            }
+        }
+
+        if ($needsCmdkeyUpdate) {
+            # Remove existing target only for persistent updates. For temporary non-persistent
+            # use, we only add when no entry exists to avoid clobbering existing credentials.
+            if ($persistent -and $hasStoredCredential) {
                 cmdkey /delete:$target 2>&1 | Out-Null
-                # Add credentials for the server - use quoted arguments to handle special characters
-                $cmdkeyArgs = @('/add:' + $target, '/user:' + $user, '/pass:' + $plainPassword)
-                $cmdkeyOutput = & cmdkey $cmdkeyArgs 2>&1
-                if ($LASTEXITCODE -ne 0) {
-                    Write-ActionLog -Message "Cmdkey failed to store credentials for $target (exit code: $LASTEXITCODE)" -Level WARN -Category 'Credentials' -Data @{ output = ($cmdkeyOutput | Out-String) }
-                }
             }
+
+            $cmdkeyArgs = @('/add:' + $target, '/user:' + $user, '/pass:' + $plainPassword)
+            $cmdkeyOutput = & cmdkey $cmdkeyArgs 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                $cmdkeyMsg = "Failed to store credentials for $target. Mapping cancelled to avoid insecure password fallback."
+                Write-ActionLog -Message "Cmdkey failed to store credentials for $target (exit code: $LASTEXITCODE)" -Level ERROR -Category 'Credentials' -Data @{ output = ($cmdkeyOutput | Out-String) }
+                $temporaryCmdkeyAdded = $false
+
+                if ($UseGUI -and -not $Silent) {
+                    [System.Windows.Forms.MessageBox]::Show(
+                        $cmdkeyMsg,
+                        "Share Manager v$version",
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
+                        [System.Windows.Forms.MessageBoxIcon]::Error
+                    )
+                }
+                elseif (-not $UseGUI -and -not $Silent) {
+                    Write-Host $cmdkeyMsg -ForegroundColor Red
+                }
+
+                if ($ReturnStatus) {
+                    return @{ Success = $false; ErrorType = "CredentialStoreFailed"; ErrorMessage = $cmdkeyMsg }
+                }
+                return
+            }
+
+            # Password no longer needed in-memory for mapping command.
+            $plainPassword = $null
         }
         
         # Enhanced retry logic with exponential backoff
@@ -2107,7 +2279,7 @@ function Connect-NetworkShare {
                 Start-Sleep -Seconds $backoff
             }
             
-            $netResult = net use "$DriveLetter`:" $SharePath /USER:$user $plainPassword $persistentFlag 2>&1
+            $netResult = net use "$DriveLetter`:" $SharePath /USER:$user $persistentFlag 2>&1
             
             if ($LASTEXITCODE -eq 0) {
                 $mapped = $true
@@ -2289,6 +2461,13 @@ function Connect-NetworkShare {
             return @{ Success = $false; ErrorType = "Exception"; ErrorMessage = "$_" }
         }
     }
+    finally {
+        # Remove temporary cmdkey entry used for non-persistent mapping.
+        if ($temporaryCmdkeyAdded -and $target) {
+            cmdkey /delete:$target 2>&1 | Out-Null
+        }
+        $plainPassword = $null
+    }
 }
 
 function Disconnect-NetworkShare {
@@ -2323,7 +2502,7 @@ function Disconnect-NetworkShare {
                 if ($persistent -and $sharePath) {
                     # Extract only the server name from the UNC path (e.g., \\server)
                     $target = $null
-                    if ($sharePath -match '^\\[^\\]+') {
+                    if ($sharePath -match '^\\\\[^\\]+') {
                         $target = $Matches[0]
                     } else {
                         $target = $sharePath
@@ -2608,7 +2787,7 @@ function Get-LogEvents {
 #region First-Run Configuration
 
 function Initialize-Config-CLI {
-    Clear-Host
+    Set-TerminalBlackBackground -Refresh
     Write-Host ""
     Write-Host "  ======================================" -ForegroundColor Cyan
     Write-Host "  Welcome to Share Manager v$version" -ForegroundColor Cyan
@@ -2953,8 +3132,8 @@ function Initialize-Config-GUI {
         "* SEARCH & FILTER - Use Ctrl+F to search, filter by category/favorites`n`n" +
         "* KEYBOARD SHORTCUTS:`n" +
         "  - Ctrl+N: Add New  - Ctrl+F: Search  - Ctrl+R: Refresh`n" +
-        "  - Ctrl+A: Connect All  - Ctrl+D: Disconnect All  - Delete: Remove`n" +
-        "  - Delete: Remove selected share`n`n" +
+        "  - Ctrl+A: Select All  - Ctrl+Shift+A: Connect All`n" +
+        "  - Ctrl+D: Disconnect All  - Delete: Remove selected share`n`n" +
         "* STATISTICS - Track connection history and usage per share`n`n" +
         "Ready to continue?",
         "Share Manager v$version - Quick Tips",
@@ -3103,6 +3282,7 @@ function Show-CredentialForm {
 #region CLI Interface
 function Start-CliMode {
     Write-ActionLog -Message "Entering CLI mode" -Level INFO -Category 'Startup'
+    Set-TerminalBlackBackground
     
     # Migrate legacy config if needed
     Convert-LegacyConfig
@@ -3981,11 +4161,17 @@ function Read-ValidatedInput {
         if (-not $firstAttempt) {
             Write-Host "  $ErrorMessage. Try again: " -ForegroundColor Yellow -NoNewline
         } else {
-            Write-Host "  > " -ForegroundColor Cyan -NoNewline
+            if ([string]::IsNullOrWhiteSpace($Prompt)) {
+                Write-Host "  > " -ForegroundColor Cyan -NoNewline
+            }
             $firstAttempt = $false
         }
         
-        $userInput = Read-Host
+        if ([string]::IsNullOrWhiteSpace($Prompt)) {
+            $userInput = Read-Host
+        } else {
+            $userInput = Read-Host $Prompt
+        }
         
         # Handle empty input
         if ([string]::IsNullOrWhiteSpace($userInput)) {
@@ -4054,20 +4240,24 @@ function Add-NewShareCli {
             $sharePath = Read-ValidatedInput `
                 -ValidationScript { 
                     param($p) 
-                    # Auto-correct: add \\ if missing
-                    if ($p -notmatch '^\\\\' -and $p -match '^[^\\]') {
-                        $script:sharePath = "\\$p"
-                        Write-Host ""
-                        Write-Host "  [Auto-corrected to: $script:sharePath]" -ForegroundColor Green
-                        return $true
+                    $candidate = $p
+                    # Auto-correct candidate validation: add \\ if missing
+                    if ($candidate -notmatch '^\\\\' -and $candidate -match '^[^\\]') {
+                        $candidate = "\\$candidate"
                     }
-                    $p -match '^\\\\[^\\]+\\'
+                    Test-ValidUncPath -Path $candidate
                 } `
-                -ErrorMessage "Invalid UNC path. Must start with \\"
+                -ErrorMessage "Invalid UNC path. Must be \\servername\sharename"
             if ($null -eq $sharePath) {
                 Write-Host ""
                 Write-Host "  [!] Operation cancelled" -ForegroundColor Yellow
                 return
+            }
+            # Apply the same auto-correction that was used during validation.
+            if ($sharePath -notmatch '^\\\\' -and $sharePath -match '^[^\\]') {
+                $sharePath = "\\$sharePath"
+                Write-Host ""
+                Write-Host "  [Auto-corrected to: $sharePath]" -ForegroundColor Green
             }
             Write-Host ""
         }
@@ -4940,9 +5130,9 @@ function Import-ExportConfigCli {
                     Write-Host "  Added: " -NoNewline -ForegroundColor DarkGray
                     Write-Host "$($result.Added)" -NoNewline -ForegroundColor White
                     Write-Host " new share(s)" -ForegroundColor DarkGray
-                    if ($result.Updated -gt 0) {
+                    if ($result.Skipped -gt 0) {
                         Write-Host "  Updated: " -NoNewline -ForegroundColor DarkGray
-                        Write-Host "$($result.Updated)" -NoNewline -ForegroundColor Cyan
+                        Write-Host "$($result.Skipped)" -NoNewline -ForegroundColor Cyan
                         Write-Host " existing share(s)" -ForegroundColor DarkGray
                     }
                 } else {
@@ -5304,7 +5494,7 @@ function Install-LogonScript {
     $ps1Path = Join-Path $baseFolder 'Share_Manager_AutoMap.ps1'
     $cmdPath = Join-Path $startupFolder 'Share_Manager_AutoMap.cmd'
     $logonScript = @'
-# Auto-generated by Share Manager v2.2.0 (multi-share, DPAPI-protected)
+# Auto-generated by Share Manager v2.3.0 (multi-share, DPAPI-protected)
 # Production-ready with enhanced error handling, network checks, and retry logic
 param()
 $baseFolder = Join-Path $env:APPDATA "Share_Manager"
@@ -5354,7 +5544,7 @@ function Write-Log {
         correlationId = $null
         sessionId     = $sessionId
         pid           = $PID
-        ver           = '2.2.0'
+        ver           = '2.3.0'
         data          = $Data
     }
     ($evt | ConvertTo-Json -Compress) | Out-File -FilePath $eventsPath -Encoding UTF8 -Append
@@ -5405,7 +5595,7 @@ $psVersion = "$($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Min
 $psEditionInfo = $PSVersionTable.PSEdition
 
 Write-Log -Message "========================================" -Category 'AutoMap'
-Write-Log -Message "AutoMap start (v2.2.0)" -Category 'AutoMap' -Data @{ psVersion = $psVersion; psEdition = $psEditionInfo }
+Write-Log -Message "AutoMap start (v2.3.0)" -Category 'AutoMap' -Data @{ psVersion = $psVersion; psEdition = $psEditionInfo }
 Write-Log -Message "Environment: PowerShell $psVersion ($psEditionInfo)" -Level DEBUG -Category 'AutoMap'
 
 # Check network availability with retry logic (for slow WiFi connections during logon)
@@ -5624,7 +5814,7 @@ Write-Log -Message "========================================" -Category 'AutoMap
 '@
     $cmdScript = @"
 @echo off
-REM Auto-generated by Share Manager v2.2.0 - Logon Script Launcher
+REM Auto-generated by Share Manager v2.3.0 - Logon Script Launcher
 REM This wrapper launches the PowerShell automap script with proper error handling
 REM Windows 11 25H2+ compatible (no wmic dependency)
 
@@ -6575,117 +6765,744 @@ function Show-ManageShareDialog {
 }
 
 function Show-CredentialsDialog {
+    param(
+        [ValidateSet("Credentials", "Backup")]
+        [string]$StartPage = "Credentials"
+    )
+
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = "Manage Credentials"
-    $form.Width = 500
-    $form.Height = 400
+    $form.Text = "Credential Center"
+    $form.Width = 720
+    $form.Height = 560
+    $form.MinimumSize = New-Object System.Drawing.Size(720, 560)
     $form.StartPosition = "CenterParent"
-    $form.FormBorderStyle = "FixedDialog"
-    $form.MaximizeBox = $false
-    
-    # ListView for credentials
+    $form.FormBorderStyle = "Sizable"
+    $form.MaximizeBox = $true
+
+    $toolTip = New-Object System.Windows.Forms.ToolTip
+    $toolTip.AutoPopDelay = 12000
+    $toolTip.InitialDelay = 400
+    $toolTip.ReshowDelay = 200
+    $toolTip.ShowAlways = $true
+
+    $lblTitle = New-Object System.Windows.Forms.Label
+    $lblTitle.Text = "Credential Center"
+    $lblTitle.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+    $lblTitle.AutoSize = $true
+    $lblTitle.Left = 15
+    $lblTitle.Top = 12
+    $lblTitle.Anchor = 'Top,Left'
+    $form.Controls.Add($lblTitle)
+
+    $lblSubtitle = New-Object System.Windows.Forms.Label
+    $lblSubtitle.Text = "Manage saved credentials and DPAPI backups from one place."
+    $lblSubtitle.AutoSize = $true
+    $lblSubtitle.Left = 15
+    $lblSubtitle.Top = 34
+    $lblSubtitle.ForeColor = [System.Drawing.Color]::DimGray
+    $lblSubtitle.Anchor = 'Top,Left'
+    $form.Controls.Add($lblSubtitle)
+
+    $tabs = New-Object System.Windows.Forms.TabControl
+    $tabs.Left = 15
+    $tabs.Top = 58
+    $tabs.Width = 675
+    $tabs.Height = 425
+    $tabs.Anchor = 'Top,Left,Right,Bottom'
+    $form.Controls.Add($tabs)
+
+    # Tab 1: Stored credentials
+    $tabCredentials = New-Object System.Windows.Forms.TabPage
+    $tabCredentials.Text = "Stored Credentials"
+    $tabs.TabPages.Add($tabCredentials) | Out-Null
+
+    $lblSearch = New-Object System.Windows.Forms.Label
+    $lblSearch.Text = "Search:"
+    $lblSearch.Top = 16
+    $lblSearch.Left = 15
+    $lblSearch.AutoSize = $true
+    $tabCredentials.Controls.Add($lblSearch)
+
+    $txtSearch = New-Object System.Windows.Forms.TextBox
+    $txtSearch.Top = 12
+    $txtSearch.Left = 80
+    $txtSearch.Width = 570
+    $txtSearch.Anchor = 'Top,Left,Right'
+    $tabCredentials.Controls.Add($txtSearch)
+
     $listView = New-Object System.Windows.Forms.ListView
     $listView.View = 'Details'
     $listView.FullRowSelect = $true
-    $listView.Top = 20
-    $listView.Left = 20
-    $listView.Width = 440
-    $listView.Height = 200
-    [void]$listView.Columns.Add("Username", 200)
-    [void]$listView.Columns.Add("Encryption", 120)
-    [void]$listView.Columns.Add("Shares Using", 100)
-    $form.Controls.Add($listView)
-    
-    function Update-CredList {
-        $listView.Items.Clear()
-        $store = Import-CredentialStore
-        $shares = Get-ShareConfiguration
-        
-        if ($store -and $store.Entries) {
-            foreach ($entry in $store.Entries) {
-                $item = New-Object System.Windows.Forms.ListViewItem($entry.Username)
-                [void]$item.SubItems.Add($entry.EncryptionType)
-                
-                # Count shares using this credential (case-insensitive comparison)
-                $usingCount = 0
-                if ($shares) {
-                    $usingCount = @($shares | Where-Object { 
-                        $_.Username -and $_.Username -eq $entry.Username 
-                    }).Count
-                }
-                [void]$item.SubItems.Add($usingCount.ToString())
-                $item.Tag = $entry.Username
-                
-                [void]$listView.Items.Add($item)
-            }
-        }
-    }
-    
-    Update-CredList
-    
-    $y = 240
-    
-    # Add/Update button
+    $listView.MultiSelect = $false
+    $listView.HideSelection = $false
+    $listView.Top = 45
+    $listView.Left = 15
+    $listView.Width = 635
+    $listView.Height = 255
+    $listView.Anchor = 'Top,Left,Right,Bottom'
+    [void]$listView.Columns.Add("Username", 280)
+    [void]$listView.Columns.Add("Encryption", 140)
+    [void]$listView.Columns.Add("Shares Using", 110)
+    $tabCredentials.Controls.Add($listView)
+
+    $lblCredHint = New-Object System.Windows.Forms.Label
+    $lblCredHint.Text = "Tip: Select a credential to inspect exactly which shares use it."
+    $lblCredHint.Top = 308
+    $lblCredHint.Left = 15
+    $lblCredHint.Width = 635
+    $lblCredHint.Height = 18
+    $lblCredHint.ForeColor = [System.Drawing.Color]::DimGray
+    $lblCredHint.Anchor = 'Left,Right,Bottom'
+    $tabCredentials.Controls.Add($lblCredHint)
+
     $btnAdd = New-Object System.Windows.Forms.Button
-    $btnAdd.Text = "Add/Update"
-    $btnAdd.Top = $y
-    $btnAdd.Left = 20
-    $btnAdd.Width = 130
-    $btnAdd.Add_Click({
-        $username = Show-InputBox -Prompt "Enter username:" -Title "Add/Update Credential"
-        if ([string]::IsNullOrWhiteSpace($username)) { return }
-        
-        $cred = Get-Credential -Message "Enter password for $username" -UserName $username
-        if ($cred) {
-            Save-Credential -Credential $cred
-            Update-CredList
-            [System.Windows.Forms.MessageBox]::Show("Credential saved", "Success")
-        }
-    })
-    $form.Controls.Add($btnAdd)
-    
-    # Remove button
+    $btnAdd.Text = "Add"
+    $btnAdd.Top = 332
+    $btnAdd.Left = 15
+    $btnAdd.Width = 95
+    $btnAdd.Height = 32
+    $btnAdd.Anchor = 'Left,Bottom'
+    $tabCredentials.Controls.Add($btnAdd)
+
+    $btnUpdate = New-Object System.Windows.Forms.Button
+    $btnUpdate.Text = "Update"
+    $btnUpdate.Top = 332
+    $btnUpdate.Left = 115
+    $btnUpdate.Width = 95
+    $btnUpdate.Height = 32
+    $btnUpdate.Anchor = 'Left,Bottom'
+    $btnUpdate.Enabled = $false
+    $tabCredentials.Controls.Add($btnUpdate)
+
+    $btnUsage = New-Object System.Windows.Forms.Button
+    $btnUsage.Text = "Usage"
+    $btnUsage.Top = 332
+    $btnUsage.Left = 215
+    $btnUsage.Width = 95
+    $btnUsage.Height = 32
+    $btnUsage.Anchor = 'Left,Bottom'
+    $btnUsage.Enabled = $false
+    $tabCredentials.Controls.Add($btnUsage)
+
     $btnRemove = New-Object System.Windows.Forms.Button
     $btnRemove.Text = "Remove"
-    $btnRemove.Top = $y
-    $btnRemove.Left = 160
-    $btnRemove.Width = 130
+    $btnRemove.Top = 332
+    $btnRemove.Left = 315
+    $btnRemove.Width = 95
+    $btnRemove.Height = 32
+    $btnRemove.Anchor = 'Left,Bottom'
+    $btnRemove.Enabled = $false
+    $tabCredentials.Controls.Add($btnRemove)
+
+    $btnRemoveUnused = New-Object System.Windows.Forms.Button
+    $btnRemoveUnused.Text = "Unused"
+    $btnRemoveUnused.Top = 332
+    $btnRemoveUnused.Left = 415
+    $btnRemoveUnused.Width = 110
+    $btnRemoveUnused.Height = 32
+    $btnRemoveUnused.Anchor = 'Left,Bottom'
+    $tabCredentials.Controls.Add($btnRemoveUnused)
+
+    $btnRefreshCreds = New-Object System.Windows.Forms.Button
+    $btnRefreshCreds.Text = "Refresh"
+    $btnRefreshCreds.Top = 332
+    $btnRefreshCreds.Left = 530
+    $btnRefreshCreds.Width = 120
+    $btnRefreshCreds.Height = 32
+    $btnRefreshCreds.Anchor = 'Right,Bottom'
+    $tabCredentials.Controls.Add($btnRefreshCreds)
+
+    # Tab 2: Backup and restore for credentials only
+    $tabBackup = New-Object System.Windows.Forms.TabPage
+    $tabBackup.Text = "Backup && Restore"
+    $tabs.TabPages.Add($tabBackup) | Out-Null
+
+    $lblBackupInfo = New-Object System.Windows.Forms.Label
+    $lblBackupInfo.Text = "Credential backups are encrypted with DPAPI and can only be restored by this Windows user on this machine."
+    $lblBackupInfo.Top = 15
+    $lblBackupInfo.Left = 15
+    $lblBackupInfo.Width = 635
+    $lblBackupInfo.Height = 35
+    $lblBackupInfo.Anchor = 'Top,Left,Right'
+    $tabBackup.Controls.Add($lblBackupInfo)
+
+    $grpExport = New-Object System.Windows.Forms.GroupBox
+    $grpExport.Text = "Export"
+    $grpExport.Top = 58
+    $grpExport.Left = 15
+    $grpExport.Width = 635
+    $grpExport.Height = 95
+    $grpExport.Anchor = 'Top,Left,Right'
+    $tabBackup.Controls.Add($grpExport)
+
+    $btnExportCreds = New-Object System.Windows.Forms.Button
+    $btnExportCreds.Text = "Export Credentials Backup..."
+    $btnExportCreds.Top = 36
+    $btnExportCreds.Left = 15
+    $btnExportCreds.Width = 230
+    $btnExportCreds.Height = 35
+    $grpExport.Controls.Add($btnExportCreds)
+
+    $lblExportInfo = New-Object System.Windows.Forms.Label
+    $lblExportInfo.Text = "Create a backup file of your encrypted credential store."
+    $lblExportInfo.Top = 43
+    $lblExportInfo.Left = 260
+    $lblExportInfo.Width = 360
+    $lblExportInfo.Height = 18
+    $lblExportInfo.ForeColor = [System.Drawing.Color]::DimGray
+    $grpExport.Controls.Add($lblExportInfo)
+
+    $grpImport = New-Object System.Windows.Forms.GroupBox
+    $grpImport.Text = "Import"
+    $grpImport.Top = 163
+    $grpImport.Left = 15
+    $grpImport.Width = 635
+    $grpImport.Height = 145
+    $grpImport.Anchor = 'Top,Left,Right'
+    $tabBackup.Controls.Add($grpImport)
+
+    $btnImportMerge = New-Object System.Windows.Forms.Button
+    $btnImportMerge.Text = "Import and Merge..."
+    $btnImportMerge.Top = 30
+    $btnImportMerge.Left = 15
+    $btnImportMerge.Width = 230
+    $btnImportMerge.Height = 32
+    $grpImport.Controls.Add($btnImportMerge)
+
+    $btnImportReplace = New-Object System.Windows.Forms.Button
+    $btnImportReplace.Text = "Import and Replace..."
+    $btnImportReplace.Top = 70
+    $btnImportReplace.Left = 15
+    $btnImportReplace.Width = 230
+    $btnImportReplace.Height = 32
+    $grpImport.Controls.Add($btnImportReplace)
+
+    $lblImportInfo = New-Object System.Windows.Forms.Label
+    $lblImportInfo.Text = "Merge keeps existing entries and adds new usernames. Replace overwrites the current credential store."
+    $lblImportInfo.Top = 35
+    $lblImportInfo.Left = 260
+    $lblImportInfo.Width = 360
+    $lblImportInfo.Height = 60
+    $lblImportInfo.ForeColor = [System.Drawing.Color]::DimGray
+    $grpImport.Controls.Add($lblImportInfo)
+
+    $btnOpenStore = New-Object System.Windows.Forms.Button
+    $btnOpenStore.Text = "Open Data Folder"
+    $btnOpenStore.Top = 320
+    $btnOpenStore.Left = 15
+    $btnOpenStore.Width = 160
+    $btnOpenStore.Height = 32
+    $btnOpenStore.Anchor = 'Left,Bottom'
+    $tabBackup.Controls.Add($btnOpenStore)
+
+    $lblSummary = New-Object System.Windows.Forms.Label
+    $lblSummary.Text = "Ready"
+    $lblSummary.Left = 15
+    $lblSummary.Top = 492
+    $lblSummary.Width = 560
+    $lblSummary.Height = 22
+    $lblSummary.Anchor = 'Left,Right,Bottom'
+    $lblSummary.AutoEllipsis = $true
+    $form.Controls.Add($lblSummary)
+
+    $btnClose = New-Object System.Windows.Forms.Button
+    $btnClose.Text = "Close"
+    $btnClose.Top = 488
+    $btnClose.Left = 590
+    $btnClose.Width = 100
+    $btnClose.Height = 30
+    $btnClose.Anchor = 'Right,Bottom'
+    $btnClose.Add_Click({ $form.Close() })
+    $form.Controls.Add($btnClose)
+    $form.CancelButton = $btnClose
+
+    $toolTip.SetToolTip($btnAdd, "Add a new credential entry.")
+    $toolTip.SetToolTip($btnUpdate, "Update the password for the selected username.")
+    $toolTip.SetToolTip($btnUsage, "Inspect every configured share that uses the selected username.")
+    $toolTip.SetToolTip($btnRemove, "Remove the selected credential.")
+    $toolTip.SetToolTip($btnRemoveUnused, "Removes credentials that are not referenced by any configured share.")
+    $toolTip.SetToolTip($btnImportReplace, "Use carefully. This replaces the entire credential store.")
+    $toolTip.SetToolTip($btnOpenStore, "Opens the Share Manager data folder.")
+
+    Add-CtrlASupport -TextBox $txtSearch
+
+    function Get-CredentialUsageMap {
+        $usage = @{}
+        $shares = @(Get-ShareConfiguration)
+        foreach ($share in $shares) {
+            if (-not $share) { continue }
+            $username = if ($share.PSObject.Properties['Username']) { [string]$share.Username } else { "" }
+            if ([string]::IsNullOrWhiteSpace($username)) { continue }
+            $usernameKey = $username.ToLowerInvariant()
+            if (-not $usage.ContainsKey($usernameKey)) { $usage[$usernameKey] = 0 }
+            $usage[$usernameKey] = [int]$usage[$usernameKey] + 1
+        }
+        return $usage
+    }
+
+    function Get-SharesForCredential {
+        param([string]$Username)
+
+        if ([string]::IsNullOrWhiteSpace($Username)) {
+            return @()
+        }
+
+        return @(
+            Get-ShareConfiguration |
+            Where-Object { $_.Username -and $_.Username -ieq $Username } |
+            Sort-Object Name
+        )
+    }
+
+    function Update-CredentialActionState {
+        $hasSelection = $listView.SelectedItems.Count -gt 0
+        $btnUpdate.Enabled = $hasSelection
+        $btnUsage.Enabled = $hasSelection
+        $btnRemove.Enabled = $hasSelection
+    }
+
+    function Update-CredentialSelectionSummary {
+        if ($listView.SelectedItems.Count -eq 0) {
+            $lblCredHint.Text = "Tip: Select a credential to inspect exactly which shares use it."
+            return
+        }
+
+        $selectedUsername = [string]$listView.SelectedItems[0].Tag
+        if ([string]::IsNullOrWhiteSpace($selectedUsername)) {
+            $lblCredHint.Text = "Tip: Select a credential to inspect exactly which shares use it."
+            return
+        }
+
+        $sharesUsing = @(Get-SharesForCredential -Username $selectedUsername)
+        if ($sharesUsing.Count -eq 0) {
+            $lblCredHint.Text = "Selected '$selectedUsername' is not used by any configured share."
+            return
+        }
+
+        $names = @($sharesUsing | ForEach-Object { if ($_.Name) { $_.Name } else { "(unnamed share)" } })
+        $previewCount = [Math]::Min($names.Count, 3)
+        $previewNames = @($names | Select-Object -First $previewCount)
+        $summary = "Used by $($sharesUsing.Count) share(s): " + ($previewNames -join ", ")
+        if ($names.Count -gt $previewCount) {
+            $summary += ", ..."
+        }
+        $lblCredHint.Text = $summary
+    }
+
+    function Update-CredentialList {
+        $listView.BeginUpdate()
+        $listView.Items.Clear()
+
+        $store = Import-CredentialStore
+        $entries = @()
+        if ($store -and $store.Entries) {
+            $entries = @($store.Entries)
+        }
+
+        $usageMap = Get-CredentialUsageMap
+        $searchText = $txtSearch.Text.Trim()
+
+        if (-not [string]::IsNullOrWhiteSpace($searchText)) {
+            $entries = @($entries | Where-Object {
+                $_.Username -and $_.Username -like "*$searchText*"
+            })
+        }
+
+        $entries = @($entries | Sort-Object Username)
+
+        foreach ($entry in $entries) {
+            $username = [string]$entry.Username
+            if ([string]::IsNullOrWhiteSpace($username)) { continue }
+
+            $encryptionType = if ($entry.PSObject.Properties['EncryptionType'] -and $entry.EncryptionType) {
+                [string]$entry.EncryptionType
+            } else {
+                "DPAPI"
+            }
+
+            $shareCount = 0
+            $usernameKey = $username.ToLowerInvariant()
+            if ($usageMap.ContainsKey($usernameKey)) {
+                $shareCount = [int]$usageMap[$usernameKey]
+            }
+
+            $item = New-Object System.Windows.Forms.ListViewItem($username)
+            [void]$item.SubItems.Add($encryptionType)
+            [void]$item.SubItems.Add($shareCount.ToString())
+            $item.Tag = $username
+
+            if ($shareCount -eq 0) {
+                $item.ForeColor = [System.Drawing.Color]::DimGray
+            }
+
+            [void]$listView.Items.Add($item)
+        }
+
+        $listView.EndUpdate()
+
+        $totalStored = if ($store -and $store.Entries) {
+            @($store.Entries | Where-Object { $_.Username -and $_.Username.Trim().Length -gt 0 }).Count
+        } else {
+            0
+        }
+        $filtered = $listView.Items.Count
+        $assignedUsernames = @($usageMap.Keys).Count
+        $lblSummary.Text = "Showing $filtered of $totalStored credentials | Usernames referenced by shares: $assignedUsernames"
+
+        Update-CredentialActionState
+        Update-CredentialSelectionSummary
+    }
+
+    function Show-CredentialUsageDialog {
+        param([string]$Username)
+
+        if ([string]::IsNullOrWhiteSpace($Username)) { return }
+
+        $sharesUsing = @(Get-SharesForCredential -Username $Username)
+
+        $usageForm = New-Object System.Windows.Forms.Form
+        $usageForm.Text = "Credential Usage - $Username"
+        $usageForm.Width = 700
+        $usageForm.Height = 420
+        $usageForm.StartPosition = "CenterParent"
+        $usageForm.FormBorderStyle = "Sizable"
+        $usageForm.MinimumSize = New-Object System.Drawing.Size(700, 420)
+
+        $lblUsageInfo = New-Object System.Windows.Forms.Label
+        $lblUsageInfo.Left = 12
+        $lblUsageInfo.Top = 12
+        $lblUsageInfo.Width = 660
+        $lblUsageInfo.Height = 18
+        $lblUsageInfo.Anchor = 'Top,Left,Right'
+        $lblUsageInfo.Text = "Username '$Username' is referenced by $($sharesUsing.Count) configured share(s)."
+        $usageForm.Controls.Add($lblUsageInfo)
+
+        $usageList = New-Object System.Windows.Forms.ListView
+        $usageList.View = 'Details'
+        $usageList.FullRowSelect = $true
+        $usageList.GridLines = $true
+        $usageList.Top = 38
+        $usageList.Left = 12
+        $usageList.Width = 660
+        $usageList.Height = 300
+        $usageList.Anchor = 'Top,Left,Right,Bottom'
+        [void]$usageList.Columns.Add("Share Name", 170)
+        [void]$usageList.Columns.Add("Drive", 70)
+        [void]$usageList.Columns.Add("Path", 310)
+        [void]$usageList.Columns.Add("Enabled", 80)
+
+        foreach ($share in $sharesUsing) {
+            $shareName = if ($share.Name) { [string]$share.Name } else { "(unnamed share)" }
+            $drive = if ($share.DriveLetter) { "$($share.DriveLetter):" } else { "-" }
+            $path = if ($share.SharePath) { [string]$share.SharePath } else { "-" }
+            $enabled = if ($share.Enabled) { "Yes" } else { "No" }
+
+            $row = New-Object System.Windows.Forms.ListViewItem($shareName)
+            [void]$row.SubItems.Add($drive)
+            [void]$row.SubItems.Add($path)
+            [void]$row.SubItems.Add($enabled)
+            [void]$usageList.Items.Add($row)
+        }
+
+        $usageForm.Controls.Add($usageList)
+
+        $btnUsageClose = New-Object System.Windows.Forms.Button
+        $btnUsageClose.Text = "Close"
+        $btnUsageClose.Top = 348
+        $btnUsageClose.Left = 572
+        $btnUsageClose.Width = 100
+        $btnUsageClose.Height = 30
+        $btnUsageClose.Anchor = 'Bottom,Right'
+        $btnUsageClose.Add_Click({ $usageForm.Close() })
+        $usageForm.Controls.Add($btnUsageClose)
+        $usageForm.CancelButton = $btnUsageClose
+
+        [void]$usageForm.ShowDialog($form)
+    }
+
+    function Invoke-CredentialCapture {
+        param([string]$DefaultUsername = "")
+
+        $username = Show-InputBox -Prompt "Enter username:" -Title "Credential Center" -DefaultValue $DefaultUsername
+        if ([string]::IsNullOrWhiteSpace($username)) { return }
+
+        $cred = Get-Credential -Message "Enter password for $username" -UserName $username
+        if (-not $cred) { return }
+
+        Save-Credential -Credential $cred
+        Update-CredentialList
+        [System.Windows.Forms.MessageBox]::Show(
+            "Credential saved for '$username'.",
+            "Credential Center",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        )
+    }
+
+    function Invoke-CredentialImport {
+        param([bool]$MergeMode)
+
+        $ofd = New-Object System.Windows.Forms.OpenFileDialog
+        $ofd.Title = "Select Credentials Backup File"
+        $ofd.Filter = "JSON Files (*.json)|*.json|All Files (*.*)|*.*"
+        $ofd.InitialDirectory = $baseFolder
+        if ($ofd.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+        if (-not $MergeMode) {
+            $replaceResult = [System.Windows.Forms.MessageBox]::Show(
+                "Replace all stored credentials with this file?`n`nThis action cannot be undone.",
+                "Confirm Replace",
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            if ($replaceResult -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        }
+
+        Import-Credentials -ImportPath $ofd.FileName -Merge:$MergeMode
+        Update-CredentialList
+    }
+
+    # List context menu for quick actions
+    $listMenu = New-Object System.Windows.Forms.ContextMenuStrip
+    $miListAdd = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miListAdd.Text = "Add Credential..."
+    $miListAdd.Add_Click({ Invoke-CredentialCapture })
+    $listMenu.Items.Add($miListAdd) | Out-Null
+
+    $miListUpdate = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miListUpdate.Text = "Update Selected..."
+    $miListUpdate.Add_Click({
+        if ($listView.SelectedItems.Count -eq 0) { return }
+        $username = [string]$listView.SelectedItems[0].Tag
+        if ([string]::IsNullOrWhiteSpace($username)) { return }
+        Invoke-CredentialCapture -DefaultUsername $username
+    })
+    $listMenu.Items.Add($miListUpdate) | Out-Null
+
+    $miListUsage = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miListUsage.Text = "Inspect Usage..."
+    $miListUsage.Add_Click({
+        if ($listView.SelectedItems.Count -eq 0) { return }
+        $username = [string]$listView.SelectedItems[0].Tag
+        if ([string]::IsNullOrWhiteSpace($username)) { return }
+        Show-CredentialUsageDialog -Username $username
+    })
+    $listMenu.Items.Add($miListUsage) | Out-Null
+
+    $miListRemove = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miListRemove.Text = "Remove Selected"
+    $miListRemove.Add_Click({
+        if ($listView.SelectedItems.Count -eq 0) { return }
+        $btnRemove.PerformClick()
+    })
+    $listMenu.Items.Add($miListRemove) | Out-Null
+
+    $listView.ContextMenuStrip = $listMenu
+
+    $btnAdd.Add_Click({ Invoke-CredentialCapture })
+
+    $btnUsage.Add_Click({
+        if ($listView.SelectedItems.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Select a credential first.",
+                "No Selection",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            return
+        }
+
+        $username = [string]$listView.SelectedItems[0].Tag
+        if ([string]::IsNullOrWhiteSpace($username)) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Unable to resolve selected username.",
+                "Error",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            )
+            return
+        }
+
+        Show-CredentialUsageDialog -Username $username
+    })
+
+    $btnUpdate.Add_Click({
+        if ($listView.SelectedItems.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Select a credential first.",
+                "No Selection",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            return
+        }
+
+        $username = [string]$listView.SelectedItems[0].Tag
+        if ([string]::IsNullOrWhiteSpace($username)) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Unable to resolve selected username.",
+                "Error",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            )
+            return
+        }
+
+        Invoke-CredentialCapture -DefaultUsername $username
+    })
+
     $btnRemove.Add_Click({
         if ($listView.SelectedItems.Count -eq 0) {
-            [System.Windows.Forms.MessageBox]::Show("Please select a credential first", "No Selection", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+            [System.Windows.Forms.MessageBox]::Show(
+                "Select a credential first.",
+                "No Selection",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
             return
         }
-        
-        $username = $listView.SelectedItems[0].Tag
+
+        $item = $listView.SelectedItems[0]
+        $username = [string]$item.Tag
         if ([string]::IsNullOrWhiteSpace($username)) {
-            [System.Windows.Forms.MessageBox]::Show("Unable to retrieve username from selection", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+            [System.Windows.Forms.MessageBox]::Show(
+                "Unable to resolve selected username.",
+                "Error",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            )
             return
         }
-        
-        $result = [System.Windows.Forms.MessageBox]::Show(
-            "Remove credential for '$username'?",
+
+        $sharesUsing = 0
+        if ($item.SubItems.Count -ge 3) {
+            [void][int]::TryParse($item.SubItems[2].Text, [ref]$sharesUsing)
+        }
+
+        $usageNote = ""
+        if ($sharesUsing -gt 0) {
+            $usageNote = "`n`nThis username is still referenced by $sharesUsing configured share(s)."
+        }
+
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Remove credential for '$username'?$usageNote",
             "Confirm Remove",
             [System.Windows.Forms.MessageBoxButtons]::YesNo,
             [System.Windows.Forms.MessageBoxIcon]::Question
         )
-        
-        if ($result -eq 'Yes') {
-            Remove-Credential -Username $username
-            Update-CredList
-            [System.Windows.Forms.MessageBox]::Show("Credential removed for '$username'", "Success", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+
+        if ($confirm -eq [System.Windows.Forms.DialogResult]::Yes) {
+            [void](Remove-Credential -Username $username)
+            Update-CredentialList
+            [System.Windows.Forms.MessageBox]::Show(
+                "Credential removed for '$username'.",
+                "Credential Center",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            )
         }
     })
-    $form.Controls.Add($btnRemove)
-    
-    # Close button
-    $btnClose = New-Object System.Windows.Forms.Button
-    $btnClose.Text = "Close"
-    $btnClose.Top = $y
-    $btnClose.Left = 300
-    $btnClose.Width = 130
-    $btnClose.Add_Click({ $form.Close() })
-    $form.Controls.Add($btnClose)
-    
+
+    $btnRemoveUnused.Add_Click({
+        $store = Import-CredentialStore
+        $entries = @()
+        if ($store -and $store.Entries) {
+            $entries = @($store.Entries)
+        }
+
+        if ($entries.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "No credentials are currently stored.",
+                "Credential Center",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            )
+            return
+        }
+
+        $usageMap = Get-CredentialUsageMap
+        $unusedUsernames = @(
+            $entries |
+            Where-Object {
+                $candidate = if ($_.PSObject.Properties['Username']) { [string]$_.Username } else { "" }
+                $candidate -and -not $usageMap.ContainsKey($candidate.ToLowerInvariant())
+            } |
+            Select-Object -ExpandProperty Username -Unique
+        )
+
+        if ($unusedUsernames.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "No unused credentials found.",
+                "Credential Center",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            )
+            return
+        }
+
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Remove $($unusedUsernames.Count) unused credential(s)?`n`nOnly credentials not referenced by any configured share will be removed.",
+            "Remove Unused Credentials",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Question
+        )
+
+        if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+        foreach ($unused in $unusedUsernames) {
+            if (-not [string]::IsNullOrWhiteSpace($unused)) {
+                [void](Remove-Credential -Username $unused)
+            }
+        }
+
+        Update-CredentialList
+        [System.Windows.Forms.MessageBox]::Show(
+            "Removed $($unusedUsernames.Count) unused credential(s).",
+            "Credential Center",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        )
+    })
+
+    $btnRefreshCreds.Add_Click({ Update-CredentialList })
+    $txtSearch.Add_TextChanged({ Update-CredentialList })
+    $listView.Add_SelectedIndexChanged({
+        Update-CredentialActionState
+        Update-CredentialSelectionSummary
+    })
+    $listView.Add_DoubleClick({
+        if ($listView.SelectedItems.Count -gt 0) {
+            $btnUpdate.PerformClick()
+        }
+    })
+
+    $btnExportCreds.Add_Click({ Export-Credentials })
+    $btnImportMerge.Add_Click({ Invoke-CredentialImport -MergeMode $true })
+    $btnImportReplace.Add_Click({ Invoke-CredentialImport -MergeMode $false })
+    $btnOpenStore.Add_Click({
+        try {
+            if (-not (Test-Path $baseFolder)) {
+                New-Item -Path $baseFolder -ItemType Directory -Force | Out-Null
+            }
+            Invoke-Item -Path $baseFolder
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Failed to open folder:`n$_",
+                "Credential Center",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            )
+        }
+    })
+
+    if ($StartPage -eq 'Backup') {
+        $tabs.SelectedTab = $tabBackup
+    } else {
+        $tabs.SelectedTab = $tabCredentials
+    }
+
+    Update-CredentialList
     [void]$form.ShowDialog()
 }
 
@@ -6979,30 +7796,46 @@ public class ListViewItemComparer : IComparer {
     $script:MainForm = $form
     # Classic theme: no styling; Modern theme: keep native defaults (EnableVisualStyles handles it)
 
+    # Top menu bar for professional navigation.
+    $mainMenu = New-Object System.Windows.Forms.MenuStrip
+    $mainMenu.RenderMode = [System.Windows.Forms.ToolStripRenderMode]::System
+    $mainMenu.Dock = [System.Windows.Forms.DockStyle]::Top
+    $form.MainMenuStrip = $mainMenu
+    $form.Controls.Add($mainMenu)
+
+    # Keep content below the menu strip.
+    $headerTop = 35
+    $hintTop = 65
+    $listTop = 90
+    $listHeight = 330
+
     # Title Label
     $lblTitle = New-Object System.Windows.Forms.Label
     $lblTitle.Text     = "Network Shares"
     # Always ensure the title pops
     $lblTitle.Font     = New-Object System.Drawing.Font("Segoe UI",12,[System.Drawing.FontStyle]::Bold)
     $lblTitle.AutoSize = $true
-    $lblTitle.Top      = 15
+    $lblTitle.Top      = $headerTop
     $lblTitle.Left     = 15
+    $lblTitle.Anchor   = 'Top,Left'
     $form.Controls.Add($lblTitle)
     
     # Search/Filter Box
     $txtSearch = New-Object System.Windows.Forms.TextBox
     $txtSearch.Width = 200
-    $txtSearch.Top = 15
+    $txtSearch.Top = $headerTop
     $txtSearch.Left = 370
     $txtSearch.Text = "Search shares..."
     $txtSearch.ForeColor = [System.Drawing.Color]::Gray
+    $txtSearch.Anchor = 'Top,Right'
     
     # Category Filter
     $cmbCategory = New-Object System.Windows.Forms.ComboBox
     $cmbCategory.Width = 120
-    $cmbCategory.Top = 15
+    $cmbCategory.Top = $headerTop
     $cmbCategory.Left = 240
     $cmbCategory.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    $cmbCategory.Anchor = 'Top,Right'
     [void]$cmbCategory.Items.Add("All Categories")
     
     # Add categories from shares
@@ -7017,8 +7850,9 @@ public class ListViewItemComparer : IComparer {
     $chkFavoritesOnly = New-Object System.Windows.Forms.CheckBox
     $chkFavoritesOnly.Text = "<> Favorites"
     $chkFavoritesOnly.Width = 110
-    $chkFavoritesOnly.Top = 15
+    $chkFavoritesOnly.Top = $headerTop
     $chkFavoritesOnly.Left = 580
+    $chkFavoritesOnly.Anchor = 'Top,Right'
     $form.Controls.Add($chkFavoritesOnly)
     
     $form.Controls.Add($txtSearch)
@@ -7029,8 +7863,10 @@ public class ListViewItemComparer : IComparer {
     $lblHint.Font     = New-Object System.Drawing.Font("Segoe UI",8,[System.Drawing.FontStyle]::Italic)
     $lblHint.ForeColor = [System.Drawing.Color]::Gray
     $lblHint.AutoSize = $true
-    $lblHint.Top      = 45
+    $lblHint.AutoEllipsis = $true
+    $lblHint.Top      = $hintTop
     $lblHint.Left     = 15
+    $lblHint.Anchor   = 'Top,Left,Right'
     $form.Controls.Add($lblHint)
 
     # ListView for shares
@@ -7043,10 +7879,10 @@ public class ListViewItemComparer : IComparer {
     $listView.AllowColumnReorder = ($cfgTheme -eq 'Modern')
     # Owner-draw header for Modern theme (items remain default for gridlines)
     if ($cfgTheme -eq 'Modern') { $listView.OwnerDraw = $true } else { $listView.OwnerDraw = $false }
-    $listView.Top = 70
+    $listView.Top = $listTop
     $listView.Left = 15
     $listView.Width = 660
-    $listView.Height = 350
+    $listView.Height = $listHeight
     $listView.Anchor = 'Top,Left,Right,Bottom'
     # Define columns with alignment for a more defined, button-like header
     $colStatus = New-Object System.Windows.Forms.ColumnHeader
@@ -7111,7 +7947,10 @@ public class ListViewItemComparer : IComparer {
     # Initial sizing and reactive updates on resize
     Set-ListViewColumns
     $listView.Add_SizeChanged({ Set-ListViewColumns })
-    $form.Add_Resize({ Set-ListViewColumns })
+    $form.Add_Resize({
+        Set-ListViewColumns
+        Update-MainLayout
+    })
 
     # Sorting state and handler
     $script:SortColumn = -1
@@ -7177,10 +8016,21 @@ public class ListViewItemComparer : IComparer {
         if ($listView.SelectedItems.Count -eq 0) { return }
         $shareId = $listView.SelectedItems[0].Tag
         $share = Get-ShareConfiguration -ShareId $shareId
-        if (-not $share) { return }
+        if (-not $share) {
+            Show-GuiStatusMessage -Message "Unable to resolve selected share." -DurationMs 3000
+            return
+        }
+
+        $shareName = if ($share.Name) { $share.Name } else { "(unnamed share)" }
+        $isShareEnabled = if ($share.PSObject.Properties['Enabled']) { [bool]$share.Enabled } else { $true }
+
+        if (-not $isShareEnabled) {
+            Show-GuiStatusMessage -Message "Share is disabled: $shareName" -DurationMs 3200
+            return
+        }
 
         if (Test-ShareConnection -DriveLetter $share.DriveLetter) {
-            [System.Windows.Forms.MessageBox]::Show("Already connected", "Info")
+            Show-GuiStatusMessage -Message "Already connected: $shareName" -DurationMs 2600
             return
         }
         
@@ -7194,12 +8044,14 @@ public class ListViewItemComparer : IComparer {
                 [System.Windows.Forms.MessageBoxIcon]::Question
             )
             if ($result -eq [System.Windows.Forms.DialogResult]::No) {
+                Show-GuiStatusMessage -Message "Connect cancelled for: $shareName" -DurationMs 2600
                 return
             }
             
             # Show credential form
             $newCred = Show-CredentialForm -Username $share.Username
             if (-not $newCred) {
+                Show-GuiStatusMessage -Message "No credentials entered for: $shareName" -DurationMs 3000
                 return
             }
             $cred = $newCred
@@ -7213,6 +8065,9 @@ public class ListViewItemComparer : IComparer {
                 [System.Windows.Forms.MessageBoxButtons]::OK,
                 [System.Windows.Forms.MessageBoxIcon]::Error
             )
+            Show-GuiStatusMessage -Message "Connection failed: $shareName" -DurationMs 4200
+        } else {
+            Show-GuiStatusMessage -Message "Connected: $shareName" -DurationMs 3000
         }
         Update-ShareList
     })
@@ -7224,13 +8079,26 @@ public class ListViewItemComparer : IComparer {
         if ($listView.SelectedItems.Count -eq 0) { return }
         $shareId = $listView.SelectedItems[0].Tag
         $share = Get-ShareConfiguration -ShareId $shareId
+        if (-not $share) {
+            Show-GuiStatusMessage -Message "Unable to resolve selected share." -DurationMs 3000
+            return
+        }
+
+        $shareName = if ($share.Name) { $share.Name } else { "(unnamed share)" }
+        $isShareEnabled = if ($share.PSObject.Properties['Enabled']) { [bool]$share.Enabled } else { $true }
+
+        if (-not $isShareEnabled) {
+            Show-GuiStatusMessage -Message "Share is disabled: $shareName" -DurationMs 3200
+            return
+        }
         
         if (-not (Test-ShareConnection -DriveLetter $share.DriveLetter)) {
-            [System.Windows.Forms.MessageBox]::Show("Not connected", "Info")
+            Show-GuiStatusMessage -Message "Not connected: $shareName" -DurationMs 2600
             return
         }
         
         Disconnect-NetworkShare -DriveLetter $share.DriveLetter -Silent
+        Show-GuiStatusMessage -Message "Disconnected: $shareName" -DurationMs 2800
         Update-ShareList
     })
     [void]$contextMenu.Items.Add($menuDisconnect)
@@ -7321,29 +8189,28 @@ public class ListViewItemComparer : IComparer {
         $shareId = $listView.SelectedItems[0].Tag
         $share = Get-ShareConfiguration -ShareId $shareId
 
-        if (Test-ShareConnection -DriveLetter $share.DriveLetter) {
-            Disconnect-NetworkShare -DriveLetter $share.DriveLetter -Silent
-        } else {
-            $cred = Get-CredentialForShare -Username $share.Username
-            if ($cred) {
-                $result = Connect-NetworkShare -SharePath $share.SharePath -DriveLetter $share.DriveLetter -Credential $cred -ReturnStatus -Silent
-                if (-not $result.Success) {
-                    [System.Windows.Forms.MessageBox]::Show(
-                        "Connection failed: $($result.ErrorMessage)",
-                        "Connection Error",
-                        [System.Windows.Forms.MessageBoxButtons]::OK,
-                        [System.Windows.Forms.MessageBoxIcon]::Error
-                    )
-                }
-            } else {
-                [System.Windows.Forms.MessageBox]::Show("No credentials found for $($share.Username)", "Error")
-            }
+        if (-not $share) {
+            Show-GuiStatusMessage -Message "Unable to resolve selected share." -DurationMs 3000
+            return
         }
-        Update-ShareList
+
+        $shareName = if ($share.Name) { $share.Name } else { "(unnamed share)" }
+        $isShareEnabled = if ($share.PSObject.Properties['Enabled']) { [bool]$share.Enabled } else { $true }
+        if (-not $isShareEnabled) {
+            Show-GuiStatusMessage -Message "Share is disabled: $shareName" -DurationMs 3200
+            return
+        }
+
+        # Route through existing handlers so double-click behavior stays in sync.
+        if (Test-ShareConnection -DriveLetter $share.DriveLetter) {
+            $menuDisconnect.PerformClick()
+        } else {
+            $menuConnect.PerformClick()
+        }
     })
 
     # Toolbar panel (below ListView)
-    # ListView: Top=70, Height=350, so bottom is at 420
+    # ListView: Top=90, Height=330, so bottom is at 420
     $toolbarY = 430
     
     # Group: Share Actions
@@ -7353,6 +8220,7 @@ public class ListViewItemComparer : IComparer {
     $grpShares.Left = 15
     $grpShares.Width = 435
     $grpShares.Height = 75
+    $grpShares.Anchor = 'Left,Right,Bottom'
     $form.Controls.Add($grpShares)
 
 
@@ -7448,6 +8316,7 @@ public class ListViewItemComparer : IComparer {
         
         Write-ActionLog -Message "Connect All: Complete (success: $success, failed: $failed, skipped: $skipped)" -Category 'Connection'
         Update-ShareList
+        Show-GuiStatusMessage -Message "Connect All: $success connected, $failed failed, $skipped skipped" -DurationMs 5000
         
         if ($success -gt 0 -or $failed -gt 0 -or $skipped -gt 0) {
             $summary = "Connected: $success"
@@ -7515,6 +8384,7 @@ public class ListViewItemComparer : IComparer {
             
             Write-ActionLog -Message "Disconnect All: Complete (disconnected: $disconnected, skipped: $skipped)" -Category 'Connection'
             Update-ShareList
+            Show-GuiStatusMessage -Message "Disconnect All: $disconnected disconnected, $skipped skipped" -DurationMs 5000
             
             if ($disconnected -gt 0 -or $skipped -gt 0) {
                 $summary = "Disconnected: $disconnected"
@@ -7548,6 +8418,7 @@ public class ListViewItemComparer : IComparer {
         Write-ActionLog -Message "Manual refresh requested" -Level DEBUG -Category 'GUI'
         Clear-ConfigCache
         Update-ShareList
+        Show-GuiStatusMessage -Message "Share list refreshed" -DurationMs 2200
     })
     $grpShares.Controls.Add($btnRefresh)
     
@@ -7558,56 +8429,68 @@ public class ListViewItemComparer : IComparer {
     $grpSystem.Left = 460
     $grpSystem.Width = 215
     $grpSystem.Height = 120
+    $grpSystem.Anchor = 'Right,Bottom'
     $form.Controls.Add($grpSystem)
     
     $btnCredentials = New-Object System.Windows.Forms.Button
-    $btnCredentials.Text = "Credentials"
+    $btnCredentials.Text = "Credentials..."
     $btnCredentials.Width = 95
     $btnCredentials.Height = 40
     $btnCredentials.Top = 25
     $btnCredentials.Left = 10
-    
-    # Context menu for credentials actions
-    $credMenu = New-Object System.Windows.Forms.ContextMenuStrip
-    $miManageCreds = New-Object System.Windows.Forms.ToolStripMenuItem
-    $miManageCreds.Text = "Manage Credentials"
-    $miManageCreds.Add_Click({ Show-CredentialsDialog })
-    $credMenu.Items.Add($miManageCreds) | Out-Null
-    
-    $credMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
-    
-    $miExportCreds = New-Object System.Windows.Forms.ToolStripMenuItem
-    $miExportCreds.Text = "Export Credentials (Backup)"
-    $miExportCreds.Add_Click({ Export-Credentials })
-    $credMenu.Items.Add($miExportCreds) | Out-Null
-    
-    $miImportCreds = New-Object System.Windows.Forms.ToolStripMenuItem
-    $miImportCreds.Text = "Import Credentials (Restore)"
-    $miImportCreds.Add_Click({ 
+
+    # Primary action opens the full credential center.
+    $btnCredentials.Add_Click({
+        Show-CredentialsDialog -StartPage Credentials
+    })
+
+    # Right-click quick menu for common credential tasks.
+    $invokeCredentialImport = {
+        param([bool]$MergeMode)
+
         $ofd = New-Object System.Windows.Forms.OpenFileDialog
         $ofd.Title = "Select Credentials Backup File"
         $ofd.Filter = "JSON Files (*.json)|*.json|All Files (*.*)|*.*"
         $ofd.InitialDirectory = $baseFolder
-        if ($ofd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-            $result = [System.Windows.Forms.MessageBox]::Show(
-                "Merge with existing credentials or replace all?`n`nYes = Merge (keep existing + add new)`nNo = Replace (remove existing)",
-                "Import Mode",
-                [System.Windows.Forms.MessageBoxButtons]::YesNoCancel,
-                [System.Windows.Forms.MessageBoxIcon]::Question
+        if ($ofd.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+        if (-not $MergeMode) {
+            $replaceConfirm = [System.Windows.Forms.MessageBox]::Show(
+                "Replace all stored credentials with this file?`n`nThis action cannot be undone.",
+                "Confirm Replace",
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
             )
-            if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
-                Import-Credentials -ImportPath $ofd.FileName -Merge
-            } elseif ($result -eq [System.Windows.Forms.DialogResult]::No) {
-                Import-Credentials -ImportPath $ofd.FileName
-            }
+            if ($replaceConfirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
         }
-    })
-    $credMenu.Items.Add($miImportCreds) | Out-Null
-    
-    $btnCredentials.Add_Click({
-        # On left-click, show the context menu
-        $credMenu.Show($btnCredentials, 0, $btnCredentials.Height)
-    })
+
+        Import-Credentials -ImportPath $ofd.FileName -Merge:$MergeMode
+    }
+
+    $credMenu = New-Object System.Windows.Forms.ContextMenuStrip
+    $miOpenCredCenter = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miOpenCredCenter.Text = "Open Credential Center"
+    $miOpenCredCenter.Add_Click({ Show-CredentialsDialog -StartPage Credentials })
+    $credMenu.Items.Add($miOpenCredCenter) | Out-Null
+
+    $credMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+
+    $miExportCreds = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miExportCreds.Text = "Export Credentials Backup..."
+    $miExportCreds.Add_Click({ Export-Credentials })
+    $credMenu.Items.Add($miExportCreds) | Out-Null
+
+    $miImportMerge = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miImportMerge.Text = "Import and Merge..."
+    $miImportMerge.Add_Click({ & $invokeCredentialImport $true })
+    $credMenu.Items.Add($miImportMerge) | Out-Null
+
+    $miImportReplace = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miImportReplace.Text = "Import and Replace..."
+    $miImportReplace.Add_Click({ & $invokeCredentialImport $false })
+    $credMenu.Items.Add($miImportReplace) | Out-Null
+
+    $btnCredentials.ContextMenuStrip = $credMenu
     $grpSystem.Controls.Add($btnCredentials)
     
     $btnSettings = New-Object System.Windows.Forms.Button
@@ -7618,18 +8501,40 @@ public class ListViewItemComparer : IComparer {
     $btnSettings.Left = 110
     $btnSettings.Add_Click({
         $formSettings = New-Object System.Windows.Forms.Form
-        $formSettings.Text = "Settings"
-        $formSettings.Width = 350
-        $formSettings.Height = 200
+        $formSettings.Text = "System Tools"
+        $formSettings.Width = 380
+        $formSettings.Height = 280
         $formSettings.StartPosition = "CenterParent"
         $formSettings.FormBorderStyle = "FixedDialog"
         $formSettings.MaximizeBox = $false
         
-        $yPos = 20
+        $lblTools = New-Object System.Windows.Forms.Label
+        $lblTools.Text = "Open the section you want to manage:"
+        $lblTools.Top = 15
+        $lblTools.Left = 30
+        $lblTools.Width = 310
+        $lblTools.Height = 18
+        $lblTools.ForeColor = [System.Drawing.Color]::DimGray
+        $formSettings.Controls.Add($lblTools)
+
+        $yPos = 40
+
+        $btnCredentialCenter = New-Object System.Windows.Forms.Button
+        $btnCredentialCenter.Text = "Credential Center"
+        $btnCredentialCenter.Width = 300
+        $btnCredentialCenter.Height = 35
+        $btnCredentialCenter.Top = $yPos
+        $btnCredentialCenter.Left = 30
+        $btnCredentialCenter.Add_Click({
+            Show-CredentialsDialog -StartPage Credentials
+        })
+        $formSettings.Controls.Add($btnCredentialCenter)
+
+        $yPos += 45
         
         $btnPref = New-Object System.Windows.Forms.Button
         $btnPref.Text = "Preferences"
-        $btnPref.Width = 280
+        $btnPref.Width = 300
         $btnPref.Height = 35
         $btnPref.Top = $yPos
         $btnPref.Left = 30
@@ -7642,7 +8547,7 @@ public class ListViewItemComparer : IComparer {
         
         $btnBackup = New-Object System.Windows.Forms.Button
         $btnBackup.Text = "Backup / Restore"
-        $btnBackup.Width = 280
+        $btnBackup.Width = 300
         $btnBackup.Height = 35
         $btnBackup.Top = $yPos
         $btnBackup.Left = 30
@@ -7655,7 +8560,7 @@ public class ListViewItemComparer : IComparer {
         
         $btnLog = New-Object System.Windows.Forms.Button
         $btnLog.Text = "Open Log..."
-        $btnLog.Width = 280
+        $btnLog.Width = 300
         $btnLog.Height = 35
         $btnLog.Top = $yPos
         $btnLog.Left = 30
@@ -7730,7 +8635,7 @@ public class ListViewItemComparer : IComparer {
     $btnExit.Height = 35
     $btnExit.Top = $bottomY
     $btnExit.Left = 345
-    $btnExit.Anchor = 'Bottom,Left,Right'
+    $btnExit.Anchor = 'Bottom,Right'
     $btnExit.Add_Click({
         $form.Close()
     })
@@ -7739,7 +8644,425 @@ public class ListViewItemComparer : IComparer {
     # Status bar
     $statusBar = New-Object System.Windows.Forms.StatusBar
     $statusBar.Text = "Ready"
+    $statusBar.Tag = $statusBar.Text
     $form.Controls.Add($statusBar)
+
+    $statusResetTimer = New-Object System.Windows.Forms.Timer
+    $statusResetTimer.Interval = 3200
+    $statusResetTimer.Add_Tick({
+        $statusResetTimer.Stop()
+        $lastStatusSummaryText = [string]$statusBar.Tag
+        if ([string]::IsNullOrWhiteSpace($lastStatusSummaryText)) {
+            $statusBar.Text = "Ready"
+        } else {
+            $statusBar.Text = $lastStatusSummaryText
+        }
+    })
+
+    function Show-GuiStatusMessage {
+        param(
+            [string]$Message,
+            [int]$DurationMs = 3200
+        )
+
+        if ([string]::IsNullOrWhiteSpace($Message)) { return }
+
+        $statusBar.Text = $Message
+        if ($DurationMs -gt 0) {
+            if ($DurationMs -lt 500) { $DurationMs = 500 }
+            $statusResetTimer.Stop()
+            $statusResetTimer.Interval = $DurationMs
+            $statusResetTimer.Start()
+        }
+    }
+
+    $resetFilters = {
+        if ($cmbCategory.Items.Count -gt 0) {
+            $cmbCategory.SelectedIndex = 0
+        }
+        $chkFavoritesOnly.Checked = $false
+        $txtSearch.Text = "Search shares..."
+        $txtSearch.ForeColor = [System.Drawing.Color]::Gray
+        Update-ShareList
+        Show-GuiStatusMessage -Message "Filters reset" -DurationMs 2200
+    }
+
+    $requireShareSelection = {
+        if ($listView.SelectedItems.Count -gt 0) { return $true }
+
+        [System.Windows.Forms.MessageBox]::Show(
+            "Select at least one share first.",
+            "No Selection",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+
+        return $false
+    }
+
+    function Show-KeyboardShortcutsDialog {
+        $shortcutForm = New-Object System.Windows.Forms.Form
+        $shortcutForm.Text = "Keyboard Shortcuts"
+        $shortcutForm.Width = 640
+        $shortcutForm.Height = 470
+        $shortcutForm.StartPosition = "CenterParent"
+        $shortcutForm.FormBorderStyle = "Sizable"
+        $shortcutForm.MinimumSize = New-Object System.Drawing.Size(640, 470)
+
+        $lblIntro = New-Object System.Windows.Forms.Label
+        $lblIntro.Text = "Available shortcuts in GUI mode (grouped by workflow)"
+        $lblIntro.Left = 12
+        $lblIntro.Top = 12
+        $lblIntro.Width = 600
+        $lblIntro.Height = 18
+        $lblIntro.Anchor = 'Top,Left,Right'
+        $lblIntro.ForeColor = [System.Drawing.Color]::DimGray
+        $shortcutForm.Controls.Add($lblIntro)
+
+        $shortcutList = New-Object System.Windows.Forms.ListView
+        $shortcutList.View = 'Details'
+        $shortcutList.FullRowSelect = $true
+        $shortcutList.GridLines = $true
+        $shortcutList.MultiSelect = $false
+        $shortcutList.HideSelection = $false
+        $shortcutList.Left = 12
+        $shortcutList.Top = 36
+        $shortcutList.Width = 600
+        $shortcutList.Height = 350
+        $shortcutList.Anchor = 'Top,Left,Right,Bottom'
+        $shortcutList.ShowGroups = $true
+        [void]$shortcutList.Columns.Add("Shortcut", 190)
+        [void]$shortcutList.Columns.Add("Action", 390)
+
+        $groupNavigation = New-Object System.Windows.Forms.ListViewGroup
+        $groupNavigation.Header = "Navigation and Filters"
+        $groupNavigation.Name = "navigation"
+        [void]$shortcutList.Groups.Add($groupNavigation)
+
+        $groupSelection = New-Object System.Windows.Forms.ListViewGroup
+        $groupSelection.Header = "Selection and Share Actions"
+        $groupSelection.Name = "selection"
+        [void]$shortcutList.Groups.Add($groupSelection)
+
+        $groupCredentials = New-Object System.Windows.Forms.ListViewGroup
+        $groupCredentials.Header = "Credentials"
+        $groupCredentials.Name = "credentials"
+        [void]$shortcutList.Groups.Add($groupCredentials)
+
+        $addShortcutRow = {
+            param(
+                [string]$Shortcut,
+                [string]$Action,
+                [System.Windows.Forms.ListViewGroup]$Group
+            )
+
+            $item = New-Object System.Windows.Forms.ListViewItem($Shortcut)
+            [void]$item.SubItems.Add($Action)
+            $item.Group = $Group
+            [void]$shortcutList.Items.Add($item)
+        }
+
+        & $addShortcutRow 'Ctrl+N' 'Add new share' $groupNavigation
+        & $addShortcutRow 'Ctrl+F' 'Focus search box' $groupNavigation
+        & $addShortcutRow 'Ctrl+R' 'Refresh list' $groupNavigation
+        & $addShortcutRow 'Ctrl+Shift+F' 'Reset all filters' $groupNavigation
+        & $addShortcutRow 'F5' 'Refresh list' $groupNavigation
+
+        & $addShortcutRow 'Ctrl+A' 'Select all visible shares or active text' $groupSelection
+        & $addShortcutRow 'Ctrl+Shift+A' 'Connect all enabled shares' $groupSelection
+        & $addShortcutRow 'Ctrl+D' 'Disconnect all connected shares' $groupSelection
+        & $addShortcutRow 'Delete' 'Delete selected share(s)' $groupSelection
+
+        & $addShortcutRow 'Ctrl+Shift+K' 'Open Credential Center' $groupCredentials
+
+        if ($shortcutList.Items.Count -gt 0) {
+            $shortcutList.Items[0].Selected = $true
+            $shortcutList.Items[0].Focused = $true
+        }
+        $shortcutForm.Controls.Add($shortcutList)
+
+        $btnCloseShortcuts = New-Object System.Windows.Forms.Button
+        $btnCloseShortcuts.Text = "Close"
+        $btnCloseShortcuts.Left = 512
+        $btnCloseShortcuts.Top = 394
+        $btnCloseShortcuts.Width = 100
+        $btnCloseShortcuts.Height = 30
+        $btnCloseShortcuts.Anchor = 'Right,Bottom'
+        $btnCloseShortcuts.Add_Click({ $shortcutForm.Close() })
+        $shortcutForm.Controls.Add($btnCloseShortcuts)
+
+        $shortcutForm.AcceptButton = $btnCloseShortcuts
+        $shortcutForm.CancelButton = $btnCloseShortcuts
+
+        [void]$shortcutForm.ShowDialog($form)
+    }
+
+    # File menu
+    $menuFile = New-Object System.Windows.Forms.ToolStripMenuItem("&File")
+
+    $miFileSwitchCli = New-Object System.Windows.Forms.ToolStripMenuItem("Switch to &CLI")
+    $miFileSwitchCli.ShortcutKeys = [System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::L
+    $miFileSwitchCli.Add_Click({ $btnCLI.PerformClick() })
+    $menuFile.DropDownItems.Add($miFileSwitchCli) | Out-Null
+
+    $menuFile.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+
+    $miFileExit = New-Object System.Windows.Forms.ToolStripMenuItem("E&xit")
+    $miFileExit.ShortcutKeys = [System.Windows.Forms.Keys]::Alt -bor [System.Windows.Forms.Keys]::F4
+    $miFileExit.Add_Click({ $btnExit.PerformClick() })
+    $menuFile.DropDownItems.Add($miFileExit) | Out-Null
+
+    # Shares menu
+    $menuShares = New-Object System.Windows.Forms.ToolStripMenuItem("&Shares")
+
+    $miShareAdd = New-Object System.Windows.Forms.ToolStripMenuItem("&Add New Share")
+    $miShareAdd.ShortcutKeys = [System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::N
+    $miShareAdd.Add_Click({ $btnAdd.PerformClick() })
+    $menuShares.DropDownItems.Add($miShareAdd) | Out-Null
+
+    $miShareEdit = New-Object System.Windows.Forms.ToolStripMenuItem("&Edit Selected")
+    $miShareEdit.Add_Click({
+        if (-not (& $requireShareSelection)) { return }
+        $menuEdit.PerformClick()
+    })
+    $menuShares.DropDownItems.Add($miShareEdit) | Out-Null
+
+    $miShareDelete = New-Object System.Windows.Forms.ToolStripMenuItem("&Delete Selected")
+    $miShareDelete.Add_Click({
+        if (-not (& $requireShareSelection)) { return }
+        $menuDelete.PerformClick()
+    })
+    $menuShares.DropDownItems.Add($miShareDelete) | Out-Null
+
+    $menuShares.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+
+    $miShareConnect = New-Object System.Windows.Forms.ToolStripMenuItem("&Connect Selected")
+    $miShareConnect.Add_Click({
+        if (-not (& $requireShareSelection)) { return }
+        $menuConnect.PerformClick()
+    })
+    $menuShares.DropDownItems.Add($miShareConnect) | Out-Null
+
+    $miShareDisconnect = New-Object System.Windows.Forms.ToolStripMenuItem("D&isconnect Selected")
+    $miShareDisconnect.Add_Click({
+        if (-not (& $requireShareSelection)) { return }
+        $menuDisconnect.PerformClick()
+    })
+    $menuShares.DropDownItems.Add($miShareDisconnect) | Out-Null
+
+    $menuShares.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+
+    $miShareConnectAll = New-Object System.Windows.Forms.ToolStripMenuItem("Connect &All")
+    $miShareConnectAll.ShortcutKeys = [System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::Shift -bor [System.Windows.Forms.Keys]::A
+    $miShareConnectAll.Add_Click({ $btnConnectAll.PerformClick() })
+    $menuShares.DropDownItems.Add($miShareConnectAll) | Out-Null
+
+    $miShareDisconnectAll = New-Object System.Windows.Forms.ToolStripMenuItem("Disconnect A&ll")
+    $miShareDisconnectAll.ShortcutKeys = [System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::D
+    $miShareDisconnectAll.Add_Click({ $btnDisconnectAll.PerformClick() })
+    $menuShares.DropDownItems.Add($miShareDisconnectAll) | Out-Null
+
+    $menuShares.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+
+    $miShareRefresh = New-Object System.Windows.Forms.ToolStripMenuItem("&Refresh")
+    $miShareRefresh.ShortcutKeys = [System.Windows.Forms.Keys]::F5
+    $miShareRefresh.Add_Click({ $btnRefresh.PerformClick() })
+    $menuShares.DropDownItems.Add($miShareRefresh) | Out-Null
+
+    $menuShares.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+
+    $miShareResetFilters = New-Object System.Windows.Forms.ToolStripMenuItem("Reset &Filters")
+    $miShareResetFilters.ShortcutKeys = [System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::Shift -bor [System.Windows.Forms.Keys]::F
+    $miShareResetFilters.Add_Click({ & $resetFilters })
+    $menuShares.DropDownItems.Add($miShareResetFilters) | Out-Null
+
+    # Credentials menu
+    $menuCreds = New-Object System.Windows.Forms.ToolStripMenuItem("&Credentials")
+
+    $miCredCenter = New-Object System.Windows.Forms.ToolStripMenuItem("Open Credential &Center")
+    $miCredCenter.ShortcutKeys = [System.Windows.Forms.Keys]::Control -bor [System.Windows.Forms.Keys]::Shift -bor [System.Windows.Forms.Keys]::K
+    $miCredCenter.Add_Click({ Show-CredentialsDialog -StartPage Credentials })
+    $menuCreds.DropDownItems.Add($miCredCenter) | Out-Null
+
+    $miCredBackup = New-Object System.Windows.Forms.ToolStripMenuItem("Open Credential &Backups")
+    $miCredBackup.Add_Click({ Show-CredentialsDialog -StartPage Backup })
+    $menuCreds.DropDownItems.Add($miCredBackup) | Out-Null
+
+    $menuCreds.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+
+    $miCredExport = New-Object System.Windows.Forms.ToolStripMenuItem("&Export Credentials Backup...")
+    $miCredExport.Add_Click({ Export-Credentials })
+    $menuCreds.DropDownItems.Add($miCredExport) | Out-Null
+
+    $miCredImportMerge = New-Object System.Windows.Forms.ToolStripMenuItem("Import and &Merge...")
+    $miCredImportMerge.Add_Click({ & $invokeCredentialImport $true })
+    $menuCreds.DropDownItems.Add($miCredImportMerge) | Out-Null
+
+    $miCredImportReplace = New-Object System.Windows.Forms.ToolStripMenuItem("Import and &Replace...")
+    $miCredImportReplace.Add_Click({ & $invokeCredentialImport $false })
+    $menuCreds.DropDownItems.Add($miCredImportReplace) | Out-Null
+
+    # Tools menu
+    $menuTools = New-Object System.Windows.Forms.ToolStripMenuItem("&Tools")
+
+    $miToolsPreferences = New-Object System.Windows.Forms.ToolStripMenuItem("&Preferences")
+    $miToolsPreferences.Add_Click({ Show-PreferencesDialog })
+    $menuTools.DropDownItems.Add($miToolsPreferences) | Out-Null
+
+    $miToolsBackup = New-Object System.Windows.Forms.ToolStripMenuItem("Backup / &Restore")
+    $miToolsBackup.Add_Click({ Show-BackupDialog })
+    $menuTools.DropDownItems.Add($miToolsBackup) | Out-Null
+
+    $menuToolsLogs = New-Object System.Windows.Forms.ToolStripMenuItem("Open &Logs")
+    $miToolsLogText = New-Object System.Windows.Forms.ToolStripMenuItem("Open Text Log")
+    $miToolsLogText.Add_Click({ Invoke-LogFileOpen -Target text })
+    $menuToolsLogs.DropDownItems.Add($miToolsLogText) | Out-Null
+
+    $miToolsLogEvents = New-Object System.Windows.Forms.ToolStripMenuItem("Open Structured Log")
+    $miToolsLogEvents.Add_Click({ Invoke-LogFileOpen -Target events })
+    $menuToolsLogs.DropDownItems.Add($miToolsLogEvents) | Out-Null
+
+    $miToolsLogFolder = New-Object System.Windows.Forms.ToolStripMenuItem("Open Logs Folder")
+    $miToolsLogFolder.Add_Click({ Invoke-LogFileOpen -Target folder })
+    $menuToolsLogs.DropDownItems.Add($miToolsLogFolder) | Out-Null
+    $menuTools.DropDownItems.Add($menuToolsLogs) | Out-Null
+
+    # Help menu
+    $menuHelp = New-Object System.Windows.Forms.ToolStripMenuItem("&Help")
+
+    $miHelpShortcuts = New-Object System.Windows.Forms.ToolStripMenuItem("Keyboard &Shortcuts")
+    $miHelpShortcuts.ShortcutKeys = [System.Windows.Forms.Keys]::F1
+    $miHelpShortcuts.Add_Click({
+        Show-KeyboardShortcutsDialog
+    })
+    $menuHelp.DropDownItems.Add($miHelpShortcuts) | Out-Null
+
+    $miHelpAbout = New-Object System.Windows.Forms.ToolStripMenuItem("&About")
+    $miHelpAbout.Add_Click({ $btnAbout.PerformClick() })
+    $menuHelp.DropDownItems.Add($miHelpAbout) | Out-Null
+
+    $mainMenu.Items.AddRange(@($menuFile, $menuShares, $menuCreds, $menuTools, $menuHelp))
+
+    function Update-SelectedShareActions {
+        $selectedIds = @($listView.SelectedItems | ForEach-Object { $_.Tag })
+        $selectedCount = $selectedIds.Count
+        $singleSelection = ($selectedCount -eq 1)
+
+        $menuEdit.Enabled = $singleSelection
+        $menuToggle.Enabled = $singleSelection
+        $menuFavorite.Enabled = $singleSelection
+        $miShareEdit.Enabled = $singleSelection
+
+        $hasSelection = $selectedCount -gt 0
+        $menuDelete.Enabled = $hasSelection
+        $miShareDelete.Enabled = $hasSelection
+
+        if (-not $hasSelection) {
+            $menuConnect.Enabled = $false
+            $menuDisconnect.Enabled = $false
+            $miShareConnect.Enabled = $false
+            $miShareDisconnect.Enabled = $false
+            return
+        }
+
+        # Connect/Disconnect actions operate on the primary selected item.
+        $primaryShareId = $listView.SelectedItems[0].Tag
+        $primaryShare = Get-ShareConfiguration -ShareId $primaryShareId
+        if (-not $primaryShare) {
+            $menuConnect.Enabled = $false
+            $menuDisconnect.Enabled = $false
+            $miShareConnect.Enabled = $false
+            $miShareDisconnect.Enabled = $false
+            return
+        }
+
+        $isPrimaryEnabled = if ($primaryShare.PSObject.Properties['Enabled']) { [bool]$primaryShare.Enabled } else { $true }
+        if (-not $isPrimaryEnabled) {
+            $menuConnect.Enabled = $false
+            $menuDisconnect.Enabled = $false
+            $miShareConnect.Enabled = $false
+            $miShareDisconnect.Enabled = $false
+            return
+        }
+
+        $isPrimaryConnected = Test-ShareConnection -DriveLetter $primaryShare.DriveLetter
+        $menuConnect.Enabled = -not $isPrimaryConnected
+        $miShareConnect.Enabled = -not $isPrimaryConnected
+        $menuDisconnect.Enabled = $isPrimaryConnected
+        $miShareDisconnect.Enabled = $isPrimaryConnected
+    }
+
+    # Keep toolbar and top filters readable across different window sizes.
+    function Update-MainLayout {
+        try {
+            $clientWidth = $form.ClientSize.Width
+            $rightMargin = 15
+            $controlGap = 8
+
+            # Right-align filter controls in the header row.
+            $chkFavoritesOnly.Left = [Math]::Max(15, $clientWidth - $rightMargin - $chkFavoritesOnly.Width)
+            $txtSearch.Left = [Math]::Max(15, $chkFavoritesOnly.Left - $controlGap - $txtSearch.Width)
+            $cmbCategory.Left = [Math]::Max(15, $txtSearch.Left - $controlGap - $cmbCategory.Width)
+
+            # Keep hint label readable when the form width is reduced.
+            $hintWidth = [Math]::Max(100, $clientWidth - ($lblHint.Left + $rightMargin))
+            $lblHint.MaximumSize = New-Object System.Drawing.Size($hintWidth, 0)
+
+            # Maintain a stable split between share actions and system controls.
+            $groupGap = 10
+            $grpSystem.Left = [Math]::Max(15, $clientWidth - $rightMargin - $grpSystem.Width)
+            $grpShares.Width = [Math]::Max(320, $grpSystem.Left - $groupGap - $grpShares.Left)
+
+            # Layout buttons inside Share Actions group.
+            $innerPadding = 10
+            $buttonGap = 5
+            $buttonCount = 4
+            $availableWidth = $grpShares.ClientSize.Width - ($innerPadding * 2) - ($buttonGap * ($buttonCount - 1))
+            $buttonWidth = [int][Math]::Floor($availableWidth / $buttonCount)
+            if ($buttonWidth -lt 80) { $buttonWidth = 80 }
+
+            $x = $innerPadding
+            foreach ($btn in @($btnAdd, $btnConnectAll, $btnDisconnectAll, $btnRefresh)) {
+                $btn.Left = $x
+                $btn.Width = $buttonWidth
+                $x += ($buttonWidth + $buttonGap)
+            }
+
+            # Let the final button absorb any remainder to avoid visual gaps.
+            $remaining = $grpShares.ClientSize.Width - $innerPadding - ($btnRefresh.Left + $btnRefresh.Width)
+            if ($remaining -gt 0) {
+                $btnRefresh.Width += $remaining
+            }
+
+            # Layout buttons inside System group.
+            $sysPad = 10
+            $sysGap = 5
+            $topButtonWidth = [int][Math]::Floor(($grpSystem.ClientSize.Width - ($sysPad * 2) - $sysGap) / 2)
+            if ($topButtonWidth -lt 80) { $topButtonWidth = 80 }
+
+            $btnCredentials.Left = $sysPad
+            $btnCredentials.Width = $topButtonWidth
+            $btnSettings.Left = $btnCredentials.Left + $btnCredentials.Width + $sysGap
+            $btnSettings.Width = [Math]::Max(80, $grpSystem.ClientSize.Width - $sysPad - $btnSettings.Left)
+            $btnAbout.Left = $sysPad
+            $btnAbout.Width = [Math]::Max(100, $grpSystem.ClientSize.Width - ($sysPad * 2))
+
+            # Keep bottom action buttons balanced.
+            $bottomGap = 10
+            $halfWidth = [int][Math]::Floor(($clientWidth - 30 - $bottomGap) / 2)
+            if ($halfWidth -lt 150) { $halfWidth = 150 }
+
+            $btnCLI.Left = 15
+            $btnCLI.Width = $halfWidth
+            $btnExit.Left = $btnCLI.Right + $bottomGap
+            $btnExit.Width = [Math]::Max(150, $clientWidth - 15 - $btnExit.Left)
+        }
+        catch {
+            Write-ActionLog -Message "Update-MainLayout failed: $_" -Level DEBUG -Category 'GUI' -OncePerSeconds 5
+        }
+    }
+
+    Update-MainLayout
 
     # Helper function to update the ListView
     function Update-ShareList {
@@ -7848,6 +9171,8 @@ public class ListViewItemComparer : IComparer {
         if ($listView.ListViewItemSorter) { $listView.Sort() }
         
         # Update status bar
+        $visible = $shares.Count
+        $totalAvailable = if ($allShares) { $allShares.Count } else { 0 }
         $total = $shares.Count
         $connectedCount = 0
         foreach ($share in $shares) {
@@ -7855,7 +9180,23 @@ public class ListViewItemComparer : IComparer {
                 $connectedCount++
             }
         }
-        $statusBar.Text = "Total: $total shares | Connected: $connectedCount | Disconnected: $($total - $connectedCount)"
+
+        $activeFilters = @()
+        if ($cmbCategory.SelectedItem -and $cmbCategory.SelectedItem -ne "All Categories") {
+            $activeFilters += "Category"
+        }
+        if ($chkFavoritesOnly.Checked) {
+            $activeFilters += "Favorites"
+        }
+        if ($searchText -and $searchText -ne "Search shares..." -and $searchText.Trim().Length -gt 0) {
+            $activeFilters += "Search"
+        }
+
+        $statusBar.Text = "Visible: $visible | Total: $totalAvailable | Connected: $connectedCount | Disconnected: $($total - $connectedCount)"
+        if ($activeFilters.Count -gt 0) {
+            $statusBar.Text += " | Filters: " + ($activeFilters -join ', ')
+        }
+        $statusBar.Tag = $statusBar.Text
         
         # Update button states based on share status
         $hasDisconnected = ($total - $connectedCount) -gt 0
@@ -7877,27 +9218,12 @@ public class ListViewItemComparer : IComparer {
             $btnDisconnectAll.ForeColor = [System.Drawing.Color]::Black
         }
         
-        # Update context menu items based on selection
-        if ($listView.SelectedItems.Count -gt 0) {
-            $shareId = $listView.SelectedItems[0].Tag
-            $share = Get-ShareConfiguration -ShareId $shareId
-            $isConnected = Test-ShareConnection -DriveLetter $share.DriveLetter
-            
-            $menuConnect.Enabled = -not $isConnected
-            $menuDisconnect.Enabled = $isConnected
-        }
+        Update-SelectedShareActions
     }
     
     # Selection changed event to update context menu
     $listView.Add_SelectedIndexChanged({
-        if ($listView.SelectedItems.Count -gt 0) {
-            $shareId = $listView.SelectedItems[0].Tag
-            $share = Get-ShareConfiguration -ShareId $shareId
-            $isConnected = Test-ShareConnection -DriveLetter $share.DriveLetter
-            
-            $menuConnect.Enabled = -not $isConnected
-            $menuDisconnect.Enabled = $isConnected
-        }
+        Update-SelectedShareActions
     })
 
     # Search box events
@@ -7927,6 +9253,7 @@ public class ListViewItemComparer : IComparer {
     $form.KeyPreview = $true
     $form.Add_KeyDown({
         param($eventSender, $e)
+        $null = $eventSender
         
         # Ctrl+N: Add New Share
         if ($e.Control -and $e.KeyCode -eq 'N') {
@@ -7944,15 +9271,43 @@ public class ListViewItemComparer : IComparer {
             Update-ShareList
             $e.Handled = $true
         }
+        # Ctrl+Shift+F: Reset all filters
+        elseif ($e.Control -and $e.Shift -and $e.KeyCode -eq 'F') {
+            & $resetFilters
+            $e.Handled = $true
+        }
         # F5: Refresh (alternative)
         elseif ($e.KeyCode -eq 'F5') {
             Clear-ConfigCache
             Update-ShareList
             $e.Handled = $true
         }
-        # Ctrl+A: Connect All
-        elseif ($e.Control -and $e.KeyCode -eq 'A') {
+        # Ctrl+Shift+A: Connect All
+        elseif ($e.Control -and $e.Shift -and $e.KeyCode -eq 'A') {
             $btnConnectAll.PerformClick()
+            $e.Handled = $true
+        }
+        # Ctrl+A: Select all (text or visible shares)
+        elseif ($e.Control -and $e.KeyCode -eq 'A') {
+            if ($form.ActiveControl -is [System.Windows.Forms.TextBoxBase]) {
+                $form.ActiveControl.SelectAll()
+            }
+            elseif ($listView.Items.Count -gt 0) {
+                $listView.Focus()
+                $listView.BeginUpdate()
+                try {
+                    foreach ($item in $listView.Items) {
+                        $item.Selected = $true
+                    }
+                    $listView.Items[0].Focused = $true
+                    $listView.EnsureVisible(0)
+                }
+                finally {
+                    $listView.EndUpdate()
+                }
+                Show-GuiStatusMessage -Message "Selected all visible shares" -DurationMs 2000
+            }
+            $e.SuppressKeyPress = $true
             $e.Handled = $true
         }
         # Ctrl+D: Disconnect All
@@ -7998,6 +9353,10 @@ public class ListViewItemComparer : IComparer {
         try {
             # Dispose of context menu and its items
             if ($contextMenu) { $contextMenu.Dispose() }
+            if ($statusResetTimer) {
+                $statusResetTimer.Stop()
+                $statusResetTimer.Dispose()
+            }
             # ListView will be disposed automatically by form
         }
         catch {
@@ -8019,6 +9378,9 @@ public class ListViewItemComparer : IComparer {
 #endregion
 
 #region Mode Selection (Entry Point)
+
+# Allow test harnesses to load functions without executing startup flow.
+if ($env:SM_SKIP_ENTRYPOINT -eq '1') { return }
 
 # Log script startup
 Write-ActionLog -Message "Share Manager v$version starting" -Level INFO -Category 'Startup' -Data @{ 
@@ -8091,6 +9453,7 @@ if ($hasShares) {
 }
 
 # If no saved config or preference is "Prompt", ask user
+Set-TerminalBlackBackground
 Write-Host ""
 Write-Host "Choose startup mode for Share Manager v${version}:" -ForegroundColor Cyan
 Write-Host "1. CLI Mode"
