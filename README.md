@@ -3,7 +3,7 @@
 ![GUI Screenshot](GUI.png)
 ![CLI Screenshot](CLI.png)
 
-- **Version:** 2.3.0
+- **Version:** 2.3.1
 - **Author:** Dantdmnl
 - **License:** See [LICENSE](LICENSE)
 
@@ -23,13 +23,11 @@ Easily manage and map network shares using this PowerShell script with support f
 - **No administrator permissions required**
 - **Persistent mapping** - Automatic reconnection at Windows logon
 
-### Release Highlights (v2.3.0 NEW)
+### Release Highlights (v2.3.1 NEW)
 
-- **Selection-aware share actions** - Connect/Disconnect now stay consistent with selection state and no longer grey out unexpectedly after delayed status updates.
-- **Disabled share safety** - Disabled shares cannot be connected/disconnected from context actions or double-click toggle.
-- **Shortcut workflow polish** - `Ctrl+A` selects all visible shares (or text in active input), while `Ctrl+Shift+A` performs Connect All.
-- **Organized shortcut reference** - Keyboard shortcuts now open in a grouped, readable dialog from Help > Keyboard Shortcuts.
-- **CLI visual consistency** - Terminal startup now enforces a black background with readable foreground colors for terminal-style execution.
+- **Mapping reliability restored** - Connections always use the provided credentials again, avoiding cmdkey conflicts that blocked mapping on some systems.
+- **Timeout guards** - Configurable UNC probe timeout and `net use` timeout prevent false offline detection and hanging.
+- **Better diagnostics** - Raw `net use` output is captured in logs on failure for faster troubleshooting.
 
 ### Organization and Search
 
@@ -123,12 +121,12 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 
 - **DPAPI Encryption**: Credentials are encrypted using Windows Data Protection API (DPAPI), which ties encryption to your user account and machine. Only you can decrypt them.
 - **Automatic Migration**: Legacy AES-encrypted credentials (if upgrading from an older version) are automatically migrated to DPAPI on first use. Config files from older versions are automatically upgraded in-memory to add new properties (for example, `Enabled` and `SyncShareNameToDriveLabel`) on every load.
-- **GDPR Compliant (v2.3.0+)**:
+- **GDPR Compliant (v2.3.1+)**:
   - **INFO logs** (default): no personal data logged - operational events only (startup, operations, results).
   - **DEBUG logs** (opt-in): includes usernames, paths, and computer names for troubleshooting when enabled via `$MANUAL_LOG_LEVEL = 'DEBUG'` in script.
   - Personal data protection by design - log level filtering is enforced in code.
   - See [GDPR-COMPLIANCE.md](GDPR-COMPLIANCE.md) for full details on data handling and rights.
-- **Password Security (v2.3.0+)**: Special characters in passwords are handled via `cmdkey`.
+- **Password Security (v2.3.1+)**: Special characters in passwords are handled via `cmdkey`.
 - **Local Storage Only**: All data (config, credentials, logs) is stored locally under `%APPDATA%\Share_Manager`.
 - **Log Rotation**: Automatic cleanup after 30 days or 5MB to prevent indefinite data retention.
 

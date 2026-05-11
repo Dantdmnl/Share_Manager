@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [2.3.1] - 2026-05-11
+
+### Added
+- **Configurable timeout preferences**
+  - UNC probe timeout for offline detection fallback.
+  - `net use` timeout to prevent hanging on slow or flaky networks.
+
+### Changed
+- **Offline detection fallback**
+  - Uses a short UNC probe when ICMP is blocked to avoid false offline results.
+- **Mapping diagnostics**
+  - Raw `net use` output is captured in logs when mapping fails.
+
+### Fixed
+- **Mapping reliability regression**
+  - Mapping now always uses the provided credentials (restores v2.2.0 behavior).
+  - Removes cmdkey conflict aborts that blocked non-persistent mappings on some systems.
+
+### Documentation
+- Updated release documentation for version `2.3.1`.
+
 ## [2.3.0] - 2026-04-18
 
 ### Added

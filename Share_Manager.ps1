@@ -25,7 +25,7 @@
     - Credentials stored per-user, per-machine (non-portable)
     - Special characters in passwords properly handled via cmdkey
     
-    Production Enhancements (v2.3.0+):
+    Production Enhancements (v2.3.1+):
     - Atomic file operations prevent configuration corruption
     - Automatic backup before destructive operations
     - Enhanced UNC path validation with auto-correction
@@ -40,7 +40,7 @@
     Optional. Pass "CLI" or "GUI" to force that mode on launch, bypassing saved preference.
 
 .VERSION
-    2.3.0
+    2.3.1
 
 .NOTES
     - No administrator permissions required
@@ -57,7 +57,7 @@ param(
 
 #region Global Variables (Version, Paths, Defaults)
 
-$version        = '2.3.0'
+$version        = '2.3.1'
 $author         = 'Dantdmnl'
 
 # Configuration constants
@@ -120,6 +120,8 @@ $defaultConfigTemplate = [PSCustomObject]@{
         UnmapOldMapping = $true
         PreferredMode   = "Prompt"
         SyncShareNameToDriveLabel = $true
+        UncProbeTimeoutSeconds = 3
+        NetUseTimeoutSeconds = 15
     }
 }
 
@@ -134,6 +136,8 @@ $defaultSharesConfig = [PSCustomObject]@{
         ReconnectInterval = 300  # seconds
         Theme             = "Classic" # UI Theme: Classic or Modern
         SyncShareNameToDriveLabel = $true
+        UncProbeTimeoutSeconds = 3
+        NetUseTimeoutSeconds = 15
     }
 }
 
@@ -454,6 +458,12 @@ function Import-AllShares {
                 }
                 if (-not $config.Preferences.PSObject.Properties['SyncShareNameToDriveLabel']) {
                     $config.Preferences | Add-Member -MemberType NoteProperty -Name SyncShareNameToDriveLabel -Value $true
+                }
+                if (-not $config.Preferences.PSObject.Properties['UncProbeTimeoutSeconds']) {
+                    $config.Preferences | Add-Member -MemberType NoteProperty -Name UncProbeTimeoutSeconds -Value 3
+                }
+                if (-not $config.Preferences.PSObject.Properties['NetUseTimeoutSeconds']) {
+                    $config.Preferences | Add-Member -MemberType NoteProperty -Name NetUseTimeoutSeconds -Value 15
                 }
             }
             
@@ -2076,11 +2086,42 @@ function Test-ShareOnline {
         return $false
     }
     try {
-        return Test-Connection -ComputerName $shareHost -Count 1 -Quiet -ErrorAction SilentlyContinue
+        $reachable = Test-Connection -ComputerName $shareHost -Count 1 -Quiet -ErrorAction SilentlyContinue
+        if ($reachable) { return $true }
+    }
+    catch {
+        $reachable = $false
+    }
+
+    # Fallback for environments where ICMP is blocked: quick UNC probe with timeout.
+    $uncTimeout = Get-PreferenceValue -Name "UncProbeTimeoutSeconds" -Default 3 -AsInteger
+    if ($uncTimeout -lt 1) { $uncTimeout = 1 }
+    if ($uncTimeout -gt 30) { $uncTimeout = 30 }
+
+    $job = $null
+    try {
+        $job = Start-Job -ScriptBlock {
+            param($path)
+            Test-Path $path
+        } -ArgumentList $SharePath
+
+        $completed = Wait-Job -Job $job -Timeout $uncTimeout
+        if ($completed) {
+            $result = Receive-Job -Job $job -ErrorAction SilentlyContinue
+            return [bool]$result
+        }
     }
     catch {
         return $false
     }
+    finally {
+        if ($job) {
+            try { Stop-Job -Job $job -Force | Out-Null } catch { }
+            try { Remove-Job -Job $job -Force | Out-Null } catch { }
+        }
+    }
+
+    return $false
 }
 
 function Connect-NetworkShare {
@@ -2148,125 +2189,59 @@ function Connect-NetworkShare {
 
     $target = $null
     $plainPassword = $null
-    $temporaryCmdkeyAdded = $false
     try {
         $user = $Credential.UserName
+        $bstrPtr = [IntPtr]::Zero
 
-        # Extract only the server name from UNC (e.g., \\server)
-        if ($SharePath -match '^\\\\([^\\]+)') {
-            $target = "\\$($Matches[1])"
-        } else {
-            $target = $SharePath
+        try {
+            # Securely extract password for mapping command.
+            $bstrPtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
+            $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstrPtr)
+        }
+        finally {
+            # CRITICAL: Always zero and free the BSTR to prevent password leaks.
+            if ($bstrPtr -ne [IntPtr]::Zero) {
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstrPtr)
+            }
         }
 
-        # Inspect existing Credential Manager entry for this target.
-        $existingCreds = cmdkey /list:$target 2>&1 | Out-String
-        $hasStoredCredential = ($existingCreds -match "Target: $([regex]::Escape($target))")
-        $hasSameUserCredential = $false
-        if ($hasStoredCredential) {
-            $hasSameUserCredential = ($existingCreds -match "User: $([regex]::Escape($user))")
-        }
-
-        $needsCmdkeyUpdate = $false
-
-        # Decide credential strategy:
-        # - Use cmdkey + net use without password argument
-        # - For non-persistent mappings, avoid overwriting an existing different-user entry
         if ($persistent) {
-            if ($hasSameUserCredential) {
-                Write-ActionLog -Message "Cmdkey credentials already exist for $target with same username (reusing)" -Level DEBUG -Category 'Credentials'
+            # Extract only the server name from UNC (e.g., \\server)
+            if ($SharePath -match '^\\\\([^\\]+)') {
+                $target = "\\$($Matches[1])"
             } else {
-                $needsCmdkeyUpdate = $true
-                if ($hasStoredCredential) {
-                    Write-ActionLog -Message "Updating cmdkey credentials for $target (username changed)" -Level DEBUG -Category 'Credentials'
+                $target = $SharePath
+            }
+
+            # Check if credentials already exist for this target with same username
+            $existingCreds = cmdkey /list:$target 2>&1 | Out-String
+            $needsUpdate = $true
+
+            if ($existingCreds -match "Target: $([regex]::Escape($target))") {
+                if ($existingCreds -match "User: $([regex]::Escape($user))") {
+                    $needsUpdate = $false
+                    Write-ActionLog -Message "Cmdkey credentials already exist for $target with same username (skipping update)" -Level DEBUG -Category 'Credentials'
                 } else {
-                    Write-ActionLog -Message "Adding new cmdkey credentials for $target" -Level DEBUG -Category 'Credentials'
+                    Write-ActionLog -Message "Updating cmdkey credentials for $target (username changed)" -Level DEBUG -Category 'Credentials'
                 }
+            } else {
+                Write-ActionLog -Message "Adding new cmdkey credentials for $target" -Level DEBUG -Category 'Credentials'
             }
-        }
-        else {
-            if (-not $hasStoredCredential) {
-                # Non-persistent mode with no prior cmdkey entry: add a temporary one.
-                $needsCmdkeyUpdate = $true
-                $temporaryCmdkeyAdded = $true
-                Write-ActionLog -Message "Adding temporary cmdkey credentials for non-persistent mapping" -Level DEBUG -Category 'Credentials'
-            }
-            elseif ($hasSameUserCredential) {
-                Write-ActionLog -Message "Reusing existing cmdkey credentials for non-persistent mapping" -Level DEBUG -Category 'Credentials'
-            }
-            else {
-                $conflictMsg = "Credential Manager already has an entry for $target with a different username. To continue, remove the existing credential for this server or enable persistent mapping for this connection."
-                if ($UseGUI -and -not $Silent) {
-                    [System.Windows.Forms.MessageBox]::Show(
-                        $conflictMsg,
-                        "Share Manager v$version",
-                        [System.Windows.Forms.MessageBoxButtons]::OK,
-                        [System.Windows.Forms.MessageBoxIcon]::Warning
-                    )
-                }
-                elseif (-not $UseGUI -and -not $Silent) {
-                    Write-Host $conflictMsg -ForegroundColor Yellow
-                }
 
-                Write-ActionLog -Message "Credential conflict for ${target}: existing different username and non-persistent mode" -Level WARN -Category 'Credentials'
-                if ($ReturnStatus) {
-                    return @{ Success = $false; ErrorType = "CredentialConflict"; ErrorMessage = $conflictMsg }
-                }
-                return
-            }
-        }
-
-        if ($needsCmdkeyUpdate) {
-            $bstrPtr = [IntPtr]::Zero
-            try {
-                # Securely extract password only when required.
-                $bstrPtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
-                $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstrPtr)
-            }
-            finally {
-                # CRITICAL: Always zero and free the BSTR to prevent password leaks.
-                if ($bstrPtr -ne [IntPtr]::Zero) {
-                    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstrPtr)
-                }
-            }
-        }
-
-        if ($needsCmdkeyUpdate) {
-            # Remove existing target only for persistent updates. For temporary non-persistent
-            # use, we only add when no entry exists to avoid clobbering existing credentials.
-            if ($persistent -and $hasStoredCredential) {
+            if ($needsUpdate) {
                 cmdkey /delete:$target 2>&1 | Out-Null
+                $cmdkeyArgs = @('/add:' + $target, '/user:' + $user, '/pass:' + $plainPassword)
+                $cmdkeyOutput = & cmdkey $cmdkeyArgs 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    Write-ActionLog -Message "Cmdkey failed to store credentials for $target (exit code: $LASTEXITCODE)" -Level WARN -Category 'Credentials' -Data @{ output = ($cmdkeyOutput | Out-String) }
+                }
             }
-
-            $cmdkeyArgs = @('/add:' + $target, '/user:' + $user, '/pass:' + $plainPassword)
-            $cmdkeyOutput = & cmdkey $cmdkeyArgs 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                $cmdkeyMsg = "Failed to store credentials for $target. Mapping cancelled to avoid insecure password fallback."
-                Write-ActionLog -Message "Cmdkey failed to store credentials for $target (exit code: $LASTEXITCODE)" -Level ERROR -Category 'Credentials' -Data @{ output = ($cmdkeyOutput | Out-String) }
-                $temporaryCmdkeyAdded = $false
-
-                if ($UseGUI -and -not $Silent) {
-                    [System.Windows.Forms.MessageBox]::Show(
-                        $cmdkeyMsg,
-                        "Share Manager v$version",
-                        [System.Windows.Forms.MessageBoxButtons]::OK,
-                        [System.Windows.Forms.MessageBoxIcon]::Error
-                    )
-                }
-                elseif (-not $UseGUI -and -not $Silent) {
-                    Write-Host $cmdkeyMsg -ForegroundColor Red
-                }
-
-                if ($ReturnStatus) {
-                    return @{ Success = $false; ErrorType = "CredentialStoreFailed"; ErrorMessage = $cmdkeyMsg }
-                }
-                return
-            }
-
-            # Password no longer needed in-memory for mapping command.
-            $plainPassword = $null
         }
         
+        $netUseTimeout = Get-PreferenceValue -Name "NetUseTimeoutSeconds" -Default 15 -AsInteger
+        if ($netUseTimeout -lt 5) { $netUseTimeout = 5 }
+        if ($netUseTimeout -gt 120) { $netUseTimeout = 120 }
+
         # Enhanced retry logic with exponential backoff
         $maxAttempts = $script:MAX_CONNECTION_RETRIES
         $mapped = $false
@@ -2279,9 +2254,45 @@ function Connect-NetworkShare {
                 Start-Sleep -Seconds $backoff
             }
             
-            $netResult = net use "$DriveLetter`:" $SharePath /USER:$user $persistentFlag 2>&1
-            
-            if ($LASTEXITCODE -eq 0) {
+            $netResult = $null
+            $netExitCode = 1
+            $job = $null
+
+            try {
+                $job = Start-Job -ScriptBlock {
+                    param($drive, $share, $username, $password, $flag)
+                    $output = net use "$drive`:" $share /USER:$username $password $flag 2>&1
+                    $exitCode = $LASTEXITCODE
+                    [PSCustomObject]@{
+                        Output = ($output | Out-String)
+                        ExitCode = $exitCode
+                    }
+                } -ArgumentList $DriveLetter, $SharePath, $user, $plainPassword, $persistentFlag
+
+                $completed = Wait-Job -Job $job -Timeout $netUseTimeout
+                if ($completed) {
+                    $jobResult = Receive-Job -Job $job -ErrorAction SilentlyContinue
+                    if ($jobResult) {
+                        $netResult = $jobResult.Output
+                        $netExitCode = [int]$jobResult.ExitCode
+                    }
+                } else {
+                    $netResult = "net use timed out after ${netUseTimeout}s"
+                    $netExitCode = 1460
+                }
+            }
+            catch {
+                $netResult = "net use failed: $_"
+                $netExitCode = 1
+            }
+            finally {
+                if ($job) {
+                    try { Stop-Job -Job $job -Force | Out-Null } catch { }
+                    try { Remove-Job -Job $job -Force | Out-Null } catch { }
+                }
+            }
+
+            if ($netExitCode -eq 0) {
                 $mapped = $true
                 break
             } else {
@@ -2299,7 +2310,7 @@ function Connect-NetworkShare {
                 Write-ActionLog -Message "Mapping attempt $attempt failed: $errorType" -Level WARN -Category 'Mapping' -Data @{ 
                     attempt = $attempt
                     errorType = $errorType
-                    exitCode = $LASTEXITCODE
+                    exitCode = $netExitCode
                 }
             }
         }
@@ -2417,6 +2428,7 @@ function Connect-NetworkShare {
                 share = $SharePath
                 attempts = $maxAttempts
                 lastError = $lastError
+                netUseOutput = $lastError
             }
             
             # Record failure in share metadata
@@ -2462,10 +2474,6 @@ function Connect-NetworkShare {
         }
     }
     finally {
-        # Remove temporary cmdkey entry used for non-persistent mapping.
-        if ($temporaryCmdkeyAdded -and $target) {
-            cmdkey /delete:$target 2>&1 | Out-Null
-        }
         $plainPassword = $null
     }
 }
@@ -5304,11 +5312,19 @@ function Set-CliPreferences {
             PreferredMode = "Prompt"
             PersistentMapping = $false
             SyncShareNameToDriveLabel = $true
+            UncProbeTimeoutSeconds = 3
+            NetUseTimeoutSeconds = 15
         }
     }
     # Backfill SyncShareNameToDriveLabel if missing (for configs created before 2.1.1)
     if (-not $config.Preferences.PSObject.Properties['SyncShareNameToDriveLabel']) {
         $config.Preferences | Add-Member -MemberType NoteProperty -Name SyncShareNameToDriveLabel -Value $true -Force
+    }
+    if (-not $config.Preferences.PSObject.Properties['UncProbeTimeoutSeconds']) {
+        $config.Preferences | Add-Member -MemberType NoteProperty -Name UncProbeTimeoutSeconds -Value 3 -Force
+    }
+    if (-not $config.Preferences.PSObject.Properties['NetUseTimeoutSeconds']) {
+        $config.Preferences | Add-Member -MemberType NoteProperty -Name NetUseTimeoutSeconds -Value 15 -Force
     }
     
     $prefs = $config.Preferences
@@ -5322,9 +5338,13 @@ function Set-CliPreferences {
         Write-Host "3. Persistent mapping        : $($prefs.PersistentMapping)"
         $syncLabelValue = if ($prefs.PSObject.Properties['SyncShareNameToDriveLabel']) { $prefs.SyncShareNameToDriveLabel } else { $true }
         Write-Host "4. Sync share name to label  : $syncLabelValue"
-        Write-Host "5. Back"
+        $uncTimeoutValue = if ($prefs.PSObject.Properties['UncProbeTimeoutSeconds']) { $prefs.UncProbeTimeoutSeconds } else { 3 }
+        $netUseTimeoutValue = if ($prefs.PSObject.Properties['NetUseTimeoutSeconds']) { $prefs.NetUseTimeoutSeconds } else { 15 }
+        Write-Host "5. UNC probe timeout (sec)   : $uncTimeoutValue"
+        Write-Host "6. Net use timeout (sec)     : $netUseTimeoutValue"
+        Write-Host "7. Back"
         Write-Host ""
-        $choice = Read-Host "Select (1-5)"
+        $choice = Read-Host "Select (1-7)"
         switch ($choice) {
             "1" {
                 do {
@@ -5394,7 +5414,33 @@ function Set-CliPreferences {
                 Write-Host "Updated." -ForegroundColor Green
                 $prefs = $config.Preferences
             }
-            "5" { return }
+            "5" {
+                do {
+                    $value = Read-Host "UNC probe timeout seconds (1-30) [3]"
+                    if ($value -eq "") { $value = 3; break }
+                    $parsed = 0
+                    if ([int]::TryParse($value, [ref]$parsed) -and $parsed -ge 1 -and $parsed -le 30) { $value = $parsed; break }
+                    Write-Host "Enter a number between 1 and 30." -ForegroundColor Yellow
+                } while ($true)
+                $config.Preferences.UncProbeTimeoutSeconds = [int]$value
+                Save-AllShares -Config $config | Out-Null
+                Write-Host "Updated." -ForegroundColor Green
+                $prefs = $config.Preferences
+            }
+            "6" {
+                do {
+                    $value = Read-Host "Net use timeout seconds (5-120) [15]"
+                    if ($value -eq "") { $value = 15; break }
+                    $parsed = 0
+                    if ([int]::TryParse($value, [ref]$parsed) -and $parsed -ge 5 -and $parsed -le 120) { $value = $parsed; break }
+                    Write-Host "Enter a number between 5 and 120." -ForegroundColor Yellow
+                } while ($true)
+                $config.Preferences.NetUseTimeoutSeconds = [int]$value
+                Save-AllShares -Config $config | Out-Null
+                Write-Host "Updated." -ForegroundColor Green
+                $prefs = $config.Preferences
+            }
+            "7" { return }
             default { return }
         }
     }
@@ -5494,7 +5540,7 @@ function Install-LogonScript {
     $ps1Path = Join-Path $baseFolder 'Share_Manager_AutoMap.ps1'
     $cmdPath = Join-Path $startupFolder 'Share_Manager_AutoMap.cmd'
     $logonScript = @'
-# Auto-generated by Share Manager v2.3.0 (multi-share, DPAPI-protected)
+# Auto-generated by Share Manager v2.3.1 (multi-share, DPAPI-protected)
 # Production-ready with enhanced error handling, network checks, and retry logic
 param()
 $baseFolder = Join-Path $env:APPDATA "Share_Manager"
@@ -5544,7 +5590,7 @@ function Write-Log {
         correlationId = $null
         sessionId     = $sessionId
         pid           = $PID
-        ver           = '2.3.0'
+        ver           = '2.3.1'
         data          = $Data
     }
     ($evt | ConvertTo-Json -Compress) | Out-File -FilePath $eventsPath -Encoding UTF8 -Append
@@ -5595,7 +5641,7 @@ $psVersion = "$($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Min
 $psEditionInfo = $PSVersionTable.PSEdition
 
 Write-Log -Message "========================================" -Category 'AutoMap'
-Write-Log -Message "AutoMap start (v2.3.0)" -Category 'AutoMap' -Data @{ psVersion = $psVersion; psEdition = $psEditionInfo }
+Write-Log -Message "AutoMap start (v2.3.1)" -Category 'AutoMap' -Data @{ psVersion = $psVersion; psEdition = $psEditionInfo }
 Write-Log -Message "Environment: PowerShell $psVersion ($psEditionInfo)" -Level DEBUG -Category 'AutoMap'
 
 # Check network availability with retry logic (for slow WiFi connections during logon)
@@ -5814,7 +5860,7 @@ Write-Log -Message "========================================" -Category 'AutoMap
 '@
     $cmdScript = @"
 @echo off
-REM Auto-generated by Share Manager v2.3.0 - Logon Script Launcher
+REM Auto-generated by Share Manager v2.3.1 - Logon Script Launcher
 REM This wrapper launches the PowerShell automap script with proper error handling
 REM Windows 11 25H2+ compatible (no wmic dependency)
 
@@ -5987,12 +6033,14 @@ function Show-PreferencesForm {
         PersistentMapping = if ($CurrentPrefs.PSObject.Properties["PersistentMapping"]) { [bool]$CurrentPrefs.PersistentMapping } else { $false }
         Theme = if ($CurrentPrefs.PSObject.Properties["Theme"]) { [string]$CurrentPrefs.Theme } else { "Classic" }
         SyncShareNameToDriveLabel = if ($CurrentPrefs.PSObject.Properties["SyncShareNameToDriveLabel"]) { [bool]$CurrentPrefs.SyncShareNameToDriveLabel } else { $true }
+        UncProbeTimeoutSeconds = if ($CurrentPrefs.PSObject.Properties["UncProbeTimeoutSeconds"]) { [int]$CurrentPrefs.UncProbeTimeoutSeconds } else { 3 }
+        NetUseTimeoutSeconds = if ($CurrentPrefs.PSObject.Properties["NetUseTimeoutSeconds"]) { [int]$CurrentPrefs.NetUseTimeoutSeconds } else { 15 }
     }
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text            = "Preferences v$version"
     $form.Width           = 420
-    $form.Height          = 470
+    $form.Height          = 520
     $form.StartPosition   = "CenterParent"
     $form.FormBorderStyle = "FixedDialog"
     $form.MaximizeBox     = $false
@@ -6024,10 +6072,50 @@ function Show-PreferencesForm {
     $chkSync.Checked  = $prefs.SyncShareNameToDriveLabel
     $form.Controls.Add($chkSync)
 
+    $grpTimeouts = New-Object System.Windows.Forms.GroupBox
+    $grpTimeouts.Text = "Network timeouts"
+    $grpTimeouts.Top = 110
+    $grpTimeouts.Left = 15
+    $grpTimeouts.Width = 380
+    $grpTimeouts.Height = 80
+    $form.Controls.Add($grpTimeouts)
+
+    $lblUncTimeout = New-Object System.Windows.Forms.Label
+    $lblUncTimeout.Text = "UNC probe timeout (sec)"
+    $lblUncTimeout.AutoSize = $true
+    $lblUncTimeout.Top = 25
+    $lblUncTimeout.Left = 15
+    $grpTimeouts.Controls.Add($lblUncTimeout)
+
+    $nudUncTimeout = New-Object System.Windows.Forms.NumericUpDown
+    $nudUncTimeout.Minimum = 1
+    $nudUncTimeout.Maximum = 30
+    $nudUncTimeout.Value = $prefs.UncProbeTimeoutSeconds
+    $nudUncTimeout.Top = 22
+    $nudUncTimeout.Left = 240
+    $nudUncTimeout.Width = 60
+    $grpTimeouts.Controls.Add($nudUncTimeout)
+
+    $lblNetUseTimeout = New-Object System.Windows.Forms.Label
+    $lblNetUseTimeout.Text = "Net use timeout (sec)"
+    $lblNetUseTimeout.AutoSize = $true
+    $lblNetUseTimeout.Top = 50
+    $lblNetUseTimeout.Left = 15
+    $grpTimeouts.Controls.Add($lblNetUseTimeout)
+
+    $nudNetUseTimeout = New-Object System.Windows.Forms.NumericUpDown
+    $nudNetUseTimeout.Minimum = 5
+    $nudNetUseTimeout.Maximum = 120
+    $nudNetUseTimeout.Value = $prefs.NetUseTimeoutSeconds
+    $nudNetUseTimeout.Top = 47
+    $nudNetUseTimeout.Left = 240
+    $nudNetUseTimeout.Width = 60
+    $grpTimeouts.Controls.Add($nudNetUseTimeout)
+
     # Startup mode group
     $grpStartup = New-Object System.Windows.Forms.GroupBox
     $grpStartup.Text = "Startup mode"
-    $grpStartup.Top = 120
+    $grpStartup.Top = 200
     $grpStartup.Left = 15
     $grpStartup.Width = 380
     $grpStartup.Height = 90
@@ -6064,7 +6152,7 @@ function Show-PreferencesForm {
     if (-not $IsInitial) {
         $grpTheme = New-Object System.Windows.Forms.GroupBox
         $grpTheme.Text = "Theme"
-    $grpTheme.Top = 220
+    $grpTheme.Top = 300
         $grpTheme.Left = 15
         $grpTheme.Width = 380
         $grpTheme.Height = 70
@@ -6092,12 +6180,14 @@ function Show-PreferencesForm {
     $btnSave.Text   = "Save"
     $btnSave.Width  = 100
     $btnSave.Height = 30
-    $btnSave.Top    = 320
+    $btnSave.Top    = 420
     $btnSave.Left   = 70
     $btnSave.Add_Click({
         $prefs.UnmapOldMapping   = $chk.Checked
     $prefs.PersistentMapping = $chkPersist.Checked
     $prefs.SyncShareNameToDriveLabel = $chkSync.Checked
+    $prefs.UncProbeTimeoutSeconds = [int]$nudUncTimeout.Value
+    $prefs.NetUseTimeoutSeconds = [int]$nudNetUseTimeout.Value
         if ($rdoCLI.Checked)    { $prefs.PreferredMode = "CLI" }
         elseif ($rdoGUI.Checked) { $prefs.PreferredMode = "GUI" }
         else                     { $prefs.PreferredMode = "Prompt" }
@@ -6119,7 +6209,7 @@ function Show-PreferencesForm {
         $btnCancel.Text   = "Cancel"
         $btnCancel.Width  = 100
         $btnCancel.Height = 30
-    $btnCancel.Top    = 320
+    $btnCancel.Top    = 420
         $btnCancel.Left   = 200
         $btnCancel.Add_Click({ $form.Close() })
         $form.Controls.Add($btnCancel)
@@ -7641,6 +7731,8 @@ function Show-PreferencesDialog {
             PersistentMapping = $false
             Theme = "Classic"
             SyncShareNameToDriveLabel = $true
+            UncProbeTimeoutSeconds = 3
+            NetUseTimeoutSeconds = 15
         }
     }
     
