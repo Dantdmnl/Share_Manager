@@ -25,7 +25,7 @@
     - Credentials stored per-user, per-machine (non-portable)
     - Special characters in passwords properly handled via cmdkey
     
-    Production Enhancements (v2.3.1+):
+    Production Enhancements (v2.4.0+):
     - Atomic file operations prevent configuration corruption
     - Automatic backup before destructive operations
     - Enhanced UNC path validation with auto-correction
@@ -40,7 +40,7 @@
     Optional. Pass "CLI" or "GUI" to force that mode on launch, bypassing saved preference.
 
 .VERSION
-    2.3.1
+    2.4.0
 
 .NOTES
     - No administrator permissions required
@@ -57,7 +57,7 @@ param(
 
 #region Global Variables (Version, Paths, Defaults)
 
-$version        = '2.3.1'
+$version        = '2.4.0'
 $author         = 'Dantdmnl'
 
 # Configuration constants
@@ -111,33 +111,35 @@ if ([string]::IsNullOrWhiteSpace($rawLevel)) {
 if (-not $script:LogLevelMap.ContainsKey($envLevel)) { $envLevel = 'INFO' }
 $script:MinLogLevel = $script:LogLevelMap[$envLevel]
 
-# Legacy support - old single-share config
-$defaultConfigTemplate = [PSCustomObject]@{
-    SharePath   = $null
-    DriveLetter = $null
-    Username    = $null
-    Preferences = [PSCustomObject]@{
-        UnmapOldMapping = $true
-        PreferredMode   = "Prompt"
-        SyncShareNameToDriveLabel = $true
-        UncProbeTimeoutSeconds = 3
-        NetUseTimeoutSeconds = 15
+function New-DefaultConfigTemplate {
+    return [PSCustomObject]@{
+        SharePath   = $null
+        DriveLetter = $null
+        Username    = $null
+        Preferences = [PSCustomObject]@{
+            UnmapOldMapping = $true
+            PreferredMode   = "Prompt"
+            SyncShareNameToDriveLabel = $true
+            UncProbeTimeoutSeconds = 3
+            NetUseTimeoutSeconds = 15
+        }
     }
 }
 
-# New multi-share configuration template
-$defaultSharesConfig = [PSCustomObject]@{
-    Shares = @()
-    Preferences = [PSCustomObject]@{
-        UnmapOldMapping   = $true
-        PreferredMode     = "Prompt"
-        PersistentMapping = $false
-        AutoReconnect     = $true
-        ReconnectInterval = 300  # seconds
-        Theme             = "Classic" # UI Theme: Classic or Modern
-        SyncShareNameToDriveLabel = $true
-        UncProbeTimeoutSeconds = 3
-        NetUseTimeoutSeconds = 15
+function New-DefaultSharesConfig {
+    return [PSCustomObject]@{
+        Shares = @()
+        Preferences = [PSCustomObject]@{
+            UnmapOldMapping   = $true
+            PreferredMode     = "Prompt"
+            PersistentMapping = $false
+            AutoReconnect     = $true
+            ReconnectInterval = 300
+            Theme             = "Classic"
+            SyncShareNameToDriveLabel = $true
+            UncProbeTimeoutSeconds = 3
+            NetUseTimeoutSeconds = 15
+        }
     }
 }
 
@@ -444,7 +446,7 @@ function Import-AllShares {
             
             # Ensure Preferences exist
             if (-not $config.PSObject.Properties['Preferences']) {
-                $config | Add-Member -MemberType NoteProperty -Name Preferences -Value $defaultSharesConfig.Preferences
+                $config | Add-Member -MemberType NoteProperty -Name Preferences -Value (New-DefaultSharesConfig).Preferences
             } else {
                 # Add missing preference properties
                 if (-not $config.Preferences.PSObject.Properties['AutoReconnect']) {
@@ -477,11 +479,11 @@ function Import-AllShares {
         }
         catch {
             Write-ActionLog -Message "Failed to import shares config: $_" -Level ERROR -Category 'Config' -Data @{ error = ("$_") }
-            return $defaultSharesConfig
+            return (New-DefaultSharesConfig)
         }
     }
     
-    return $defaultSharesConfig
+    return (New-DefaultSharesConfig)
 }
 
 # ================================================================================
@@ -1114,16 +1116,31 @@ function Test-ShareConnection {
         [string]$DriveLetter
     )
     
-    if (Test-Path "${DriveLetter}:") {
+    if (Test-DrivePath -DriveLetter $DriveLetter) {
         try {
             # Verify it's actually our network share
             $drive = Get-PSDrive -Name $DriveLetter -PSProvider FileSystem -ErrorAction Stop
             return ($drive.DisplayRoot -match '^\\\\')
         }
         catch {
-            return $false
+            # Fall through to net use below; mapped drives can be invisible to
+            # the current PowerShell provider context in some sessions.
         }
     }
+
+    try {
+        $netUseOutput = Invoke-NetUseQuery -DriveLetter $DriveLetter
+        if ($netUseOutput -match '(?im)^\s*Unavailable\s+') {
+            return $false
+        }
+        if ($netUseOutput -match '(?im)^\s*Remote name\s+\\\\') {
+            return $true
+        }
+    }
+    catch {
+        Write-ActionLog -Message "Failed to query mapping state for $DriveLetter - $_" -Level DEBUG -Category 'Mapping' -OncePerSeconds 30
+    }
+
     return $false
 }
 
@@ -1393,6 +1410,54 @@ function Get-DetailedShareStatus {
     return $status
 }
 
+function Get-ShareCredentialDiagnostics {
+    <#
+    .SYNOPSIS
+        Finds likely Windows SMB credential conflict risks in configured shares.
+    #>
+    $config = Get-CachedConfig -Force
+    $shares = @()
+    if ($config -and $config.Shares) {
+        $shares = @($config.Shares | Where-Object { $_.Enabled })
+    }
+
+    $serverMap = @{}
+    foreach ($share in $shares) {
+        if (-not $share.SharePath -or $share.SharePath -notmatch '^\\\\([^\\]+)') { continue }
+        $server = "\\$($Matches[1])"
+        $key = $server.ToLowerInvariant()
+        if (-not $serverMap.ContainsKey($key)) {
+            $serverMap[$key] = @{
+                Server = $server
+                Usernames = @{}
+                Shares = @()
+            }
+        }
+        $username = if ($share.Username) { [string]$share.Username } else { "" }
+        if (-not $serverMap[$key].Usernames.ContainsKey($username)) {
+            $serverMap[$key].Usernames[$username] = 0
+        }
+        $serverMap[$key].Usernames[$username]++
+        $serverMap[$key].Shares += $share.Name
+    }
+
+    $diagnostics = @()
+    foreach ($entry in $serverMap.Values) {
+        $usernames = @($entry.Usernames.Keys | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($usernames.Count -gt 1) {
+            $diagnostics += [PSCustomObject]@{
+                Server = $entry.Server
+                Issue = "MultipleConfiguredUsernames"
+                Detail = "Windows may reject multiple credentials for the same SMB server."
+                Usernames = ($usernames -join ', ')
+                Shares = ($entry.Shares -join ', ')
+            }
+        }
+    }
+
+    return @($diagnostics)
+}
+
 #endregion
 
 function Convert-LegacyConfig {
@@ -1469,7 +1534,7 @@ function Import-ShareConfig {
             $json = Get-Content -Path $configPath -Raw
             $cfg  = ConvertFrom-Json $json
             if (-not $cfg.PSObject.Properties['Preferences']) {
-                $cfg | Add-Member -MemberType NoteProperty -Name Preferences -Value $defaultConfigTemplate.Preferences
+                $cfg | Add-Member -MemberType NoteProperty -Name Preferences -Value (New-DefaultConfigTemplate).Preferences
             }
             # Add PersistentMapping if missing
             if (-not $cfg.Preferences.PSObject.Properties['PersistentMapping']) {
@@ -1650,7 +1715,7 @@ function Get-StartupFolder {
 # Utility: Add Ctrl+A support to textbox for select all
 function Add-CtrlASupport {
     param(
-        [System.Windows.Forms.TextBox]$TextBox,
+        [System.Windows.Forms.Control]$TextBox,
         [System.Windows.Forms.Control]$NextControl = $null
     )
     
@@ -2124,6 +2189,118 @@ function Test-ShareOnline {
     return $false
 }
 
+function Test-DrivePath {
+    param([string]$DriveLetter)
+
+    return (Test-Path "$DriveLetter`:")
+}
+
+function Invoke-NetUseDelete {
+    param([string]$DriveLetter)
+
+    $output = cmd /c "net use `"${DriveLetter}:`" /delete /y" 2>&1
+    return [PSCustomObject]@{
+        Output = ($output | Out-String)
+        ExitCode = $LASTEXITCODE
+    }
+}
+
+function Invoke-NetUseQuery {
+    param([string]$DriveLetter)
+
+    return (net use "$DriveLetter`:" 2>&1 | Out-String)
+}
+
+function Invoke-NetUseWithCredential {
+    param(
+        [string]$DriveLetter,
+        [string]$SharePath,
+        [string]$Username,
+        [string]$Password,
+        [string]$PersistentFlag,
+        [int]$TimeoutSeconds
+    )
+
+    $job = $null
+    try {
+        $job = Start-Job -ScriptBlock {
+            param($drive, $share, $username, $password, $flag)
+            $output = net use "$drive`:" $share /USER:$username $password $flag 2>&1
+            $exitCode = $LASTEXITCODE
+            [PSCustomObject]@{
+                Output = ($output | Out-String)
+                ExitCode = $exitCode
+            }
+        } -ArgumentList $DriveLetter, $SharePath, $Username, $Password, $PersistentFlag
+
+        $completed = Wait-Job -Job $job -Timeout $TimeoutSeconds
+        if ($completed) {
+            $jobResult = Receive-Job -Job $job -ErrorAction SilentlyContinue
+            if ($jobResult) {
+                return [PSCustomObject]@{
+                    Output = $jobResult.Output
+                    ExitCode = [int]$jobResult.ExitCode
+                }
+            }
+        }
+
+        return [PSCustomObject]@{
+            Output = "net use timed out after ${TimeoutSeconds}s"
+            ExitCode = 1460
+        }
+    }
+    catch {
+        return [PSCustomObject]@{
+            Output = "net use failed: $_"
+            ExitCode = 1
+        }
+    }
+    finally {
+        if ($job) {
+            try { Stop-Job -Job $job -Force | Out-Null } catch { }
+            try { Remove-Job -Job $job -Force | Out-Null } catch { }
+        }
+    }
+}
+
+function Invoke-CmdKeyList {
+    param([string]$Target)
+
+    return (cmdkey /list:$Target 2>&1 | Out-String)
+}
+
+function Invoke-CmdKeyDelete {
+    param([string]$Target)
+
+    cmdkey /delete:$Target 2>&1 | Out-Null
+    return $LASTEXITCODE
+}
+
+function Invoke-CmdKeyAdd {
+    param(
+        [string]$Target,
+        [string]$Username,
+        [string]$Password
+    )
+
+    $cmdkeyArgs = @('/add:' + $Target, '/user:' + $Username, '/pass:' + $Password)
+    $output = & cmdkey $cmdkeyArgs 2>&1
+    return [PSCustomObject]@{
+        Output = ($output | Out-String)
+        ExitCode = $LASTEXITCODE
+    }
+}
+
+function Get-CredentialTargetsForSharePath {
+    param([string]$SharePath)
+
+    if ($SharePath -match '^\\\\([^\\]+)') {
+        $server = $Matches[1]
+        return @($server, "\\$server") | Sort-Object -Unique
+    }
+    return @($SharePath)
+}
+
 function Connect-NetworkShare {
     param (
         [string]$SharePath,
@@ -2138,11 +2315,11 @@ function Connect-NetworkShare {
     $autoUnmap = Get-PreferenceValue -Name "UnmapOldMapping" -Default $false -AsBoolean
     $persistentFlag = if ($persistent) { "/PERSISTENT:YES" } else { "/PERSISTENT:NO" }
 
-    if (Test-Path "$DriveLetter`:") {
+    if (Test-DrivePath -DriveLetter $DriveLetter) {
         # Auto-unmap if preference is set
         if ($autoUnmap) {
             try {
-                cmd /c "net use `"${DriveLetter}:`" /delete /y" 2>&1 | Out-Null
+                Invoke-NetUseDelete -DriveLetter $DriveLetter | Out-Null
                 if (-not $Silent -and -not $UseGUI) {
                     Write-Host "  Unmapped existing drive $DriveLetter" -ForegroundColor Gray
                 }
@@ -2206,34 +2383,30 @@ function Connect-NetworkShare {
         }
 
         if ($persistent) {
-            # Extract only the server name from UNC (e.g., \\server)
-            if ($SharePath -match '^\\\\([^\\]+)') {
-                $target = "\\$($Matches[1])"
-            } else {
-                $target = $SharePath
-            }
+            $credentialTargets = @(Get-CredentialTargetsForSharePath -SharePath $SharePath)
 
-            # Check if credentials already exist for this target with same username
-            $existingCreds = cmdkey /list:$target 2>&1 | Out-String
-            $needsUpdate = $true
+            foreach ($target in $credentialTargets) {
+                # Check if credentials already exist for this target with same username
+                $existingCreds = Invoke-CmdKeyList -Target $target
+                $needsUpdate = $true
 
-            if ($existingCreds -match "Target: $([regex]::Escape($target))") {
-                if ($existingCreds -match "User: $([regex]::Escape($user))") {
-                    $needsUpdate = $false
-                    Write-ActionLog -Message "Cmdkey credentials already exist for $target with same username (skipping update)" -Level DEBUG -Category 'Credentials'
+                if ($existingCreds -match "Target: $([regex]::Escape($target))") {
+                    if ($existingCreds -match "User: $([regex]::Escape($user))") {
+                        $needsUpdate = $false
+                        Write-ActionLog -Message "Cmdkey credentials already exist for $target with same username (skipping update)" -Level DEBUG -Category 'Credentials'
+                    } else {
+                        Write-ActionLog -Message "Updating cmdkey credentials for $target (username changed)" -Level DEBUG -Category 'Credentials'
+                    }
                 } else {
-                    Write-ActionLog -Message "Updating cmdkey credentials for $target (username changed)" -Level DEBUG -Category 'Credentials'
+                    Write-ActionLog -Message "Adding new cmdkey credentials for $target" -Level DEBUG -Category 'Credentials'
                 }
-            } else {
-                Write-ActionLog -Message "Adding new cmdkey credentials for $target" -Level DEBUG -Category 'Credentials'
-            }
 
-            if ($needsUpdate) {
-                cmdkey /delete:$target 2>&1 | Out-Null
-                $cmdkeyArgs = @('/add:' + $target, '/user:' + $user, '/pass:' + $plainPassword)
-                $cmdkeyOutput = & cmdkey $cmdkeyArgs 2>&1
-                if ($LASTEXITCODE -ne 0) {
-                    Write-ActionLog -Message "Cmdkey failed to store credentials for $target (exit code: $LASTEXITCODE)" -Level WARN -Category 'Credentials' -Data @{ output = ($cmdkeyOutput | Out-String) }
+                if ($needsUpdate) {
+                    Invoke-CmdKeyDelete -Target $target | Out-Null
+                    $cmdkeyResult = Invoke-CmdKeyAdd -Target $target -Username $user -Password $plainPassword
+                    if ($cmdkeyResult.ExitCode -ne 0) {
+                        Write-ActionLog -Message "Cmdkey failed to store credentials for $target (exit code: $($cmdkeyResult.ExitCode))" -Level WARN -Category 'Credentials' -Data @{ output = $cmdkeyResult.Output }
+                    }
                 }
             }
         }
@@ -2256,41 +2429,16 @@ function Connect-NetworkShare {
             
             $netResult = $null
             $netExitCode = 1
-            $job = $null
 
-            try {
-                $job = Start-Job -ScriptBlock {
-                    param($drive, $share, $username, $password, $flag)
-                    $output = net use "$drive`:" $share /USER:$username $password $flag 2>&1
-                    $exitCode = $LASTEXITCODE
-                    [PSCustomObject]@{
-                        Output = ($output | Out-String)
-                        ExitCode = $exitCode
-                    }
-                } -ArgumentList $DriveLetter, $SharePath, $user, $plainPassword, $persistentFlag
-
-                $completed = Wait-Job -Job $job -Timeout $netUseTimeout
-                if ($completed) {
-                    $jobResult = Receive-Job -Job $job -ErrorAction SilentlyContinue
-                    if ($jobResult) {
-                        $netResult = $jobResult.Output
-                        $netExitCode = [int]$jobResult.ExitCode
-                    }
-                } else {
-                    $netResult = "net use timed out after ${netUseTimeout}s"
-                    $netExitCode = 1460
-                }
-            }
-            catch {
-                $netResult = "net use failed: $_"
-                $netExitCode = 1
-            }
-            finally {
-                if ($job) {
-                    try { Stop-Job -Job $job -Force | Out-Null } catch { }
-                    try { Remove-Job -Job $job -Force | Out-Null } catch { }
-                }
-            }
+            $netUseResult = Invoke-NetUseWithCredential `
+                -DriveLetter $DriveLetter `
+                -SharePath $SharePath `
+                -Username $user `
+                -Password $plainPassword `
+                -PersistentFlag $persistentFlag `
+                -TimeoutSeconds $netUseTimeout
+            $netResult = $netUseResult.Output
+            $netExitCode = [int]$netUseResult.ExitCode
 
             if ($netExitCode -eq 0) {
                 $mapped = $true
@@ -2319,7 +2467,7 @@ function Connect-NetworkShare {
             # Verify connection by checking net use output matches expected share path
             $verified = $false
             try {
-                $netUseOutput = net use "$DriveLetter`:" 2>&1 | Out-String
+                $netUseOutput = Invoke-NetUseQuery -DriveLetter $DriveLetter
                 if ($netUseOutput -match "Remote name\s+(.+)") {
                     $remotePath = $Matches[1].Trim()
                     if ($remotePath -eq $SharePath) {
@@ -2481,7 +2629,8 @@ function Connect-NetworkShare {
 function Disconnect-NetworkShare {
     param (
         [string]$DriveLetter,
-        [switch]$Silent
+        [switch]$Silent,
+        [switch]$ReturnStatus
     )
     try {
         # Get preferences using helper function
@@ -2503,51 +2652,36 @@ function Disconnect-NetworkShare {
                 $sharePath = $cfg.SharePath
             }
         }
-        if (Test-Path "$DriveLetter`:") {
-            net use "$DriveLetter`:" /DELETE /Y 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-                # If persistent, remove credentials from Credential Manager
+        $netUseResult = Invoke-NetUseDelete -DriveLetter $DriveLetter
+        $netUseExitCode = if ($netUseResult.PSObject.Properties['ExitCode']) { [int]$netUseResult.ExitCode } else { [int]$netUseResult }
+        $netUseOutput = if ($netUseResult.PSObject.Properties['Output']) { [string]$netUseResult.Output } else { "" }
+
+        if ($netUseExitCode -eq 0) {
+            # If persistent, remove credentials from Credential Manager
                 if ($persistent -and $sharePath) {
-                    # Extract only the server name from the UNC path (e.g., \\server)
-                    $target = $null
-                    if ($sharePath -match '^\\\\[^\\]+') {
-                        $target = $Matches[0]
-                    } else {
-                        $target = $sharePath
-                    }
-                    cmdkey /delete:$target 2>&1 | Out-Null
+                foreach ($target in @(Get-CredentialTargetsForSharePath -SharePath $sharePath)) {
+                    Invoke-CmdKeyDelete -Target $target | Out-Null
                 }
-                # Regenerate or remove logon script based on current preference
-                if ($persistent) { Install-LogonScript -Silent:$Silent } else { Remove-LogonScript -Silent:$Silent }
-                if ($UseGUI -and -not $Silent) {
-                    [System.Windows.Forms.MessageBox]::Show(
-                        "Drive $DriveLetter unmapped.",
-                        "Share Manager v$version",
-                        [System.Windows.Forms.MessageBoxButtons]::OK,
-                        [System.Windows.Forms.MessageBoxIcon]::Information
-                    )
-                }
-                elseif (-not $UseGUI -and -not $Silent) {
-                    Write-Host "Drive $DriveLetter unmapped." -ForegroundColor Green
-                }
-                Write-ActionLog -Message "Unmapped $DriveLetter" -Category 'Mapping'
             }
-            else {
-                if ($UseGUI -and -not $Silent) {
-                    [System.Windows.Forms.MessageBox]::Show(
-                        "Failed to unmap drive.",
-                        "Share Manager v$version",
-                        [System.Windows.Forms.MessageBoxButtons]::OK,
-                        [System.Windows.Forms.MessageBoxIcon]::Error
-                    )
-                }
-                elseif (-not $UseGUI -and -not $Silent) {
-                    Write-Host "Failed to unmap drive." -ForegroundColor Red
-                }
-                Write-ActionLog -Message "Failed unmapping $DriveLetter" -Level ERROR -Category 'Mapping'
+            # Regenerate or remove logon script based on current preference
+            if ($persistent) { Install-LogonScript -Silent:$Silent } else { Remove-LogonScript -Silent:$Silent }
+            if ($UseGUI -and -not $Silent) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Drive $DriveLetter unmapped.",
+                    "Share Manager v$version",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Information
+                )
+            }
+            elseif (-not $UseGUI -and -not $Silent) {
+                Write-Host "Drive $DriveLetter unmapped." -ForegroundColor Green
+            }
+            Write-ActionLog -Message "Unmapped $DriveLetter" -Category 'Mapping'
+            if ($ReturnStatus) {
+                return @{ Success = $true; ErrorType = $null; ErrorMessage = $null }
             }
         }
-        else {
+        elseif (-not (Test-ShareConnection -DriveLetter $DriveLetter)) {
             if ($UseGUI -and -not $Silent) {
                 [System.Windows.Forms.MessageBox]::Show(
                     "Drive $DriveLetter not mapped.",
@@ -2558,6 +2692,26 @@ function Disconnect-NetworkShare {
             }
             elseif (-not $UseGUI -and -not $Silent) {
                 Write-Host "Drive $DriveLetter not mapped." -ForegroundColor Yellow
+            }
+            if ($ReturnStatus) {
+                return @{ Success = $false; ErrorType = "NotMapped"; ErrorMessage = "Drive not mapped" }
+            }
+        }
+        else {
+            if ($UseGUI -and -not $Silent) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Failed to unmap drive.",
+                    "Share Manager v$version",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Error
+                )
+            }
+            elseif (-not $UseGUI -and -not $Silent) {
+                Write-Host "Failed to unmap drive." -ForegroundColor Red
+            }
+            Write-ActionLog -Message "Failed unmapping $DriveLetter" -Level ERROR -Category 'Mapping' -Data @{ exitCode = $netUseExitCode; output = $netUseOutput }
+            if ($ReturnStatus) {
+                return @{ Success = $false; ErrorType = "NetUseFailed"; ErrorMessage = "net use delete failed with exit code $netUseExitCode"; Output = $netUseOutput }
             }
         }
     }
@@ -2574,6 +2728,9 @@ function Disconnect-NetworkShare {
             Write-Host "Error during unmapping: $_" -ForegroundColor Red
         }
         Write-ActionLog -Message "Error during unmapping: $_" -Level ERROR -Category 'Mapping' -Data @{ error = ("$_") }
+        if ($ReturnStatus) {
+            return @{ Success = $false; ErrorType = "Exception"; ErrorMessage = "$_" }
+        }
     }
 }
 
@@ -4658,31 +4815,41 @@ function Disconnect-ShareCli {
     Write-Host "  ======[ DISCONNECT SHARE ]======" -ForegroundColor Cyan
     Write-Host ""
     
-    $shares = Get-ShareConfiguration
-    $connected = @($shares | Where-Object { Test-ShareConnection -DriveLetter $_.DriveLetter })
+    $shares = @(Get-ShareConfiguration | Where-Object { $_.DriveLetter })
     
-    if ($connected.Count -eq 0) {
-        Write-Host "  No shares are currently connected." -ForegroundColor Yellow
+    if ($shares.Count -eq 0) {
+        Write-Host "  No shares with drive letters are configured." -ForegroundColor Yellow
         return
     }
     
-    Write-Host "  Connected Shares:" -ForegroundColor Gray
+    Write-Host "  Configured Shares:" -ForegroundColor Gray
     Write-Host ""
-    for ($i = 0; $i -lt $connected.Count; $i++) {
+    for ($i = 0; $i -lt $shares.Count; $i++) {
+        $isConnected = Test-ShareConnection -DriveLetter $shares[$i].DriveLetter
+        $statusText = if ($isConnected) { "connected" } else { "not detected" }
+        $statusColor = if ($isConnected) { "Green" } else { "DarkGray" }
         Write-Host "  $($i + 1). " -NoNewline -ForegroundColor White
-        Write-Host "$($connected[$i].Name)" -NoNewline
-        Write-Host " [$($connected[$i].DriveLetter):]" -ForegroundColor DarkGray
+        Write-Host "$($shares[$i].Name)" -NoNewline
+        Write-Host " [$($shares[$i].DriveLetter):] " -NoNewline -ForegroundColor DarkGray
+        Write-Host "($statusText)" -ForegroundColor $statusColor
     }
     
     Write-Host ""
     Write-Host "  Enter number to disconnect (or 0 to cancel): " -NoNewline -ForegroundColor White
     $choice = Read-Host
     $num = 0
-    if ([int]::TryParse($choice, [ref]$num) -and $num -gt 0 -and $num -le $connected.Count) {
-        $share = $connected[$num - 1]
+    if ([int]::TryParse($choice, [ref]$num) -and $num -gt 0 -and $num -le $shares.Count) {
+        $share = $shares[$num - 1]
         Write-Host ""
         Write-Host "  Disconnecting '$($share.Name)'..." -ForegroundColor Yellow
-        Disconnect-NetworkShare -DriveLetter $share.DriveLetter
+        $result = Disconnect-NetworkShare -DriveLetter $share.DriveLetter -ReturnStatus
+        if ($result.Success) {
+            Write-Host "  [OK] Disconnected" -ForegroundColor Green
+        } elseif ($result.ErrorType -eq "NotMapped") {
+            Write-Host "  [ ] Not mapped" -ForegroundColor DarkGray
+        } else {
+            Write-Host "  [X] Failed: $($result.ErrorMessage)" -ForegroundColor Red
+        }
     }
 }
 
@@ -4703,19 +4870,26 @@ function Connect-AllSharesCli {
     $success = 0
     $failed = 0
     $skipped = 0
+    $netUseTimeout = Get-PreferenceValue -Name "NetUseTimeoutSeconds" -Default 15 -AsInteger
+    if ($netUseTimeout -lt 5) { $netUseTimeout = 5 }
+    if ($netUseTimeout -gt 120) { $netUseTimeout = 120 }
+    $index = 0
     
     foreach ($share in $shares) {
+        $index++
+        $shareName = if ($share.Name) { $share.Name } else { "Unknown" }
         if (Test-ShareConnection -DriveLetter $share.DriveLetter) {
             Write-Host "  [ ] " -NoNewline -ForegroundColor DarkGray
-            Write-Host "$($share.Name)" -NoNewline -ForegroundColor Gray
+            Write-Host "($index/$($shares.Count)) $shareName" -NoNewline -ForegroundColor Gray
             Write-Host " (already connected)" -ForegroundColor DarkGray
             $skipped++
             continue
         }
         
         Write-Host "  [*] " -NoNewline -ForegroundColor Cyan
-        Write-Host "$($share.Name)" -NoNewline
-        Write-Host "... " -NoNewline -ForegroundColor DarkGray
+        Write-Host "($index/$($shares.Count)) $shareName" -NoNewline
+        Write-Host " -> $($share.DriveLetter): " -NoNewline -ForegroundColor DarkGray
+        Write-Host "(timeout ${netUseTimeout}s)... " -NoNewline -ForegroundColor DarkGray
         
         $cred = Get-CredentialForShare -Username $share.Username
         if (-not $cred) {
@@ -4728,12 +4902,12 @@ function Connect-AllSharesCli {
                 continue
             }
             $cred = New-Object System.Management.Automation.PSCredential($share.Username, $password)
-            Write-Host "  [*] Connecting $($share.Name)... " -NoNewline -ForegroundColor Cyan
+            Write-Host "  [*] Connecting $shareName... " -NoNewline -ForegroundColor Cyan
         }
         
         try {
-            Connect-NetworkShare -SharePath $share.SharePath -DriveLetter $share.DriveLetter -Credential $cred -Silent
-            if (Test-ShareConnection -DriveLetter $share.DriveLetter) {
+            $result = Connect-NetworkShare -SharePath $share.SharePath -DriveLetter $share.DriveLetter -Credential $cred -ReturnStatus -Silent
+            if ($result.Success -or (Test-ShareConnection -DriveLetter $share.DriveLetter)) {
                 Write-Host "[OK]" -ForegroundColor Green
                 $success++
                 
@@ -4755,11 +4929,14 @@ function Connect-AllSharesCli {
                 }
             } else {
                 Write-Host "[X]" -ForegroundColor Red
+                $errorText = if ($result.ErrorMessage) { $result.ErrorMessage } else { "connection did not verify" }
+                Write-Host "      $errorText" -ForegroundColor DarkGray
                 $failed++
             }
         }
         catch {
             Write-Host "[X]" -ForegroundColor Red
+            Write-Host "      $_" -ForegroundColor DarkGray
             $failed++
         }
     }
@@ -4913,24 +5090,16 @@ function Disconnect-AllSharesCli {
     $config = Get-CachedConfig -Force
     $shares = if ($config -and $config.Shares) { $config.Shares } else { @() }
     
-    # Build array of connected shares (properly initialized)
-    $connected = @()
-    if ($shares.Count -gt 0) {
-        foreach ($share in $shares) {
-            if (Test-ShareConnection -DriveLetter $share.DriveLetter) {
-                $connected += $share
-            }
-        }
-    }
+    $targets = @($shares | Where-Object { $_.DriveLetter })
     
-    if ($connected.Count -eq 0) {
-        Write-Host "  No shares are currently connected." -ForegroundColor Yellow
+    if ($targets.Count -eq 0) {
+        Write-Host "  No shares with drive letters are configured." -ForegroundColor Yellow
         return
     }
     
-    Write-Host "  This will disconnect " -NoNewline -ForegroundColor Yellow
-    Write-Host "$($connected.Count)" -NoNewline -ForegroundColor White
-    Write-Host " share(s)." -ForegroundColor Yellow
+    Write-Host "  This will attempt to disconnect " -NoNewline -ForegroundColor Yellow
+    Write-Host "$($targets.Count)" -NoNewline -ForegroundColor White
+    Write-Host " configured share(s)." -ForegroundColor Yellow
     Write-Host ""
     Write-Host "  Are you sure? (Y/N) [N]: " -NoNewline
     $confirm = Read-Host
@@ -4942,13 +5111,27 @@ function Disconnect-AllSharesCli {
     
     Write-Host ""
     $disconnected = 0
-    foreach ($share in $connected) {
+    $notMapped = 0
+    $failed = 0
+    foreach ($share in $targets) {
         Write-Host "  [*] " -NoNewline -ForegroundColor Yellow
         Write-Host "$($share.Name)" -NoNewline
         Write-Host "... " -NoNewline -ForegroundColor DarkGray
-        Disconnect-NetworkShare -DriveLetter $share.DriveLetter -Silent
-        Write-Host "[OK]" -ForegroundColor Green
-        $disconnected++
+        $result = Disconnect-NetworkShare -DriveLetter $share.DriveLetter -Silent -ReturnStatus
+        if ($result.Success) {
+            Write-Host "[OK]" -ForegroundColor Green
+            $disconnected++
+        } elseif ($result.ErrorType -eq "NotMapped") {
+            Write-Host "[ ]" -ForegroundColor DarkGray
+            Write-Host "      Not mapped" -ForegroundColor DarkGray
+            $notMapped++
+        } else {
+            Write-Host "[X]" -ForegroundColor Red
+            if ($result.ErrorMessage) {
+                Write-Host "      $($result.ErrorMessage)" -ForegroundColor DarkGray
+            }
+            $failed++
+        }
     }
     
     Write-Host ""
@@ -4956,10 +5139,20 @@ function Disconnect-AllSharesCli {
     Write-Host "  Disconnected " -NoNewline
     Write-Host "$disconnected" -NoNewline -ForegroundColor Yellow
     Write-Host " share(s)" -ForegroundColor Gray
+    if ($notMapped -gt 0) {
+        Write-Host "  Not mapped " -NoNewline
+        Write-Host "$notMapped" -NoNewline -ForegroundColor DarkGray
+        Write-Host " share(s)" -ForegroundColor Gray
+    }
+    if ($failed -gt 0) {
+        Write-Host "  Failed " -NoNewline
+        Write-Host "$failed" -NoNewline -ForegroundColor Red
+        Write-Host " share(s)" -ForegroundColor Gray
+    }
     Write-Host "  ------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
     
-    Write-ActionLog -Message "Disconnect All completed: $disconnected disconnected" -Level INFO -Category 'Mapping'
+    Write-ActionLog -Message "Disconnect All completed: $disconnected disconnected, $notMapped not mapped, $failed failed" -Level INFO -Category 'Mapping'
     
     Write-Host "  Press any key to continue..." -ForegroundColor DarkGray
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
@@ -5540,7 +5733,7 @@ function Install-LogonScript {
     $ps1Path = Join-Path $baseFolder 'Share_Manager_AutoMap.ps1'
     $cmdPath = Join-Path $startupFolder 'Share_Manager_AutoMap.cmd'
     $logonScript = @'
-# Auto-generated by Share Manager v2.3.1 (multi-share, DPAPI-protected)
+# Auto-generated by Share Manager v2.4.0 (multi-share, DPAPI-protected)
 # Production-ready with enhanced error handling, network checks, and retry logic
 param()
 $baseFolder = Join-Path $env:APPDATA "Share_Manager"
@@ -5590,7 +5783,7 @@ function Write-Log {
         correlationId = $null
         sessionId     = $sessionId
         pid           = $PID
-        ver           = '2.3.1'
+        ver           = '2.4.0'
         data          = $Data
     }
     ($evt | ConvertTo-Json -Compress) | Out-File -FilePath $eventsPath -Encoding UTF8 -Append
@@ -5631,6 +5824,206 @@ function Test-NetworkAvailable {
     }
 }
 
+function Convert-SecureStringToPlainText {
+    param([System.Security.SecureString]$SecureString)
+
+    $bstrPtr = [IntPtr]::Zero
+    try {
+        $bstrPtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
+        return [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstrPtr)
+    }
+    finally {
+        if ($bstrPtr -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstrPtr)
+        }
+    }
+}
+
+function Invoke-AutoMapNetUseDelete {
+    param([string]$Drive)
+
+    $output = net use $Drive /DELETE /Y 2>&1
+    return [PSCustomObject]@{
+        Output = ($output | Out-String)
+        ExitCode = $LASTEXITCODE
+    }
+}
+
+function Invoke-AutoMapNetUseQuery {
+    param([string]$Drive)
+
+    return (net use $Drive 2>&1 | Out-String)
+}
+
+function Get-AutoMapServerTarget {
+    param([string]$SharePath)
+
+    if ($SharePath -match '^\\\\([^\\]+)') {
+        return "\\$($Matches[1])"
+    }
+    return $SharePath
+}
+
+function Get-AutoMapCredentialTargets {
+    param([string]$SharePath)
+
+    if ($SharePath -match '^\\\\([^\\]+)') {
+        $server = $Matches[1]
+        return @($server, "\\$server") | Sort-Object -Unique
+    }
+    return @($SharePath)
+}
+
+function Get-AutoMapServerConnections {
+    param([string]$ServerTarget)
+
+    $allConnections = net use 2>&1 | Out-String
+    $escaped = [regex]::Escape($ServerTarget)
+    $matches = @()
+    foreach ($line in ($allConnections -split "`r?`n")) {
+        if ($line -match $escaped) {
+            $matches += $line.Trim()
+        }
+    }
+    return @($matches)
+}
+
+function Set-AutoMapCredentialTarget {
+    param(
+        [string]$ServerTarget,
+        [string]$Username,
+        [string]$Password
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ServerTarget) -or
+        [string]::IsNullOrWhiteSpace($Username) -or
+        [string]::IsNullOrEmpty($Password)) {
+        return [PSCustomObject]@{
+            Updated = $false
+            ExitCode = 0
+            Output = "Skipped credential target update"
+        }
+    }
+
+    cmdkey /delete:$ServerTarget 2>&1 | Out-Null
+    $output = & cmdkey @('/add:' + $ServerTarget, '/user:' + $Username, '/pass:' + $Password) 2>&1
+    return [PSCustomObject]@{
+        Updated = ($LASTEXITCODE -eq 0)
+        ExitCode = $LASTEXITCODE
+        Output = ($output | Out-String)
+    }
+}
+
+function Get-AutoMapSmbMapping {
+    param([string]$Drive)
+
+    if (-not (Get-Command Get-SmbMapping -ErrorAction SilentlyContinue)) {
+        return $null
+    }
+
+    try {
+        return @(Get-SmbMapping -LocalPath $Drive -ErrorAction SilentlyContinue | Select-Object -First 1)[0]
+    }
+    catch {
+        Write-Log -Message "Get-SmbMapping failed for $Drive - $_" -Level DEBUG -Category 'AutoMap'
+        return $null
+    }
+}
+
+function Repair-AutoMapUnavailableSmbMapping {
+    param(
+        [string]$Drive,
+        [string]$Share,
+        [string]$Username,
+        [string]$Password,
+        [string]$Name
+    )
+
+    if (-not (Get-Command New-SmbMapping -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+
+    $mapping = Get-AutoMapSmbMapping -Drive $Drive
+    if (-not $mapping -or [string]$mapping.Status -ne 'Unavailable') {
+        return $false
+    }
+
+    $remotePath = [string]$mapping.RemotePath
+    if ($remotePath -and $remotePath -ne $Share) {
+        Write-Log -Message "Unavailable mapping on $Drive points to different remote path; skipping SMB repair" -Level WARN -Category 'AutoMap' -Data @{ drive = $Drive; configured = $Share; existing = $remotePath }
+        return $false
+    }
+
+    Write-Log -Message "Detected unavailable SMB mapping for $Drive ($Name); attempting reconnect with New-SmbMapping" -Level INFO -Category 'AutoMap'
+    try {
+        if ($Password) {
+            New-SmbMapping -LocalPath $Drive -RemotePath $Share -UserName $Username -Password $Password -Persistent $true -ErrorAction Stop | Out-Null
+        } else {
+            New-SmbMapping -LocalPath $Drive -RemotePath $Share -Persistent $true -ErrorAction Stop | Out-Null
+        }
+        Write-Log -Message "Reconnected unavailable SMB mapping for $Drive ($Name)" -Level INFO -Category 'AutoMap'
+        return $true
+    }
+    catch {
+        Write-Log -Message "New-SmbMapping repair failed for $Drive ($Name): $_" -Level WARN -Category 'AutoMap'
+        return $false
+    }
+}
+
+function Invoke-AutoMapNetUseMap {
+    param(
+        [string]$Drive,
+        [string]$Share,
+        [string]$Username,
+        [string]$Password,
+        [int]$TimeoutSeconds
+    )
+
+    $job = $null
+    try {
+        $job = Start-Job -ScriptBlock {
+            param($drive, $share, $username, $password)
+            if ($password) {
+                $output = net use $drive $share /USER:$username $password /PERSISTENT:YES 2>&1
+            } else {
+                $output = net use $drive $share /PERSISTENT:YES 2>&1
+            }
+            [PSCustomObject]@{
+                Output = ($output | Out-String)
+                ExitCode = $LASTEXITCODE
+            }
+        } -ArgumentList $Drive, $Share, $Username, $Password
+
+        $completed = Wait-Job -Job $job -Timeout $TimeoutSeconds
+        if ($completed) {
+            $jobResult = Receive-Job -Job $job -ErrorAction SilentlyContinue
+            if ($jobResult) {
+                return [PSCustomObject]@{
+                    Output = $jobResult.Output
+                    ExitCode = [int]$jobResult.ExitCode
+                }
+            }
+        }
+
+        return [PSCustomObject]@{
+            Output = "net use timed out after ${TimeoutSeconds}s"
+            ExitCode = 1460
+        }
+    }
+    catch {
+        return [PSCustomObject]@{
+            Output = "net use failed: $_"
+            ExitCode = 1
+        }
+    }
+    finally {
+        if ($job) {
+            try { Stop-Job -Job $job -Force | Out-Null } catch { }
+            try { Remove-Job -Job $job -Force | Out-Null } catch { }
+        }
+    }
+}
+
 # Rotate and write a start marker
 Invoke-LogFileRotation -Path $logPath -Prefix 'LogonScript'
 Invoke-LogFileRotation -Path $eventsPath -Prefix 'LogonScript.events'
@@ -5641,7 +6034,7 @@ $psVersion = "$($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Min
 $psEditionInfo = $PSVersionTable.PSEdition
 
 Write-Log -Message "========================================" -Category 'AutoMap'
-Write-Log -Message "AutoMap start (v2.3.1)" -Category 'AutoMap' -Data @{ psVersion = $psVersion; psEdition = $psEditionInfo }
+Write-Log -Message "AutoMap start (v2.4.0)" -Category 'AutoMap' -Data @{ psVersion = $psVersion; psEdition = $psEditionInfo }
 Write-Log -Message "Environment: PowerShell $psVersion ($psEditionInfo)" -Level DEBUG -Category 'AutoMap'
 
 # Check network availability with retry logic (for slow WiFi connections during logon)
@@ -5702,6 +6095,39 @@ $totalShares = $cfg.Shares.Count
 $enabledShares = ($cfg.Shares | Where-Object { $_.Enabled }).Count
 Write-Log -Message "Found $totalShares total shares ($enabledShares enabled, $($totalShares - $enabledShares) disabled)" -Level INFO -Category 'AutoMap'
 
+$netUseTimeoutSeconds = 15
+try {
+    if ($cfg.Preferences -and $cfg.Preferences.PSObject.Properties['NetUseTimeoutSeconds']) {
+        $netUseTimeoutSeconds = [int]$cfg.Preferences.NetUseTimeoutSeconds
+    }
+} catch {
+    $netUseTimeoutSeconds = 15
+}
+if ($netUseTimeoutSeconds -lt 5) { $netUseTimeoutSeconds = 5 }
+if ($netUseTimeoutSeconds -gt 120) { $netUseTimeoutSeconds = 120 }
+Write-Log -Message "Using net use timeout: ${netUseTimeoutSeconds}s" -Level INFO -Category 'AutoMap'
+
+$serverUserMap = @{}
+foreach ($s in @($cfg.Shares | Where-Object { $_.Enabled })) {
+    $serverTarget = Get-AutoMapServerTarget -SharePath $s.SharePath
+    if ([string]::IsNullOrWhiteSpace($serverTarget)) { continue }
+    $serverKey = $serverTarget.ToLowerInvariant()
+    $username = if ($s.Username) { [string]$s.Username } else { "" }
+    if (-not $serverUserMap.ContainsKey($serverKey)) {
+        $serverUserMap[$serverKey] = @{}
+    }
+    if (-not $serverUserMap[$serverKey].ContainsKey($username)) {
+        $serverUserMap[$serverKey][$username] = @()
+    }
+    $serverUserMap[$serverKey][$username] += $s.Name
+}
+foreach ($serverKey in $serverUserMap.Keys) {
+    $usernames = @($serverUserMap[$serverKey].Keys | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($usernames.Count -gt 1) {
+        Write-Log -Message "Potential Windows credential conflict: multiple usernames configured for $serverKey" -Level WARN -Category 'AutoMap' -Data @{ server = $serverKey; usernames = ($usernames -join ', ') }
+    }
+}
+
 # Load credential map (username -> SecureString) with DPAPI/legacy AES support
 $credMap = @{}
 if (Test-Path $credsPath) {
@@ -5757,11 +6183,12 @@ foreach ($s in $cfg.Shares) {
     $share = $s.SharePath
     $user  = $s.Username
     $name  = $s.Name
+    $serverTarget = Get-AutoMapServerTarget -SharePath $share
 
     # Check if drive is already in use by something else
     if (Test-Path $drive) {
         try {
-            $existing = net use $drive 2>&1 | Out-String
+            $existing = Invoke-AutoMapNetUseQuery -Drive $drive
             if ($existing -match [regex]::Escape($share)) {
                 Write-Log "Drive $drive already mapped to $share, skipping" -Level INFO -Category 'AutoMap'
                 $skipCount++
@@ -5769,26 +6196,43 @@ foreach ($s in $cfg.Shares) {
             } else {
                 # Drive in use by different share/source
                 Write-Log "Drive $drive in use by different resource, unmapping first" -Level INFO -Category 'AutoMap'
-                cmd /c "net use `"$drive`" /delete /y >nul 2>&1"
+                Invoke-AutoMapNetUseDelete -Drive $drive | Out-Null
             }
         } catch {
             # Can't determine, try to unmap anyway
-            cmd /c "net use `"$drive`" /delete /y >nul 2>&1"
+            Invoke-AutoMapNetUseDelete -Drive $drive | Out-Null
         }
     } else {
         # Clean unmap just in case
-        cmd /c "net use `"$drive`" /delete /y >nul 2>&1"
+        Invoke-AutoMapNetUseDelete -Drive $drive | Out-Null
     }
 
     $plainPW = $null
     if ($user -and $credMap.ContainsKey($user)) {
         try {
-            $plainPW = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                [Runtime.InteropServices.Marshal]::SecureStringToBSTR($credMap[$user])
-            )
+            $plainPW = Convert-SecureStringToPlainText -SecureString $credMap[$user]
         } catch {
             Write-Log "Failed to decrypt password for $user" -Level ERROR -Category 'AutoMap'
         }
+    }
+
+    if ($plainPW) {
+        foreach ($credentialTarget in @(Get-AutoMapCredentialTargets -SharePath $share)) {
+            $cmdKeyResult = Set-AutoMapCredentialTarget -ServerTarget $credentialTarget -Username $user -Password $plainPW
+            if ($cmdKeyResult.Updated) {
+                Write-Log -Message "Prepared Windows credential target for $credentialTarget" -Level DEBUG -Category 'AutoMap'
+            } elseif ($cmdKeyResult.ExitCode -ne 0) {
+                Write-Log -Message "Could not prepare Windows credential target for $credentialTarget (exit code $($cmdKeyResult.ExitCode)); continuing with explicit credentials" -Level WARN -Category 'AutoMap' -Data @{ server = $credentialTarget; output = $cmdKeyResult.Output }
+            }
+        }
+    } else {
+        Write-Log -Message "No stored password available for $name; attempting mapping without explicit password" -Level WARN -Category 'AutoMap'
+    }
+
+    if (Repair-AutoMapUnavailableSmbMapping -Drive $drive -Share $share -Username $user -Password $plainPW -Name $name) {
+        $successCount++
+        $plainPW = $null
+        continue
     }
 
     # Enhanced retry with exponential backoff (2s, 4s, 8s)
@@ -5801,43 +6245,46 @@ foreach ($s in $cfg.Shares) {
             Start-Sleep -Seconds $backoff
         }
         
-        Write-Log -Message "Mapping attempt ${i}: $drive -> $share ($name)" -Level INFO -Category 'AutoMap'
-        if ($plainPW) {
-            $result = cmd /c "net use `"$drive`" `"$share`" /user:$user $plainPW /persistent:yes 2>&1"
-        } else {
-            $result = cmd /c "net use `"$drive`" `"$share`" /persistent:yes 2>&1"
-        }
+        Write-Log -Message "Mapping attempt ${i}: $drive -> $share ($name, timeout ${netUseTimeoutSeconds}s)" -Level INFO -Category 'AutoMap'
+        $mapResult = Invoke-AutoMapNetUseMap -Drive $drive -Share $share -Username $user -Password $plainPW -TimeoutSeconds $netUseTimeoutSeconds
         
-        if ($LASTEXITCODE -eq 0) {
+        if ($mapResult.ExitCode -eq 0) {
             # Verify the mapping actually worked
             $verified = $false
             try {
-                $verified = Test-Path $drive
-                if ($verified) {
+                $verifyOutput = Invoke-AutoMapNetUseQuery -Drive $drive
+                $verified = ($verifyOutput -match [regex]::Escape($share))
+                if ($verified -or (Test-Path $drive)) {
                     Write-Log -Message "Mapped $drive to $share ($name)" -Category 'AutoMap'
-                    $successCount++
                 } else {
                     Write-Log -Message "Mapping succeeded but drive not accessible: $drive" -Level WARN -Category 'AutoMap'
                 }
             } catch {
                 Write-Log -Message "Mapping succeeded but verification failed: $_" -Level WARN -Category 'AutoMap'
             }
+            $successCount++
             $mapped = $true
             break 
         } else {
             # Classify error
             $errorType = "Unknown"
-            $resultStr = $result | Out-String
+            $resultStr = $mapResult.Output | Out-String
             if ($resultStr -match "1326|Logon failure") { $errorType = "Authentication" }
             elseif ($resultStr -match "53|network path") { $errorType = "PathNotFound" }
             elseif ($resultStr -match "67|network name") { $errorType = "InvalidPath" }
             elseif ($resultStr -match "1219|multiple connections") { $errorType = "MultipleConnections" }
             elseif ($resultStr -match "1203|1231|network busy|timeout") { $errorType = "NetworkTimeout" }
             elseif ($resultStr -match "85|local device.*in use") { $errorType = "DriveInUse" }
+
+            if ($errorType -eq "MultipleConnections") {
+                $activeServerConnections = @(Get-AutoMapServerConnections -ServerTarget $serverTarget)
+                Write-Log -Message "Windows reported credential conflict for $serverTarget. Existing SMB sessions may need to be disconnected." -Level WARN -Category 'AutoMap' -Data @{ server = $serverTarget; activeConnections = ($activeServerConnections -join ' | ') }
+            }
             
-            Write-Log -Message "Attempt $i failed for $name`: $errorType" -Level WARN -Category 'AutoMap' -Data @{ attempt = $i; errorType = $errorType; exitCode = $LASTEXITCODE; share = $name }
+            Write-Log -Message "Attempt $i failed for $name`: $errorType" -Level WARN -Category 'AutoMap' -Data @{ attempt = $i; errorType = $errorType; exitCode = $mapResult.ExitCode; share = $name; netUseOutput = $resultStr }
         }
     }
+    $plainPW = $null
     if (-not $mapped) { 
         Write-Log -Message "Failed mapping $drive -> $share ($name) after $maxAttempts attempts" -Level ERROR -Category 'AutoMap' -Data @{ drive = $drive; share = $share; name = $name; attempts = $maxAttempts }
         $failCount++
@@ -5860,7 +6307,7 @@ Write-Log -Message "========================================" -Category 'AutoMap
 '@
     $cmdScript = @"
 @echo off
-REM Auto-generated by Share Manager v2.3.1 - Logon Script Launcher
+REM Auto-generated by Share Manager v2.4.0 - Logon Script Launcher
 REM This wrapper launches the PowerShell automap script with proper error handling
 REM Windows 11 25H2+ compatible (no wmic dependency)
 
@@ -8121,13 +8568,20 @@ public class ListViewItemComparer : IComparer {
             return
         }
 
+        Show-GuiStatusMessage -Message "Checking connection state for: $shareName" -DurationMs 0
+        [System.Windows.Forms.Application]::DoEvents()
+
         if (Test-ShareConnection -DriveLetter $share.DriveLetter) {
             Show-GuiStatusMessage -Message "Already connected: $shareName" -DurationMs 2600
             return
         }
         
+        Show-GuiStatusMessage -Message "Looking up credentials for: $shareName" -DurationMs 0
+        [System.Windows.Forms.Application]::DoEvents()
         $cred = Get-CredentialForShare -Username $share.Username
         if (-not $cred) {
+            Show-GuiStatusMessage -Message "Credentials needed for: $shareName" -DurationMs 0
+            [System.Windows.Forms.Application]::DoEvents()
             # Prompt for credentials
             $result = [System.Windows.Forms.MessageBox]::Show(
                 "No saved credentials found for $($share.Username).`n`nWould you like to enter credentials now?",
@@ -8149,6 +8603,11 @@ public class ListViewItemComparer : IComparer {
             $cred = $newCred
         }
         
+        $netUseTimeout = Get-PreferenceValue -Name "NetUseTimeoutSeconds" -Default 15 -AsInteger
+        if ($netUseTimeout -lt 5) { $netUseTimeout = 5 }
+        if ($netUseTimeout -gt 120) { $netUseTimeout = 120 }
+        Show-GuiStatusMessage -Message "Mapping $shareName to $($share.DriveLetter): (timeout ${netUseTimeout}s)..." -DurationMs 0
+        [System.Windows.Forms.Application]::DoEvents()
         $result = Connect-NetworkShare -SharePath $share.SharePath -DriveLetter $share.DriveLetter -Credential $cred -ReturnStatus -Silent
         if (-not $result.Success) {
             [System.Windows.Forms.MessageBox]::Show(
@@ -8184,13 +8643,23 @@ public class ListViewItemComparer : IComparer {
             return
         }
         
-        if (-not (Test-ShareConnection -DriveLetter $share.DriveLetter)) {
+        Show-GuiStatusMessage -Message "Disconnecting $shareName from $($share.DriveLetter):..." -DurationMs 0
+        [System.Windows.Forms.Application]::DoEvents()
+        $disconnectResult = Disconnect-NetworkShare -DriveLetter $share.DriveLetter -Silent -ReturnStatus
+        if ($disconnectResult.Success) {
+            Show-GuiStatusMessage -Message "Disconnected: $shareName" -DurationMs 2800
+        } elseif ($disconnectResult.ErrorType -eq "NotMapped") {
             Show-GuiStatusMessage -Message "Not connected: $shareName" -DurationMs 2600
-            return
+        } else {
+            $errorText = if ($disconnectResult.ErrorMessage) { $disconnectResult.ErrorMessage } else { "disconnect failed" }
+            Show-GuiStatusMessage -Message "Disconnect failed: $shareName" -DurationMs 4200
+            [System.Windows.Forms.MessageBox]::Show(
+                "Disconnect failed: $errorText",
+                "Disconnect Error",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            )
         }
-        
-        Disconnect-NetworkShare -DriveLetter $share.DriveLetter -Silent
-        Show-GuiStatusMessage -Message "Disconnected: $shareName" -DurationMs 2800
         Update-ShareList
     })
     [void]$contextMenu.Items.Add($menuDisconnect)
@@ -8335,7 +8804,7 @@ public class ListViewItemComparer : IComparer {
     $btnConnectAll.Top = 25
     $btnConnectAll.Left = 115
     $btnConnectAll.Add_Click({
-        $shares = Get-ShareConfiguration | Where-Object { $_.Enabled }
+        $shares = @(Get-ShareConfiguration | Where-Object { $_.Enabled })
         $success = 0
         $failed = 0
         $skipped = 0
@@ -8345,65 +8814,93 @@ public class ListViewItemComparer : IComparer {
         
         $shareCount = if ($shares) { $shares.Count } else { 0 }
         Write-ActionLog -Message "Connect All: Starting bulk connection ($shareCount enabled shares)" -Category 'Connection'
-        
-        foreach ($share in $shares) {
-            $shareName = if ($share.Name) { $share.Name } else { "Unknown" }
-            
-            if (Test-ShareConnection -DriveLetter $share.DriveLetter) { 
-                Write-ActionLog -Message "Connect All: Skipping $shareName (already connected)" -Level DEBUG -Category 'Connection'
-                $skipped++
-                $skippedShares += $shareName
-                continue 
-            }
-            $cred = Get-CredentialForShare -Username $share.Username
-            if (-not $cred) {
-                # Prompt for credentials
-                $result = [System.Windows.Forms.MessageBox]::Show(
-                    "No saved credentials found for $($share.Username) (Share: $shareName).`n`nWould you like to enter credentials now?",
-                    "Share Manager v$version",
-                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
-                    [System.Windows.Forms.MessageBoxIcon]::Question
-                )
-                if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
-                    $newCred = Show-CredentialForm -Username $share.Username
-                    if ($newCred) {
-                        $cred = $newCred
+
+        $netUseTimeout = Get-PreferenceValue -Name "NetUseTimeoutSeconds" -Default 15 -AsInteger
+        if ($netUseTimeout -lt 5) { $netUseTimeout = 5 }
+        if ($netUseTimeout -gt 120) { $netUseTimeout = 120 }
+
+        Set-GuiBulkOperationState -InProgress $true -Message "Connect All: preparing $shareCount share(s)..."
+        try {
+            $index = 0
+            foreach ($share in $shares) {
+                $index++
+                $shareName = if ($share.Name) { $share.Name } else { "Unknown" }
+                
+                Show-GuiStatusMessage -Message "Connect All ($index/$shareCount): checking $shareName..." -DurationMs 0
+                [System.Windows.Forms.Application]::DoEvents()
+                
+                if (Test-ShareConnection -DriveLetter $share.DriveLetter) { 
+                    Write-ActionLog -Message "Connect All: Skipping $shareName (already connected)" -Level DEBUG -Category 'Connection'
+                    $skipped++
+                    $skippedShares += $shareName
+                    Show-GuiStatusMessage -Message "Connect All ($index/$shareCount): already connected: $shareName" -DurationMs 0
+                    [System.Windows.Forms.Application]::DoEvents()
+                    continue 
+                }
+                $cred = Get-CredentialForShare -Username $share.Username
+                if (-not $cred) {
+                    Show-GuiStatusMessage -Message "Connect All ($index/$shareCount): credentials needed for $shareName" -DurationMs 0
+                    [System.Windows.Forms.Application]::DoEvents()
+                    # Prompt for credentials
+                    $result = [System.Windows.Forms.MessageBox]::Show(
+                        "No saved credentials found for $($share.Username) (Share: $shareName).`n`nWould you like to enter credentials now?",
+                        "Share Manager v$version",
+                        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                        [System.Windows.Forms.MessageBoxIcon]::Question
+                    )
+                    if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+                        $newCred = Show-CredentialForm -Username $share.Username
+                        if ($newCred) {
+                            $cred = $newCred
+                        } else {
+                            Write-ActionLog -Message "Connect All: User cancelled credential entry for $shareName" -Level WARN -Category 'Connection'
+                            $failed++
+                            $failedShares += $shareName
+                            continue
+                        }
                     } else {
-                        Write-ActionLog -Message "Connect All: User cancelled credential entry for $shareName" -Level WARN -Category 'Connection'
+                        Write-ActionLog -Message "Connect All: No credentials for $shareName" -Level WARN -Category 'Connection'
+                        Write-ActionLog -Message "Connect All: No credentials for $shareName (Username: $($share.Username))" -Level DEBUG -Category 'Connection'
                         $failed++
                         $failedShares += $shareName
                         continue
                     }
-                } else {
-                    Write-ActionLog -Message "Connect All: No credentials for $shareName" -Level WARN -Category 'Connection'
-                    Write-ActionLog -Message "Connect All: No credentials for $shareName (Username: $($share.Username))" -Level DEBUG -Category 'Connection'
-                    $failed++
-                    $failedShares += $shareName
-                    continue
                 }
-            }
-            try {
-                Connect-NetworkShare -SharePath $share.SharePath -DriveLetter $share.DriveLetter -Credential $cred -Silent
-                if (Test-ShareConnection -DriveLetter $share.DriveLetter) {
-                    $success++
-                    $connectedShares += $shareName
-                    $config = Get-CachedConfig -Force
-                    $shareObj = $config.Shares | Where-Object { $_.Id -eq $share.Id }
-                    if ($shareObj) {
-                        $shareObj.LastConnected = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-                        Save-AllShares -Config $config | Out-Null
+                try {
+                    Show-GuiStatusMessage -Message "Connect All ($index/$shareCount): mapping $shareName to $($share.DriveLetter): (timeout ${netUseTimeout}s)..." -DurationMs 0
+                    [System.Windows.Forms.Application]::DoEvents()
+                    $connectResult = Connect-NetworkShare -SharePath $share.SharePath -DriveLetter $share.DriveLetter -Credential $cred -ReturnStatus -Silent
+                    if ($connectResult.Success -or (Test-ShareConnection -DriveLetter $share.DriveLetter)) {
+                        $success++
+                        $connectedShares += $shareName
+                        $config = Get-CachedConfig -Force
+                        $shareObj = $config.Shares | Where-Object { $_.Id -eq $share.Id }
+                        if ($shareObj) {
+                            $shareObj.LastConnected = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                            Save-AllShares -Config $config | Out-Null
+                        }
+                        Show-GuiStatusMessage -Message "Connect All ($index/$shareCount): connected $shareName" -DurationMs 0
+                        [System.Windows.Forms.Application]::DoEvents()
+                        Write-ActionLog -Message "Connect All: Connected $shareName" -Category 'Connection'
+                    } else {
+                        $failed++
+                        $failedShares += $shareName
+                        $errorText = if ($connectResult.ErrorMessage) { $connectResult.ErrorMessage } else { "connection did not verify" }
+                        Show-GuiStatusMessage -Message "Connect All ($index/$shareCount): failed $shareName - $errorText" -DurationMs 0
+                        [System.Windows.Forms.Application]::DoEvents()
+                        Write-ActionLog -Message "Connect All: Connection failed for $shareName - $errorText" -Level WARN -Category 'Connection'
                     }
-                    Write-ActionLog -Message "Connect All: Connected $shareName" -Category 'Connection'
-                } else {
+                } catch {
                     $failed++
                     $failedShares += $shareName
-                    Write-ActionLog -Message "Connect All: Connection failed for $shareName" -Level WARN -Category 'Connection'
+                    Show-GuiStatusMessage -Message "Connect All ($index/$shareCount): error on $shareName" -DurationMs 0
+                    [System.Windows.Forms.Application]::DoEvents()
+                    Write-ActionLog -Message "Connect All: Exception for $shareName - $_" -Level ERROR -Category 'Connection'
                 }
-            } catch {
-                $failed++
-                $failedShares += $shareName
-                Write-ActionLog -Message "Connect All: Exception for $shareName - $_" -Level ERROR -Category 'Connection'
             }
+        }
+        finally {
+            Set-GuiBulkOperationState -InProgress $false
         }
         
         Write-ActionLog -Message "Connect All: Complete (success: $success, failed: $failed, skipped: $skipped)" -Category 'Connection'
@@ -8451,34 +8948,58 @@ public class ListViewItemComparer : IComparer {
             [System.Windows.Forms.MessageBoxIcon]::Question
         )
         if ($result -eq 'Yes') {
-            $shares = Get-ShareConfiguration
+            $shares = @(Get-ShareConfiguration)
             $disconnected = 0
             $skipped = 0
+            $failed = 0
             $disconnectedShares = @()
             $skippedShares = @()
+            $failedShares = @()
             
             $shareCount = if ($shares) { $shares.Count } else { 0 }
             Write-ActionLog -Message "Disconnect All: Starting bulk disconnection ($shareCount total shares)" -Category 'Connection'
             
-            foreach ($share in $shares) {
-                $shareName = if ($share.Name) { $share.Name } else { "Unknown" }
-                
-                if (Test-ShareConnection -DriveLetter $share.DriveLetter) {
-                    Disconnect-NetworkShare -DriveLetter $share.DriveLetter -Silent
-                    $disconnected++
-                    $disconnectedShares += $shareName
-                    Write-ActionLog -Message "Disconnect All: Disconnected $shareName" -Category 'Connection'
-                } else {
-                    $skipped++
-                    $skippedShares += $shareName
+            Set-GuiBulkOperationState -InProgress $true -Message "Disconnect All: preparing $shareCount share(s)..."
+            try {
+                $index = 0
+                foreach ($share in $shares) {
+                    $index++
+                    $shareName = if ($share.Name) { $share.Name } else { "Unknown" }
+                    
+                    Show-GuiStatusMessage -Message "Disconnect All ($index/$shareCount): disconnecting $shareName..." -DurationMs 0
+                    [System.Windows.Forms.Application]::DoEvents()
+                    
+                    $disconnectResult = Disconnect-NetworkShare -DriveLetter $share.DriveLetter -Silent -ReturnStatus
+                    if ($disconnectResult.Success) {
+                        $disconnected++
+                        $disconnectedShares += $shareName
+                        Show-GuiStatusMessage -Message "Disconnect All ($index/$shareCount): disconnected $shareName" -DurationMs 0
+                        [System.Windows.Forms.Application]::DoEvents()
+                        Write-ActionLog -Message "Disconnect All: Disconnected $shareName" -Category 'Connection'
+                    } elseif ($disconnectResult.ErrorType -eq "NotMapped") {
+                        $skipped++
+                        $skippedShares += $shareName
+                        Show-GuiStatusMessage -Message "Disconnect All ($index/$shareCount): not mapped: $shareName" -DurationMs 0
+                        [System.Windows.Forms.Application]::DoEvents()
+                    } else {
+                        $failed++
+                        $failedShares += $shareName
+                        $errorText = if ($disconnectResult.ErrorMessage) { $disconnectResult.ErrorMessage } else { "disconnect failed" }
+                        Show-GuiStatusMessage -Message "Disconnect All ($index/$shareCount): failed $shareName - $errorText" -DurationMs 0
+                        [System.Windows.Forms.Application]::DoEvents()
+                        Write-ActionLog -Message "Disconnect All: Failed $shareName - $errorText" -Level WARN -Category 'Connection'
+                    }
                 }
             }
+            finally {
+                Set-GuiBulkOperationState -InProgress $false
+            }
             
-            Write-ActionLog -Message "Disconnect All: Complete (disconnected: $disconnected, skipped: $skipped)" -Category 'Connection'
+            Write-ActionLog -Message "Disconnect All: Complete (disconnected: $disconnected, skipped: $skipped, failed: $failed)" -Category 'Connection'
             Update-ShareList
-            Show-GuiStatusMessage -Message "Disconnect All: $disconnected disconnected, $skipped skipped" -DurationMs 5000
+            Show-GuiStatusMessage -Message "Disconnect All: $disconnected disconnected, $skipped not mapped, $failed failed" -DurationMs 5000
             
-            if ($disconnected -gt 0 -or $skipped -gt 0) {
+            if ($disconnected -gt 0 -or $skipped -gt 0 -or $failed -gt 0) {
                 $summary = "Disconnected: $disconnected"
                 if ($disconnectedShares.Count -gt 0) {
                     $summary += "`n  " + ($disconnectedShares -join ', ')
@@ -8487,6 +9008,12 @@ public class ListViewItemComparer : IComparer {
                     $summary += "`n`nSkipped: $skipped (not connected)"
                     if ($skippedShares.Count -gt 0) {
                         $summary += "`n  " + ($skippedShares -join ', ')
+                    }
+                }
+                if ($failed -gt 0) {
+                    $summary += "`n`nFailed: $failed"
+                    if ($failedShares.Count -gt 0) {
+                        $summary += "`n  " + ($failedShares -join ', ')
                     }
                 }
                 [System.Windows.Forms.MessageBox]::Show(
@@ -8738,6 +9265,7 @@ public class ListViewItemComparer : IComparer {
     $statusBar.Text = "Ready"
     $statusBar.Tag = $statusBar.Text
     $form.Controls.Add($statusBar)
+    $script:GuiBulkOperationInProgress = $false
 
     $statusResetTimer = New-Object System.Windows.Forms.Timer
     $statusResetTimer.Interval = 3200
@@ -8759,13 +9287,37 @@ public class ListViewItemComparer : IComparer {
 
         if ([string]::IsNullOrWhiteSpace($Message)) { return }
 
+        $statusResetTimer.Stop()
         $statusBar.Text = $Message
         if ($DurationMs -gt 0) {
             if ($DurationMs -lt 500) { $DurationMs = 500 }
-            $statusResetTimer.Stop()
             $statusResetTimer.Interval = $DurationMs
             $statusResetTimer.Start()
         }
+    }
+
+    function Set-GuiBulkOperationState {
+        param(
+            [bool]$InProgress,
+            [string]$Message
+        )
+
+        $script:GuiBulkOperationInProgress = $InProgress
+        foreach ($control in @($btnConnectAll, $btnDisconnectAll, $btnRefresh, $btnAdd)) {
+            if ($control) {
+                $control.Enabled = -not $InProgress
+            }
+        }
+
+        if ($InProgress) {
+            $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+            if ($Message) {
+                Show-GuiStatusMessage -Message $Message -DurationMs 0
+            }
+        } else {
+            $form.Cursor = [System.Windows.Forms.Cursors]::Default
+        }
+        [System.Windows.Forms.Application]::DoEvents()
     }
 
     $resetFilters = {
@@ -9295,7 +9847,7 @@ public class ListViewItemComparer : IComparer {
         $hasConnected = $connectedCount -gt 0
         
         # Enable Connect All only if there are disconnected shares
-        $btnConnectAll.Enabled = $hasDisconnected
+        $btnConnectAll.Enabled = ($hasDisconnected -and -not $script:GuiBulkOperationInProgress)
         if (-not $hasDisconnected) {
             $btnConnectAll.ForeColor = [System.Drawing.Color]::Gray
         } else {
@@ -9303,7 +9855,7 @@ public class ListViewItemComparer : IComparer {
         }
         
         # Enable Disconnect All only if there are connected shares
-        $btnDisconnectAll.Enabled = $hasConnected
+        $btnDisconnectAll.Enabled = ($hasConnected -and -not $script:GuiBulkOperationInProgress)
         if (-not $hasConnected) {
             $btnDisconnectAll.ForeColor = [System.Drawing.Color]::Gray
         } else {

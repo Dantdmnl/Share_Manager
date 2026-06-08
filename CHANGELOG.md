@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [2.4.0] - 2026-06-08
+
+### Added
+- **Persistent AutoMap repair path**
+  - Detects red-X `Unavailable` SMB mappings and attempts a `New-SmbMapping` reconnect before falling back to timed `net use` remapping.
+  - Prepares both `server` and `\\server` Credential Manager targets for persistent mappings to better match Windows Explorer credential lookup.
+- **Credential diagnostics**
+  - Adds diagnostics for same-server/multiple-username configuration risks.
+  - AutoMap logs active same-server SMB session clues when Windows reports multiple-credential conflicts.
+- **GUI/CLI operation feedback**
+  - GUI manual and bulk connect/disconnect actions now show progress in the status bar.
+  - CLI connect/disconnect flows now show per-share progress, target drive letters, timeout context, and clearer failure reasons.
+
+### Changed
+- **Mapping command boundaries**
+  - Network mapping, `cmdkey`, and drive checks now use small wrapper functions so the risky Windows boundary is easier to test.
+  - AutoMap now honors the configured `NetUseTimeoutSeconds` preference.
+- **Connection detection**
+  - Red-X `Unavailable` mappings are treated as disconnected.
+  - `net use` output is used as a fallback when PowerShell provider state cannot see a mapping.
+- **Default configuration handling**
+  - Default configuration objects are created fresh to avoid shared mutable state during missing/corrupt config recovery.
+
+### Fixed
+- **First-time credential dialog**
+  - `Ctrl+A` support now accepts ComboBox username fields as well as TextBox controls.
+- **CLI Disconnect All**
+  - Disconnect All now attempts configured drive letters directly and reports disconnected, not mapped, and failed results.
+- **Persistent AutoMap credential cleanup**
+  - SecureString plaintext extraction now always frees BSTR memory.
+
+### Documentation
+- Updated release documentation for version `2.4.0`.
+
 ## [2.3.1] - 2026-05-11
 
 ### Added

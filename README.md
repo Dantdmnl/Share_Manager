@@ -3,7 +3,7 @@
 ![GUI Screenshot](GUI.png)
 ![CLI Screenshot](CLI.png)
 
-- **Version:** 2.3.1
+- **Version:** 2.4.0
 - **Author:** Dantdmnl
 - **License:** See [LICENSE](LICENSE)
 
@@ -23,11 +23,11 @@ Easily manage and map network shares using this PowerShell script with support f
 - **No administrator permissions required**
 - **Persistent mapping** - Automatic reconnection at Windows logon
 
-### Release Highlights (v2.3.1 NEW)
+### Release Highlights (v2.4.0 NEW)
 
-- **Mapping reliability restored** - Connections always use the provided credentials again, avoiding cmdkey conflicts that blocked mapping on some systems.
-- **Timeout guards** - Configurable UNC probe timeout and `net use` timeout prevent false offline detection and hanging.
-- **Better diagnostics** - Raw `net use` output is captured in logs on failure for faster troubleshooting.
+- **AutoMap hardening** - Persistent mappings now repair red-X `Unavailable` SMB mappings, prepare both `server` and `\\server` Credential Manager targets, and honor configured `net use` timeouts.
+- **Clearer GUI/CLI feedback** - Manual and bulk connect/disconnect actions show progress, target drive letters, timeout context, and clearer failure reasons.
+- **Windows credential diagnostics** - Credential conflict risks and active SMB-session clues are logged to make Windows 10/11 reconnect issues easier to diagnose.
 
 ### Organization and Search
 
@@ -121,12 +121,12 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 
 - **DPAPI Encryption**: Credentials are encrypted using Windows Data Protection API (DPAPI), which ties encryption to your user account and machine. Only you can decrypt them.
 - **Automatic Migration**: Legacy AES-encrypted credentials (if upgrading from an older version) are automatically migrated to DPAPI on first use. Config files from older versions are automatically upgraded in-memory to add new properties (for example, `Enabled` and `SyncShareNameToDriveLabel`) on every load.
-- **GDPR Compliant (v2.3.1+)**:
+- **GDPR Compliant (v2.4.0+)**:
   - **INFO logs** (default): no personal data logged - operational events only (startup, operations, results).
   - **DEBUG logs** (opt-in): includes usernames, paths, and computer names for troubleshooting when enabled via `$MANUAL_LOG_LEVEL = 'DEBUG'` in script.
   - Personal data protection by design - log level filtering is enforced in code.
   - See [GDPR-COMPLIANCE.md](GDPR-COMPLIANCE.md) for full details on data handling and rights.
-- **Password Security (v2.3.1+)**: Special characters in passwords are handled via `cmdkey`.
+- **Password Security (v2.4.0+)**: Special characters in passwords are handled via direct `net use` arguments and prepared Credential Manager targets for persistent mappings.
 - **Local Storage Only**: All data (config, credentials, logs) is stored locally under `%APPDATA%\Share_Manager`.
 - **Log Rotation**: Automatic cleanup after 30 days or 5MB to prevent indefinite data retention.
 
