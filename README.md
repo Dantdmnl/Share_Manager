@@ -3,7 +3,7 @@
 ![GUI Screenshot](GUI.png)
 ![CLI Screenshot](CLI.png)
 
-- **Version:** 2.4.0
+- **Version:** 2.5.0
 - **Author:** Dantdmnl
 - **License:** See [LICENSE](LICENSE)
 
@@ -23,11 +23,12 @@ Easily manage and map network shares using this PowerShell script with support f
 - **No administrator permissions required**
 - **Persistent mapping** - Automatic reconnection at Windows logon
 
-### Release Highlights (v2.4.0 NEW)
+### Release Highlights (v2.5.0)
 
-- **AutoMap hardening** - Persistent mappings now repair red-X `Unavailable` SMB mappings, prepare both `server` and `\\server` Credential Manager targets, and honor configured `net use` timeouts.
-- **Clearer GUI/CLI feedback** - Manual and bulk connect/disconnect actions show progress, target drive letters, timeout context, and clearer failure reasons.
-- **Windows credential diagnostics** - Credential conflict risks and active SMB-session clues are logged to make Windows 10/11 reconnect issues easier to diagnose.
+- **Optional updater** - Check stable GitHub releases from the CLI or GUI, verify the downloaded script, and keep a backup before replacement.
+- **Credential reliability** - Correct Credential Manager argument boundaries, refresh changed passwords for the same username, and retain explicit credentials for mapping even if credential storage fails.
+- **CLI maintenance** - Disconnect stale mappings, count only enabled shares for Connect All, and group update/log actions above GUI Mode and Quit.
+- **PowerShell 5.1 fixes** - Correct background job cleanup and expand offline regression coverage.
 
 ### Organization and Search
 
@@ -72,6 +73,32 @@ Easily manage and map network shares using this PowerShell script with support f
 - **Batch enable/disable** - Enable or disable multiple shares at once
 - **Drive label sync** - Mapped drives labeled with share name in Explorer
 - **Reconnect All** operation for quick bulk remapping
+
+## Updating Share Manager
+
+Version 2.5.0 includes an optional updater. The CLI and GUI screenshots above show this version.
+
+### Checking for Updates
+
+Use **U - Updates** in the CLI or **Help > Check for Updates** in the GUI. Checks are manual; Share Manager does not contact GitHub at startup or schedule update checks. Installation asks for confirmation.
+
+The updater uses the latest stable release from this repository and its `Share_Manager.ps1` asset. It checks GitHub's SHA-256 asset digest, file size, PowerShell syntax, required application functions, and the version against the release tag. A release missing a digest must be downloaded manually. The digest checks integrity against GitHub metadata; it is not an independent publisher signature.
+
+The current script is replaced atomically, with a timestamped `.bak` file beside it. Local script customizations are replaced, but configurations and saved credentials in `%APPDATA%\Share_Manager` are not changed by the updater. The script folder must be writable. Download or validation failures leave the current script in place. Equal versions and downgrades are refused.
+
+Close and reopen Share Manager after installing. Persistent AutoMap scripts are regenerated through the normal startup flow when persistent mapping is enabled. To roll back, close Share Manager and replace the script with the saved `.bak` copy, retaining the `.ps1` filename. Backups are retained until you remove them.
+
+Update checks send a request to GitHub; downloads also use GitHub's asset hosting. No share configuration, usernames, or saved credentials are included. GitHub receives ordinary connection metadata such as your public IP address.
+
+### Maintenance Validation
+
+Run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Debug\test_regression.ps1` and `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Debug\test_syntax.ps1`.
+
+Run `powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Debug\test_update_gui.ps1` for an offline GUI worker smoke test. It briefly displays two progress dialogs and verifies success/error handling without downloading or installing anything.
+
+Before publishing, test GUI update progress and prompts, read-only script folders, reconnect after a server password change, and Disconnect All with only red-X mappings on Windows 10/11. Automated credential tests use synthetic arguments and mocks; they do not modify Windows Credential Manager or connect to a real SMB server.
+
+Design references: [GitHub release API](https://docs.github.com/en/rest/releases/releases#get-the-latest-release), [release asset digests](https://docs.github.com/en/rest/releases/assets#get-a-release-asset), and [go-selfupdate's release filtering and checksum validation](https://github.com/creativeprojects/go-selfupdate). The local Network Configuration script provided the backup/atomic replacement pattern.
 
 ## Prerequisites
 
@@ -137,13 +164,13 @@ This repository includes a comprehensive validation script to ensure the project
 Run all checks locally:
 
 ```powershell
-pwsh -NoProfile -File .\Debug\test_syntax.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Debug\test_syntax.ps1
 ```
 
 Run regression tests:
 
 ```powershell
-pwsh -NoProfile -File .\Debug\test_regression.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Debug\test_regression.ps1
 ```
 
 What it checks:
@@ -160,10 +187,10 @@ What it checks:
 
 If PSScriptAnalyzer is not installed, the syntax script skips that step and shows how to install it.
 
-If Pester is not installed, install it with:
+The regression runner selects Pester 3.4 or 4.x because the suite uses legacy assertion syntax. Pester 5 can remain installed alongside it. If a compatible version is not installed, use:
 
 ```powershell
-Install-Module -Name Pester -Scope CurrentUser
+Install-Module -Name Pester -RequiredVersion 4.10.1 -Scope CurrentUser
 ```
 
 ## Factory Reset

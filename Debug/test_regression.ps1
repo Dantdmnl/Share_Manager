@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     Executes Debug/Share_Manager.Tests.ps1 and returns a non-zero exit code
-    if any tests fail. Compatible with Pester 3.x and newer.
+    if any tests fail. Uses Pester 3.4 or 4.x (the suite uses legacy assertion syntax).
 
 .PARAMETER TestsPath
     Optional path to the Pester test file.
@@ -23,14 +23,16 @@ catch {
     exit 1
 }
 
-$pesterModule = Get-Module -ListAvailable -Name Pester | Sort-Object Version -Descending | Select-Object -First 1
+$pesterModule = Get-Module -ListAvailable -Name Pester | Where-Object {
+    $_.Version -ge [version]'3.4' -and $_.Version.Major -lt 5
+} | Sort-Object Version -Descending | Select-Object -First 1
 if (-not $pesterModule) {
-    Write-Host "[X] Pester is not installed." -ForegroundColor Red
-    Write-Host "Install with: Install-Module -Name Pester -Scope CurrentUser" -ForegroundColor Yellow
+    Write-Host "[X] Compatible Pester (3.4 or 4.x) is not installed." -ForegroundColor Red
+    Write-Host "Install with: Install-Module -Name Pester -RequiredVersion 4.10.1 -Scope CurrentUser" -ForegroundColor Yellow
     exit 1
 }
 
-Import-Module Pester -ErrorAction Stop | Out-Null
+Import-Module -Name $pesterModule.Path -Force -ErrorAction Stop | Out-Null
 
 Write-Host "`n================================================================" -ForegroundColor Cyan
 Write-Host "  SHARE MANAGER - REGRESSION TESTS" -ForegroundColor Cyan
@@ -39,6 +41,11 @@ Write-Host "  Pester: $($pesterModule.Version)" -ForegroundColor Gray
 Write-Host "  Tests : $resolvedTests`n" -ForegroundColor Gray
 
 $results = Invoke-Pester -Script $resolvedTests -PassThru
+
+if (-not $results -or $results.TotalCount -eq 0) {
+    Write-Host "[X] No regression tests ran." -ForegroundColor Red
+    exit 1
+}
 
 if ($results.FailedCount -gt 0) {
     Write-Host "`n[X] Regression tests failed: $($results.FailedCount) failure(s)" -ForegroundColor Red

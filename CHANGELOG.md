@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [2.5.0] - 2026-09-27
+
+### Added
+- User-initiated updater: CLI `U` and GUI Help > Check for Updates, using the latest stable GitHub release.
+- SHA-256, size, script identity, parser, and version validation before atomic script replacement, with a timestamped backup beside the script.
+- Background update checks/downloads with a progress dialog in the GUI; installation requires confirmation and takes effect after restarting.
+
+### Fixed
+- Pass separate target, username, and password arguments to Credential Manager in both manual and generated AutoMap flows. PowerShell previously combined these into one argument.
+- Remove the unsupported `Stop-Job -Force` parameter from UNC probing and mapping cleanup for Windows PowerShell 5.1 compatibility.
+- Refresh persistent credentials even when the username is unchanged, so password changes are not skipped. Avoid deleting stored credentials before attempting to update them.
+- Let CLI Disconnect All reach configured mappings even when every mapping appears disconnected or unavailable.
+- Count only enabled, disconnected shares in the CLI Connect All summary; keep Disconnect All available for stale mappings and group Updates with View Log above Quit.
+- Select a compatible Pester 3.4/4.x installation explicitly and fail validation if no tests run.
+- Suppress the Windows console minimize call's stray `True` output and show helpful GUI launch guidance. Reuse the console interop type on repeated calls and skip minimization when no console is attached.
+
+### Tests
+- Isolate application startup inside Pester's temporary directory so regression tests do not rotate the user's application logs.
+- Exercise credential argument boundaries and timed-out mapping job cleanup.
+- Cover updater rejection and backup paths, changed local files, declined installations, CLI dispatch, and credential-store failures without blocking explicit mapping credentials.
+
+### Documentation
+- Update application and generated AutoMap version metadata to `2.5.0`.
+- Document updater privacy, verification, backup/rollback behavior, and PowerShell 5.1 validation commands.
+- Refresh CLI/GUI screenshots for `2.5.0` and publish release notes with validation scope.
+
 ## [2.4.0] - 2026-06-08
 
 ### Added

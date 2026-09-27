@@ -25,7 +25,7 @@
     - Credentials stored per-user, per-machine (non-portable)
     - Special characters in passwords properly handled via cmdkey
     
-    Production Enhancements (v2.4.0+):
+    Production Enhancements (v2.5.0+):
     - Atomic file operations prevent configuration corruption
     - Automatic backup before destructive operations
     - Enhanced UNC path validation with auto-correction
@@ -40,7 +40,7 @@
     Optional. Pass "CLI" or "GUI" to force that mode on launch, bypassing saved preference.
 
 .VERSION
-    2.4.0
+    2.5.0
 
 .NOTES
     - No administrator permissions required
@@ -57,8 +57,9 @@ param(
 
 #region Global Variables (Version, Paths, Defaults)
 
-$version        = '2.4.0'
+$version        = '2.5.0'
 $author         = 'Dantdmnl'
+$script:ApplicationPath = $PSCommandPath
 
 # Configuration constants
 $script:CONFIG_CACHE_MAX_AGE_SECONDS = 5
@@ -148,6 +149,208 @@ $script:UseGUI = $false
 #endregion
 
 #region Helper Functions: InputBox, Logging, Config & Credential Key
+
+function ConvertTo-ShareManagerReleaseInfo {
+    param([Parameter(Mandatory=$true)]$Release)
+
+    if ($Release.draft -or $Release.prerelease -or $Release.tag_name -cnotmatch '^[Vv]?\d+\.\d+\.\d+$') {
+        throw 'The release is not a supported stable version.'
+    }
+    $releaseVersion = [version]($Release.tag_name -replace '^[Vv]', '')
+    $assets = @($Release.assets | Where-Object { $_.name -ceq 'Share_Manager.ps1' -and $_.state -eq 'uploaded' })
+    if ($assets.Count -ne 1) { throw 'The release must contain one Share_Manager.ps1 asset.' }
+    $asset = $assets[0]
+    if ($asset.digest -notmatch '^sha256:[a-fA-F0-9]{64}$') {
+        throw 'The release has no SHA-256 asset digest. Use the release page to download manually.'
+    }
+    if ([long]$asset.size -le 0 -or [long]$asset.size -gt 5MB) { throw 'Unexpected release asset size.' }
+    $downloadUrl = "https://github.com/Dantdmnl/Share_Manager/releases/download/$($Release.tag_name)/Share_Manager.ps1"
+    if ($asset.browser_download_url -cne $downloadUrl) { throw 'Unexpected release download URL.' }
+    return [PSCustomObject]@{
+        Version = $releaseVersion.ToString()
+        Tag = [string]$Release.tag_name
+        DownloadUrl = $downloadUrl
+        Digest = [string]$asset.digest
+        Size = [long]$asset.size
+        ReleaseUrl = "https://github.com/Dantdmnl/Share_Manager/releases/tag/$($Release.tag_name)"
+    }
+}
+
+function Get-ShareManagerRelease {
+    <# .SYNOPSIS
+        Checks the public GitHub stable release without downloading or executing code.
+    #>
+    $previousProtocol = [Net.ServicePointManager]::SecurityProtocol
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = $previousProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/Dantdmnl/Share_Manager/releases/latest' `
+            -Headers @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'Share-Manager-Updater' } `
+            -TimeoutSec 20 -ErrorAction Stop
+        return ConvertTo-ShareManagerReleaseInfo -Release $release
+    }
+    finally {
+        [Net.ServicePointManager]::SecurityProtocol = $previousProtocol
+    }
+}
+
+function Get-ShareManagerScriptVersion {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$parseErrors)
+    if ($parseErrors.Count -gt 0) { throw 'The script failed PowerShell parser validation.' }
+    $assignments = @($ast.EndBlock.Statements | Where-Object {
+        $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+        $_.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+        $_.Left.VariablePath.UserPath -eq 'version'
+    })
+    if ($assignments.Count -ne 1) { throw 'The script has no unique version assignment.' }
+    $expression = $assignments[0].Right.Expression
+    if ($expression -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) {
+        throw 'The script version must be a literal string.'
+    }
+    $value = $expression.Value
+    if ($value -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid script version.' }
+    $functions = @($ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] } | ForEach-Object { $_.Name })
+    foreach ($required in @('Connect-NetworkShare', 'Start-CliMode', 'Show-GUI')) {
+        if ($functions -notcontains $required) { throw 'The download is not a complete Share Manager script.' }
+    }
+    return [version]$value
+}
+
+function Install-ShareManagerUpdate {
+    <# .SYNOPSIS
+        Verifies a release download and atomically replaces the script, retaining a backup.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]$Release,
+        [Parameter(Mandatory=$true)][string]$CurrentScriptPath
+    )
+
+    # Revalidate the install input and construct the URL from the repository and tag.
+    $checked = ConvertTo-ShareManagerReleaseInfo -Release ([PSCustomObject]@{
+        tag_name = $Release.Tag; draft = $false; prerelease = $false
+        assets = @([PSCustomObject]@{
+            name = 'Share_Manager.ps1'; state = 'uploaded'; digest = $Release.Digest
+            size = $Release.Size; browser_download_url = $Release.DownloadUrl
+        })
+    })
+    $currentFile = Get-Item -LiteralPath $CurrentScriptPath -ErrorAction Stop
+    if ($currentFile.PSIsContainer -or $currentFile.Extension -ne '.ps1') { throw 'The current script path must be a .ps1 file.' }
+    $currentPath = $currentFile.FullName
+    $localVersion = Get-ShareManagerScriptVersion -Path $currentPath
+    if ([version]$checked.Version -le $localVersion) { throw 'This version is already installed, or the local script is newer. Restart Share Manager.' }
+    $originalHash = (Get-FileHash -LiteralPath $currentPath -Algorithm SHA256 -ErrorAction Stop).Hash
+    $id = [guid]::NewGuid().ToString('N')
+    $stagedPath = Join-Path $currentFile.DirectoryName ('.Share_Manager.' + $id + '.update.ps1')
+    $backupPath = $currentPath + '.' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.' + $id + '.bak'
+    $previousProtocol = [Net.ServicePointManager]::SecurityProtocol
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = $previousProtocol -bor [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $checked.DownloadUrl -UseBasicParsing -TimeoutSec 60 -OutFile $stagedPath -ErrorAction Stop | Out-Null
+        if ((Get-Item -LiteralPath $stagedPath).Length -ne $checked.Size) { throw 'The downloaded size does not match the release asset.' }
+        $downloadHash = (Get-FileHash -LiteralPath $stagedPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        if ('sha256:' + $downloadHash -ine $checked.Digest) { throw 'The downloaded SHA-256 does not match the release asset.' }
+        if ((Get-ShareManagerScriptVersion -Path $stagedPath) -ne [version]$checked.Version) { throw 'The script version does not match the release tag.' }
+        if ((Get-FileHash -LiteralPath $currentPath -Algorithm SHA256 -ErrorAction Stop).Hash -ne $originalHash) {
+            throw 'The local script changed during the download. Update cancelled.'
+        }
+        [System.IO.File]::Replace($stagedPath, $currentPath, $backupPath)
+        return [PSCustomObject]@{ Version = $checked.Version; BackupPath = $backupPath }
+    }
+    finally {
+        [Net.ServicePointManager]::SecurityProtocol = $previousProtocol
+        if (Test-Path -LiteralPath $stagedPath) { Remove-Item -LiteralPath $stagedPath -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Invoke-ShareManagerUpdateTask {
+    param([ValidateSet('Check', 'Install')][string]$Operation, $Release, [switch]$UseGUI)
+
+    if (-not $UseGUI) {
+        if ($Operation -eq 'Check') { return Get-ShareManagerRelease }
+        return Install-ShareManagerUpdate -Release $Release -CurrentScriptPath $script:ApplicationPath
+    }
+
+    # Only updater functions enter the worker; application startup and credentials stay out.
+    $definitions = foreach ($name in @('ConvertTo-ShareManagerReleaseInfo', 'Get-ShareManagerRelease', 'Get-ShareManagerScriptVersion', 'Install-ShareManagerUpdate')) {
+        "function $name {`n$((Get-Command $name -CommandType Function).Definition)`n}"
+    }
+    $worker = [PowerShell]::Create()
+    $dialog = New-Object System.Windows.Forms.Form
+    $timer = New-Object System.Windows.Forms.Timer
+    try {
+        $dialog.Text = 'Share Manager Update'
+        $dialog.ClientSize = New-Object System.Drawing.Size(460, 95)
+        $dialog.FormBorderStyle = 'FixedDialog'
+        $dialog.StartPosition = 'CenterScreen'
+        $dialog.ControlBox = $false
+        $label = New-Object System.Windows.Forms.Label
+        $label.Dock = 'Top'
+        $label.Height = 50
+        $label.TextAlign = 'MiddleCenter'
+        $label.Text = if ($Operation -eq 'Check') { 'Checking GitHub for updates...' } else { 'Downloading and verifying the update...' }
+        $progress = New-Object System.Windows.Forms.ProgressBar
+        $progress.Dock = 'Bottom'
+        $progress.Style = 'Marquee'
+        $dialog.Controls.AddRange(@($label, $progress))
+        $null = $worker.AddScript($definitions -join "`n")
+        $null = $worker.AddScript({
+            param($operation, $release, $path)
+            $ErrorActionPreference = 'Stop'
+            if ($operation -eq 'Check') { Get-ShareManagerRelease }
+            else { Install-ShareManagerUpdate -Release $release -CurrentScriptPath $path }
+        }).AddArgument($Operation).AddArgument($Release).AddArgument($script:ApplicationPath)
+        $pending = $worker.BeginInvoke()
+        $timer.Interval = 100
+        $timer.Add_Tick({ if ($pending.IsCompleted) { $timer.Stop(); $dialog.Close() } })
+        $timer.Start()
+        $null = $dialog.ShowDialog()
+        $result = $worker.EndInvoke($pending)
+        if ($worker.HadErrors) { throw $worker.Streams.Error[0] }
+        return $result
+    }
+    finally {
+        $timer.Stop()
+        $timer.Dispose()
+        $dialog.Dispose()
+        $worker.Dispose()
+    }
+}
+
+function Update-ShareManager {
+    <# .SYNOPSIS
+        Offers a user-initiated stable update in the CLI or GUI, with an install confirmation.
+    #>
+    param([switch]$UseGUI)
+
+    try {
+        if (-not $UseGUI) { Write-Host 'Checking GitHub for updates...' -ForegroundColor Cyan }
+        $release = Invoke-ShareManagerUpdateTask -Operation Check -UseGUI:$UseGUI
+        if ([version]$release.Version -le [version]$version) {
+            $message = "No newer stable release. Running: $version; latest release: $($release.Version)."
+        } else {
+            $question = "Install Share Manager $($release.Version)?`n`nCurrent version: $version`nRelease notes: $($release.ReleaseUrl)`n`nThis replaces the script file and keeps a backup beside it. Local script edits will be replaced. Restart afterward to use the update."
+            if ($UseGUI) {
+                $approved = [System.Windows.Forms.MessageBox]::Show($question, 'Share Manager Update', 'YesNo', 'Question', 'Button2') -eq 'Yes'
+            } else {
+                Write-Host $question
+                $approved = (Read-Host 'Install update? [y/N]').Trim() -ieq 'y'
+            }
+            if (-not $approved) { return }
+            if (-not $UseGUI) { Write-Host 'Downloading and verifying the update...' -ForegroundColor Cyan }
+            $installed = Invoke-ShareManagerUpdateTask -Operation Install -Release $release -UseGUI:$UseGUI
+            $message = "Installed $($installed.Version). Close and reopen Share Manager to use it.`nBackup: $($installed.BackupPath)"
+        }
+        if ($UseGUI) { [System.Windows.Forms.MessageBox]::Show($message, 'Share Manager Update', 'OK', 'Information') | Out-Null }
+        else { Write-Host $message -ForegroundColor Green }
+    }
+    catch {
+        $message = "Update failed: $($_.Exception.Message)`nYou can retry or download manually: https://github.com/Dantdmnl/Share_Manager/releases"
+        if ($UseGUI) { [System.Windows.Forms.MessageBox]::Show($message, 'Share Manager Update', 'OK', 'Error') | Out-Null }
+        else { Write-Host $message -ForegroundColor Yellow }
+    }
+}
 
 function Show-InputBox {
     param (
@@ -2181,7 +2384,7 @@ function Test-ShareOnline {
     }
     finally {
         if ($job) {
-            try { Stop-Job -Job $job -Force | Out-Null } catch { }
+            try { Stop-Job -Job $job -ErrorAction Stop | Out-Null } catch { }
             try { Remove-Job -Job $job -Force | Out-Null } catch { }
         }
     }
@@ -2257,7 +2460,7 @@ function Invoke-NetUseWithCredential {
     }
     finally {
         if ($job) {
-            try { Stop-Job -Job $job -Force | Out-Null } catch { }
+            try { Stop-Job -Job $job -ErrorAction Stop | Out-Null } catch { }
             try { Remove-Job -Job $job -Force | Out-Null } catch { }
         }
     }
@@ -2283,7 +2486,7 @@ function Invoke-CmdKeyAdd {
         [string]$Password
     )
 
-    $cmdkeyArgs = @('/add:' + $Target, '/user:' + $Username, '/pass:' + $Password)
+    $cmdkeyArgs = @(('/add:' + $Target), ('/user:' + $Username), ('/pass:' + $Password))
     $output = & cmdkey $cmdkeyArgs 2>&1
     return [PSCustomObject]@{
         Output = ($output | Out-String)
@@ -2386,27 +2589,10 @@ function Connect-NetworkShare {
             $credentialTargets = @(Get-CredentialTargetsForSharePath -SharePath $SharePath)
 
             foreach ($target in $credentialTargets) {
-                # Check if credentials already exist for this target with same username
-                $existingCreds = Invoke-CmdKeyList -Target $target
-                $needsUpdate = $true
-
-                if ($existingCreds -match "Target: $([regex]::Escape($target))") {
-                    if ($existingCreds -match "User: $([regex]::Escape($user))") {
-                        $needsUpdate = $false
-                        Write-ActionLog -Message "Cmdkey credentials already exist for $target with same username (skipping update)" -Level DEBUG -Category 'Credentials'
-                    } else {
-                        Write-ActionLog -Message "Updating cmdkey credentials for $target (username changed)" -Level DEBUG -Category 'Credentials'
-                    }
-                } else {
-                    Write-ActionLog -Message "Adding new cmdkey credentials for $target" -Level DEBUG -Category 'Credentials'
-                }
-
-                if ($needsUpdate) {
-                    Invoke-CmdKeyDelete -Target $target | Out-Null
-                    $cmdkeyResult = Invoke-CmdKeyAdd -Target $target -Username $user -Password $plainPassword
-                    if ($cmdkeyResult.ExitCode -ne 0) {
-                        Write-ActionLog -Message "Cmdkey failed to store credentials for $target (exit code: $($cmdkeyResult.ExitCode))" -Level WARN -Category 'Credentials' -Data @{ output = $cmdkeyResult.Output }
-                    }
+                # Matching usernames do not establish that the stored password is current.
+                $cmdkeyResult = Invoke-CmdKeyAdd -Target $target -Username $user -Password $plainPassword
+                if ($cmdkeyResult.ExitCode -ne 0) {
+                    Write-ActionLog -Message "Credential Manager update failed (exit code: $($cmdkeyResult.ExitCode)); continuing with supplied mapping credentials" -Level WARN -Category 'Credentials'
                 }
             }
         }
@@ -3490,21 +3676,7 @@ function Start-CliMode {
                 }
             }
             "D" { 
-                # Check if any shares are connected
-                $shares = Get-ShareConfiguration
-                $hasConnected = $false
-                foreach ($share in $shares) {
-                    if (Test-ShareConnection -DriveLetter $share.DriveLetter) {
-                        $hasConnected = $true
-                        break
-                    }
-                }
-                if ($hasConnected) {
-                    Disconnect-AllSharesCli
-                } else {
-                    Write-Host "  No shares are currently connected." -ForegroundColor DarkGray
-                    Start-Sleep -Seconds 1
-                }
+                Disconnect-AllSharesCli
             }
             "N" { 
                 # Check if any shares are connected or can be connected
@@ -3531,6 +3703,7 @@ function Start-CliMode {
             "P" { Set-CliPreferences }
             "K" { Update-CliCredentialsMenu }
             "B" { Import-ExportConfigCli }
+            "U" { Update-ShareManager }
             "L" { 
                 Write-Host "`n=== Log Menu ===" -ForegroundColor Cyan
                 Write-Host "1. Open Log File"
@@ -5356,9 +5529,13 @@ function Show-CLI-Menu {
     
     # Count connected shares properly
     $connected = 0
+    $disconnected = 0
+    $enabledCount = @($shares | Where-Object { $_.Enabled }).Count
     foreach ($share in $shares) {
         if (Test-ShareConnection -DriveLetter $share.DriveLetter) {
             $connected++
+        } elseif ($share.Enabled) {
+            $disconnected++
         }
     }
     
@@ -5379,15 +5556,10 @@ function Show-CLI-Menu {
     Write-Host ""
     
     if ($total -eq 0) {
-        Write-Host "  1" -NoNewline -ForegroundColor White
-        Write-Host " - Add Your First Share" -ForegroundColor Gray
-        Write-Host ""
         Write-Host "  " -NoNewline
         Write-Host "Tip: " -NoNewline -ForegroundColor Yellow
         Write-Host "Start by adding a network share to get started!" -ForegroundColor DarkGray
     } else {
-        $disconnected = $total - $connected
-        
         # Connect All - gray out if all connected
         if ($disconnected -gt 0) {
             Write-Host "  C" -NoNewline -ForegroundColor Green
@@ -5397,23 +5569,15 @@ function Show-CLI-Menu {
         } else {
             Write-Host "  C" -NoNewline -ForegroundColor DarkGray
             Write-Host " - Connect All " -NoNewline -ForegroundColor DarkGray
-            Write-Host "(all connected)" -ForegroundColor DarkGray
+            $connectSummary = if ($enabledCount -eq 0) { '(no enabled shares)' } else { '(all enabled shares connected)' }
+            Write-Host $connectSummary -ForegroundColor DarkGray
         }
         
-        # Disconnect All - gray out if none connected
-        if ($connected -gt 0) {
-            Write-Host "  D" -NoNewline -ForegroundColor Yellow
-            Write-Host " - Disconnect All    " -NoNewline -ForegroundColor Gray
-            Write-Host "N" -NoNewline -ForegroundColor Cyan
-                Write-Host " - Reconnect All" -ForegroundColor Gray
-        } else {
-            Write-Host "  D" -NoNewline -ForegroundColor DarkGray
-            Write-Host " - Disconnect All " -NoNewline -ForegroundColor DarkGray
-            Write-Host "(none connected)    " -NoNewline -ForegroundColor DarkGray
-            Write-Host "N" -NoNewline -ForegroundColor DarkGray
-                Write-Host " - Reconnect All " -NoNewline -ForegroundColor DarkGray
-            Write-Host "(none connected)" -ForegroundColor DarkGray
-        }
+        # Disconnected mappings can still need removal; reconnect also works from zero connections.
+        Write-Host "  D" -NoNewline -ForegroundColor Yellow
+        Write-Host " - Disconnect All    " -NoNewline -ForegroundColor Gray
+        Write-Host "N" -NoNewline -ForegroundColor $(if ($enabledCount -gt 0) { 'Cyan' } else { 'DarkGray' })
+        Write-Host " - Reconnect All" -ForegroundColor Gray
     }
     
     Write-Host ""
@@ -5433,6 +5597,9 @@ function Show-CLI-Menu {
     
     Write-Host "  L" -NoNewline -ForegroundColor White
     Write-Host " - View Log     " -NoNewline -ForegroundColor Gray
+    Write-Host "U" -NoNewline -ForegroundColor White
+    Write-Host " - Updates" -ForegroundColor Gray
+    Write-Host "  " -NoNewline
     Write-Host "G" -NoNewline -ForegroundColor Cyan
     Write-Host " - GUI Mode     " -NoNewline -ForegroundColor Gray
     Write-Host "Q" -NoNewline -ForegroundColor Red
@@ -5733,7 +5900,7 @@ function Install-LogonScript {
     $ps1Path = Join-Path $baseFolder 'Share_Manager_AutoMap.ps1'
     $cmdPath = Join-Path $startupFolder 'Share_Manager_AutoMap.cmd'
     $logonScript = @'
-# Auto-generated by Share Manager v2.4.0 (multi-share, DPAPI-protected)
+# Auto-generated by Share Manager v2.5.0 (multi-share, DPAPI-protected)
 # Production-ready with enhanced error handling, network checks, and retry logic
 param()
 $baseFolder = Join-Path $env:APPDATA "Share_Manager"
@@ -5783,7 +5950,7 @@ function Write-Log {
         correlationId = $null
         sessionId     = $sessionId
         pid           = $PID
-        ver           = '2.4.0'
+        ver           = '2.5.0'
         data          = $Data
     }
     ($evt | ConvertTo-Json -Compress) | Out-File -FilePath $eventsPath -Encoding UTF8 -Append
@@ -5905,8 +6072,7 @@ function Set-AutoMapCredentialTarget {
         }
     }
 
-    cmdkey /delete:$ServerTarget 2>&1 | Out-Null
-    $output = & cmdkey @('/add:' + $ServerTarget, '/user:' + $Username, '/pass:' + $Password) 2>&1
+    $output = & cmdkey @(('/add:' + $ServerTarget), ('/user:' + $Username), ('/pass:' + $Password)) 2>&1
     return [PSCustomObject]@{
         Updated = ($LASTEXITCODE -eq 0)
         ExitCode = $LASTEXITCODE
@@ -6018,7 +6184,7 @@ function Invoke-AutoMapNetUseMap {
     }
     finally {
         if ($job) {
-            try { Stop-Job -Job $job -Force | Out-Null } catch { }
+            try { Stop-Job -Job $job -ErrorAction Stop | Out-Null } catch { }
             try { Remove-Job -Job $job -Force | Out-Null } catch { }
         }
     }
@@ -6034,7 +6200,7 @@ $psVersion = "$($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Min
 $psEditionInfo = $PSVersionTable.PSEdition
 
 Write-Log -Message "========================================" -Category 'AutoMap'
-Write-Log -Message "AutoMap start (v2.4.0)" -Category 'AutoMap' -Data @{ psVersion = $psVersion; psEdition = $psEditionInfo }
+Write-Log -Message "AutoMap start (v2.5.0)" -Category 'AutoMap' -Data @{ psVersion = $psVersion; psEdition = $psEditionInfo }
 Write-Log -Message "Environment: PowerShell $psVersion ($psEditionInfo)" -Level DEBUG -Category 'AutoMap'
 
 # Check network availability with retry logic (for slow WiFi connections during logon)
@@ -6307,7 +6473,7 @@ Write-Log -Message "========================================" -Category 'AutoMap
 '@
     $cmdScript = @"
 @echo off
-REM Auto-generated by Share Manager v2.4.0 - Logon Script Launcher
+REM Auto-generated by Share Manager v2.5.0 - Logon Script Launcher
 REM This wrapper launches the PowerShell automap script with proper error handling
 REM Windows 11 25H2+ compatible (no wmic dependency)
 
@@ -6667,18 +6833,26 @@ function Show-PreferencesForm {
 }
 
 function Hide-ConsoleWindow {
-    Add-Type @"
+    Write-Host "Share Manager v$version is opening in GUI mode." -ForegroundColor Cyan
+    Write-Host "Use the Share Manager window on your taskbar." -ForegroundColor Gray
+    Write-Host "Keep this console open while using the GUI; closing it will end Share Manager." -ForegroundColor Gray
+
+    if (-not ('ShareManagerConsoleWindow' -as [type])) {
+        Add-Type @"
 using System;
 using System.Runtime.InteropServices;
-public class Win {
+public class ShareManagerConsoleWindow {
     [DllImport("kernel32.dll")]
     public static extern IntPtr GetConsoleWindow();
     [DllImport("user32.dll")]
     public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 }
 "@
-    $hWnd = [Win]::GetConsoleWindow()
-    [Win]::ShowWindow($hWnd, 2)
+    }
+    $hWnd = [ShareManagerConsoleWindow]::GetConsoleWindow()
+    if ($hWnd -ne [IntPtr]::Zero) {
+        [void][ShareManagerConsoleWindow]::ShowWindow($hWnd, 2)
+    }
 }
 
 function Show-AddShareDialog {
@@ -9580,6 +9754,10 @@ public class ListViewItemComparer : IComparer {
         Show-KeyboardShortcutsDialog
     })
     $menuHelp.DropDownItems.Add($miHelpShortcuts) | Out-Null
+
+    $miHelpUpdates = New-Object System.Windows.Forms.ToolStripMenuItem("Check for &Updates")
+    $miHelpUpdates.Add_Click({ Update-ShareManager -UseGUI })
+    $menuHelp.DropDownItems.Add($miHelpUpdates) | Out-Null
 
     $miHelpAbout = New-Object System.Windows.Forms.ToolStripMenuItem("&About")
     $miHelpAbout.Add_Click({ $btnAbout.PerformClick() })

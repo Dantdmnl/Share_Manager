@@ -55,13 +55,13 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Bypass
 Run the comprehensive validation script:
 
 ```powershell
-pwsh -NoProfile -File .\Debug\test_syntax.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Debug\test_syntax.ps1
 ```
 
 Run regression tests:
 
 ```powershell
-pwsh -NoProfile -File .\Debug\test_regression.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Debug\test_regression.ps1
 ```
 
 The validation script checks:

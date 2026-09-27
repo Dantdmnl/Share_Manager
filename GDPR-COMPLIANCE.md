@@ -1,6 +1,6 @@
 # GDPR Compliance Overview
 
-This document explains how Share Manager (CLI/GUI, v2.4.0) handles personal data in a GDPR-compliant way and how you can exercise your data rights.
+This document explains how Share Manager (CLI/GUI, v2.5.0) handles personal data and how you can exercise your data rights.
 
 ## What data is processed
 
@@ -46,7 +46,9 @@ All data is stored locally under the current Windows user profile:
 - `%APPDATA%\Share_Manager\cred.txt` - Legacy single-credential file (backed up to .v1.backup and removed)
 - `%APPDATA%\Share_Manager\key.bin` - Legacy AES key (kept for backward compatibility)
 
-**No data is transmitted to third parties or over the network by this tool.** All operations are local to your machine.
+Configuration and saved credential files stay on your machine. Mapping shares communicates with the configured network servers using Windows authentication.
+
+The optional updater contacts GitHub only when you select **Check for Updates**. Installing an update downloads the published script from GitHub and its asset hosting. These requests include ordinary connection metadata (such as public IP address and an updater user-agent), but do not include share configuration, usernames, passwords, or local logs. There are no scheduled checks or telemetry uploads. A script backup is retained beside the original script until you remove it.
 
 ## Legal basis and data minimization
 
@@ -60,7 +62,7 @@ All data is stored locally under the current Windows user profile:
 - Passwords are encrypted at rest using Windows DPAPI (Data Protection API), which ties encryption keys to your Windows user account and machine. Only you (on this machine) can decrypt them.
 - Legacy AES-encrypted credentials (key.bin) are automatically migrated to DPAPI on first use and remain backward-compatible during migration.
 - The startup (automap) script decrypts credentials only in the same user context (your account).
-- Passwords are never logged at any level or transmitted.
+- Saved passwords are encrypted locally; Windows uses the supplied credentials to authenticate to your configured servers. Update requests never include credentials.
 - **Special character handling (v2.2.0+)**: Passwords with special characters (`&`, `%`, `!`, etc.) are properly escaped when stored in Windows Credential Manager via cmdkey.
 - **Enhanced privacy in logs (v2.2.0+)**: Personal data (usernames, share paths, computer names) logged ONLY at DEBUG level. Default INFO level shows operations without exposing personal identifiers.
 - Session IDs and correlation IDs enable troubleshooting without exposing user identity.
@@ -77,7 +79,7 @@ All data is stored locally under the current Windows user profile:
 - Access: You can open the files in %APPDATA%\Share_Manager to view what is stored (except passwords which remain encrypted).
 - Rectification: Edit entries via the UI/CLI (e.g., Edit Share, change Username) or by updating the files.
 - Erasure (Right to be forgotten): Use the Credentials menu to remove credentials, and delete configuration files to remove all data. The tool provides a removal function that clears credential entries and automap scripts.
-- Restriction/Objection: Disable persistent mapping and/or remove shares. The tool operates only on demand and does not send data externally.
+- Restriction/Objection: Disable persistent mapping and/or remove shares. Avoid the optional update command to prevent GitHub update requests.
 - Portability: Use the Backup & Restore (Export Configuration) to export shares.json. Credentials are not exported in plaintext.
 
 ## Operational controls in the app

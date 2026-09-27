@@ -17,9 +17,16 @@ $script:ScriptPath = Join-Path $PSScriptRoot '..\Share_Manager.ps1'
 $script:OriginalSkipEntryPoint = $env:SM_SKIP_ENTRYPOINT
 $env:SM_SKIP_ENTRYPOINT = '1'
 
-. $script:ScriptPath
-
 Describe "Share Manager core regressions" {
+$script:OriginalAppData = $env:APPDATA
+try {
+    $env:APPDATA = $TestDrive
+    . $script:ScriptPath
+}
+finally {
+    $env:APPDATA = $script:OriginalAppData
+}
+
     BeforeAll {
         $script:TestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("ShareManagerTests_" + [Guid]::NewGuid().ToString('N'))
         New-Item -Path $script:TestRoot -ItemType Directory -Force | Out-Null
@@ -198,7 +205,68 @@ Describe "Share Manager core regressions" {
         }
     }
 
+    Context "Credential argument boundaries" {
+        It "passes separate arguments for manual and generated AutoMap credentials" {
+            $sourceAst = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+            $autoMapSource = $sourceAst.Find({
+                param($node)
+                $node -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+                $node.Value -like '*function Set-AutoMapCredentialTarget*'
+            }, $true).Value
+            $autoMapAst = [System.Management.Automation.Language.Parser]::ParseInput($autoMapSource, [ref]$null, [ref]$null)
+            $definition = $autoMapAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Set-AutoMapCredentialTarget' }, $true)
+            . ([scriptblock]::Create($definition.Extent.Text))
+            function cmdkey {
+                $script:CapturedCredentialArguments = @($args | ForEach-Object { $_ })
+                $global:LASTEXITCODE = 0
+            }
+            $password = 'synthetic password & $value'
+            Invoke-CmdKeyAdd -Target 'server' -Username 'domain\test' -Password $password | Out-Null
+            $script:CapturedCredentialArguments.Count | Should Be 3
+            $script:CapturedCredentialArguments[0] | Should Be '/add:server'
+            $script:CapturedCredentialArguments[1] | Should Be '/user:domain\test'
+            $script:CapturedCredentialArguments[2] | Should Be ('/pass:' + $password)
+            Set-AutoMapCredentialTarget -ServerTarget '\\server' -Username 'domain\test' -Password $password | Out-Null
+            $script:CapturedCredentialArguments.Count | Should Be 3
+            $script:CapturedCredentialArguments[0] | Should Be '/add:\\server'
+            $script:CapturedCredentialArguments[1] | Should Be '/user:domain\test'
+            $script:CapturedCredentialArguments[2] | Should Be ('/pass:' + $password)
+        }
+
+        It "stops and removes a timed-out mapping job" {
+            $script:StoppedJob = $null
+            $script:RemovedJob = $null
+            function Start-Job { param($ScriptBlock, $ArgumentList) return 'test-job' }
+            function Wait-Job { param($Job, $Timeout) return $null }
+            function Stop-Job { [CmdletBinding()] param($Job) $script:StoppedJob = $Job }
+            function Remove-Job { param($Job, [switch]$Force) $script:RemovedJob = $Job }
+            $result = Invoke-NetUseWithCredential -DriveLetter Z -SharePath '\\server\share' -Username test -Password synthetic -PersistentFlag '/PERSISTENT:NO' -TimeoutSeconds 1
+            $result.ExitCode | Should Be 1460
+            $script:StoppedJob | Should Be 'test-job'
+            $script:RemovedJob | Should Be 'test-job'
+        }
+    }
+
     Context "Mapping reliability contract" {
+        It "refreshes persistent credentials without deleting them or blocking explicit mapping" {
+            Mock Get-PreferenceValue { if ($Name -eq 'PersistentMapping') { return $true }; return $Default }
+            Mock Test-DrivePath { return $false }
+            Mock Test-ShareOnline { return $true }
+            Mock Invoke-CmdKeyAdd { return [PSCustomObject]@{ ExitCode = 1; Output = 'synthetic failure' } }
+            Mock Invoke-CmdKeyDelete { throw 'Must not delete credentials during connect' }
+            Mock Invoke-CmdKeyList { throw 'Must not infer password freshness from username' }
+            Mock Invoke-NetUseWithCredential { return [PSCustomObject]@{ ExitCode = 0; Output = '' } }
+            Mock Set-MappedDriveLabel { }
+            Mock Install-LogonScript { }
+            Mock Write-ActionLog { }
+            $credential = New-Object System.Management.Automation.PSCredential('test-user', (ConvertTo-SecureString 'synthetic-new-password' -AsPlainText -Force))
+            $result = Connect-NetworkShare -DriveLetter Z -SharePath '\\srv\docs' -Credential $credential -Silent -ReturnStatus
+            $result.Success | Should Be $true
+            Assert-MockCalled Invoke-CmdKeyAdd -Times 2 -Exactly -Scope It -ParameterFilter { $Password -eq 'synthetic-new-password' }
+            Assert-MockCalled Invoke-NetUseWithCredential -Times 1 -Exactly -Scope It -ParameterFilter { $Username -eq 'test-user' -and $Password -eq 'synthetic-new-password' }
+            Assert-MockCalled Invoke-CmdKeyDelete -Times 0 -Exactly -Scope It
+        }
+
         It "creates both bare-server and UNC credential targets" {
             $targets = @(Get-CredentialTargetsForSharePath -SharePath '\\srv\docs')
 
@@ -208,7 +276,8 @@ Describe "Share Manager core regressions" {
 
         It "always passes supplied credentials to net use" {
             $connectText = (Get-Command Connect-NetworkShare).ScriptBlock.ToString()
-            $wrapperText = (Get-Command Invoke-NetUseWithCredential).ScriptBlock.ToString()
+            $sourceAst = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+            $wrapperText = $sourceAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-NetUseWithCredential' }, $true).Extent.Text
 
             $connectText | Should Match 'Invoke-NetUseWithCredential'
             $connectText | Should Match '-Username \$user'
@@ -230,6 +299,16 @@ Describe "Share Manager core regressions" {
     }
 
     Context "CLI disconnect reliability" {
+        It "dispatches Disconnect All even when no share appears connected" {
+            $cliAst = (Get-Command Start-CliMode).ScriptBlock.Ast
+            $switchAst = $cliAst.Find({ param($node) $node -is [System.Management.Automation.Language.SwitchStatementAst] }, $true)
+            $disconnectClause = @($switchAst.Clauses | Where-Object { $_.Item1.Value -eq 'D' })[0].Item2
+            Mock Disconnect-AllSharesCli { }
+            function Test-ShareConnection { return $false }
+            & ([scriptblock]::Create($disconnectClause.Extent.Text.TrimStart('{').TrimEnd('}')))
+            Assert-MockCalled Disconnect-AllSharesCli -Times 1 -Exactly -Scope It
+        }
+
         It "detects mappings visible to net use when Test-Path cannot see the drive" {
             Mock Test-DrivePath { return $false }
             Mock Invoke-NetUseQuery { return "Status       OK`r`nRemote name  \\srv\docs`r`n" }
@@ -348,7 +427,7 @@ Describe "Share Manager core regressions" {
 
             $scriptText | Should Match 'function Get-AutoMapCredentialTargets'
             $scriptText | Should Match 'function Set-AutoMapCredentialTarget'
-            $scriptText | Should Match 'cmdkey /delete:\$ServerTarget'
+            $scriptText | Should Not Match 'cmdkey /delete:\$ServerTarget'
             $scriptText | Should Match "'/add:' \+ \`$ServerTarget"
             $scriptText | Should Match 'foreach \(\$credentialTarget in @\(Get-AutoMapCredentialTargets -SharePath \$share\)\)'
             $scriptText | Should Match 'Set-AutoMapCredentialTarget -ServerTarget \$credentialTarget -Username \$user -Password \$plainPW'
@@ -369,6 +448,176 @@ Describe "Share Manager core regressions" {
             $scriptText | Should Match '\[string\]\$mapping\.Status -ne ''Unavailable'''
             $scriptText | Should Match 'New-SmbMapping -LocalPath \$Drive -RemotePath \$Share'
             $scriptText | Should Match 'Repair-AutoMapUnavailableSmbMapping -Drive \$drive -Share \$share -Username \$user -Password \$plainPW -Name \$name'
+        }
+    }
+
+    Context "Stable release updater" {
+        BeforeEach {
+            $script:UpdateTarget = Join-Path $script:TestRoot 'updater-target.ps1'
+            $script:UpdateDownload = Join-Path $script:TestRoot 'updater-download.ps1'
+            $script:OldUpdateContent = '$version = ''2.4.0''; function Connect-NetworkShare {}; function Start-CliMode {}; function Show-GUI {}'
+            $script:NewUpdateContent = $script:OldUpdateContent.Replace('2.4.0', '2.4.1')
+            [IO.File]::WriteAllText($script:UpdateTarget, $script:OldUpdateContent)
+            [IO.File]::WriteAllText($script:UpdateDownload, $script:NewUpdateContent)
+            $script:RawRelease = [PSCustomObject]@{
+                tag_name = 'V2.4.1'; draft = $false; prerelease = $false
+                assets = @([PSCustomObject]@{
+                    name = 'Share_Manager.ps1'; state = 'uploaded'
+                    digest = 'sha256:' + (Get-FileHash -LiteralPath $script:UpdateDownload -Algorithm SHA256).Hash
+                    size = (Get-Item -LiteralPath $script:UpdateDownload).Length
+                    browser_download_url = 'https://github.com/Dantdmnl/Share_Manager/releases/download/V2.4.1/Share_Manager.ps1'
+                })
+            }
+            Mock Invoke-WebRequest { Copy-Item -LiteralPath $script:UpdateDownload -Destination $OutFile }
+        }
+
+        It "accepts a stable release and compares versions numerically" {
+            $release = ConvertTo-ShareManagerReleaseInfo $script:RawRelease
+            $release.Version | Should Be '2.4.1'
+            ([version]'2.10.0' -gt [version]$release.Version) | Should Be $true
+        }
+
+        It "rejects prereleases and unsupported tags" {
+            $script:RawRelease.prerelease = $true
+            { ConvertTo-ShareManagerReleaseInfo $script:RawRelease } | Should Throw
+            $script:RawRelease.prerelease = $false
+            $script:RawRelease.tag_name = 'V2.4.1-preview'
+            { ConvertTo-ShareManagerReleaseInfo $script:RawRelease } | Should Throw
+        }
+
+        It "rejects missing digests, foreign URLs, and duplicate assets" {
+            $originalDigest = $script:RawRelease.assets[0].digest
+            $script:RawRelease.assets[0].digest = $null
+            { ConvertTo-ShareManagerReleaseInfo $script:RawRelease } | Should Throw
+            $script:RawRelease.assets[0].digest = $originalDigest
+            $script:RawRelease.assets[0].browser_download_url = 'https://example.com/Share_Manager.ps1'
+            { ConvertTo-ShareManagerReleaseInfo $script:RawRelease } | Should Throw
+            $script:RawRelease.assets += $script:RawRelease.assets[0]
+            { ConvertTo-ShareManagerReleaseInfo $script:RawRelease } | Should Throw
+        }
+
+        It "installs verified bytes and retains an exact backup" {
+            $release = ConvertTo-ShareManagerReleaseInfo $script:RawRelease
+            $installed = Install-ShareManagerUpdate -Release $release -CurrentScriptPath $script:UpdateTarget
+            [IO.File]::ReadAllText($script:UpdateTarget) | Should Be $script:NewUpdateContent
+            [IO.File]::ReadAllText($installed.BackupPath) | Should Be $script:OldUpdateContent
+            @(Get-ChildItem -LiteralPath $script:TestRoot -Filter '*.update.ps1' -Force).Count | Should Be 0
+        }
+
+        It "keeps the original script after download failure" {
+            Mock Invoke-WebRequest { throw 'synthetic network failure' }
+            $release = ConvertTo-ShareManagerReleaseInfo $script:RawRelease
+            { Install-ShareManagerUpdate -Release $release -CurrentScriptPath $script:UpdateTarget } | Should Throw
+            [IO.File]::ReadAllText($script:UpdateTarget) | Should Be $script:OldUpdateContent
+        }
+
+        It "rejects corrupted bytes without replacing the script" {
+            $release = ConvertTo-ShareManagerReleaseInfo $script:RawRelease
+            [IO.File]::WriteAllText($script:UpdateDownload, $script:NewUpdateContent.Replace('2.4.1', '9.9.9'))
+            { Install-ShareManagerUpdate -Release $release -CurrentScriptPath $script:UpdateTarget } | Should Throw
+            [IO.File]::ReadAllText($script:UpdateTarget) | Should Be $script:OldUpdateContent
+            @(Get-ChildItem -LiteralPath $script:TestRoot -Filter '*.update.ps1' -Force).Count | Should Be 0
+        }
+
+        It "rejects truncated downloads before replacing the script" {
+            $release = ConvertTo-ShareManagerReleaseInfo $script:RawRelease
+            [IO.File]::WriteAllText($script:UpdateDownload, 'truncated')
+            { Install-ShareManagerUpdate -Release $release -CurrentScriptPath $script:UpdateTarget } | Should Throw
+            [IO.File]::ReadAllText($script:UpdateTarget) | Should Be $script:OldUpdateContent
+            Assert-MockCalled Invoke-WebRequest -Times 1 -Exactly -Scope It
+        }
+
+        It "keeps the original when verified bytes contain invalid syntax" {
+            [IO.File]::WriteAllText($script:UpdateDownload, 'function {')
+            $script:RawRelease.assets[0].digest = 'sha256:' + (Get-FileHash -LiteralPath $script:UpdateDownload -Algorithm SHA256).Hash
+            $script:RawRelease.assets[0].size = (Get-Item -LiteralPath $script:UpdateDownload).Length
+            $release = ConvertTo-ShareManagerReleaseInfo $script:RawRelease
+            { Install-ShareManagerUpdate -Release $release -CurrentScriptPath $script:UpdateTarget } | Should Throw
+            [IO.File]::ReadAllText($script:UpdateTarget) | Should Be $script:OldUpdateContent
+            Assert-MockCalled Invoke-WebRequest -Times 1 -Exactly -Scope It
+        }
+
+        It "rejects a valid checksum when the script version disagrees with the tag" {
+            [IO.File]::WriteAllText($script:UpdateDownload, $script:NewUpdateContent.Replace('2.4.1', '2.4.2'))
+            $script:RawRelease.assets[0].digest = 'sha256:' + (Get-FileHash -LiteralPath $script:UpdateDownload -Algorithm SHA256).Hash
+            $release = ConvertTo-ShareManagerReleaseInfo $script:RawRelease
+            { Install-ShareManagerUpdate -Release $release -CurrentScriptPath $script:UpdateTarget } | Should Throw
+            [IO.File]::ReadAllText($script:UpdateTarget) | Should Be $script:OldUpdateContent
+        }
+
+        It "rejects scripts with parser errors or missing application functions" {
+            [IO.File]::WriteAllText($script:UpdateDownload, 'function {')
+            { Get-ShareManagerScriptVersion -Path $script:UpdateDownload } | Should Throw
+            [IO.File]::WriteAllText($script:UpdateDownload, '$version = ''2.4.1''')
+            { Get-ShareManagerScriptVersion -Path $script:UpdateDownload } | Should Throw
+        }
+
+        It "refuses repeat installs and downgrades before downloading" {
+            [IO.File]::WriteAllText($script:UpdateTarget, $script:NewUpdateContent)
+            $release = ConvertTo-ShareManagerReleaseInfo $script:RawRelease
+            { Install-ShareManagerUpdate -Release $release -CurrentScriptPath $script:UpdateTarget } | Should Throw
+            [IO.File]::WriteAllText($script:UpdateTarget, $script:NewUpdateContent.Replace('2.4.1', '2.5.0'))
+            { Install-ShareManagerUpdate -Release $release -CurrentScriptPath $script:UpdateTarget } | Should Throw
+            Assert-MockCalled Invoke-WebRequest -Times 0 -Exactly -Scope It
+        }
+
+        It "preserves local edits made during the download" {
+            Mock Invoke-WebRequest {
+                Copy-Item -LiteralPath $script:UpdateDownload -Destination $OutFile
+                [IO.File]::WriteAllText($script:UpdateTarget, '# concurrent edit')
+            }
+            $release = ConvertTo-ShareManagerReleaseInfo $script:RawRelease
+            { Install-ShareManagerUpdate -Release $release -CurrentScriptPath $script:UpdateTarget } | Should Throw
+            [IO.File]::ReadAllText($script:UpdateTarget) | Should Be '# concurrent edit'
+        }
+
+        It "does not install after the user declines" {
+            Mock Invoke-ShareManagerUpdateTask { return [PSCustomObject]@{ Version = '99.0.0'; ReleaseUrl = 'https://github.com/Dantdmnl/Share_Manager/releases' } }
+            Mock Read-Host { return 'n' }
+            Mock Write-Host { }
+            Update-ShareManager
+            Assert-MockCalled Invoke-ShareManagerUpdateTask -Times 0 -Exactly -Scope It -ParameterFilter { $Operation -eq 'Install' }
+        }
+    }
+
+    Context "Release CLI presentation" {
+        BeforeEach {
+            $script:MenuOutput = ''
+            Mock Clear-Host { }
+            Mock Write-Host {
+                $script:MenuOutput += [string]$Object
+                if (-not $NoNewline) { $script:MenuOutput += "`n" }
+            }
+            Mock Test-ShareConnection { return $DriveLetter -eq 'X' }
+        }
+
+        It "counts enabled disconnected shares and puts Updates before Quit" {
+            Mock Get-ShareConfiguration {
+                return @(
+                    [PSCustomObject]@{ DriveLetter = 'X'; Enabled = $true },
+                    [PSCustomObject]@{ DriveLetter = 'Y'; Enabled = $true },
+                    [PSCustomObject]@{ DriveLetter = 'Z'; Enabled = $false }
+                )
+            }
+            Show-CLI-Menu
+            $script:MenuOutput | Should Match 'SHARE MANAGER v2\.5\.0'
+            $script:MenuOutput | Should Match 'Connect All \(1 disconnected\)'
+            $script:MenuOutput | Should Match 'U - Updates'
+            ($script:MenuOutput.IndexOf('U - Updates') -lt $script:MenuOutput.IndexOf('Quit')) | Should Be $true
+        }
+
+        It "does not suggest connecting disabled shares" {
+            Mock Get-ShareConfiguration { return [PSCustomObject]@{ DriveLetter = 'Z'; Enabled = $false } }
+            Show-CLI-Menu
+            $script:MenuOutput | Should Match 'no enabled shares'
+            $script:MenuOutput | Should Match 'Disconnect All'
+            $script:MenuOutput | Should Not Match '\d+ disconnected'
+        }
+
+        It "shows Add Share only once for an empty configuration" {
+            Mock Get-ShareConfiguration { return @() }
+            Show-CLI-Menu
+            ([regex]::Matches($script:MenuOutput, '1 - Add')).Count | Should Be 1
         }
     }
 
