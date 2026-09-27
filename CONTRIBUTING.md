@@ -88,6 +88,20 @@ The repository provides custom analyzer settings:
 - `Debug/PSScriptAnalyzerSettings.psd1`
   - Excluded rules are documented and intentional (for example, `PSAvoidUsingWriteHost` for interactive scripts).
 
+## Release Validation
+
+In addition to the syntax and regression checks above, run the offline GUI updater smoke test:
+
+```powershell
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Debug\test_update_gui.ps1
+```
+
+It briefly displays two progress dialogs and verifies success/error handling without downloading or installing anything.
+
+Before publishing, test GUI update progress and prompts, read-only script folders, reconnect after a server password change, and Disconnect All with only red-X mappings on Windows 10/11. Automated credential tests use synthetic arguments and mocks; they do not modify Windows Credential Manager or connect to a real SMB server.
+
+Updater design references: [GitHub release API](https://docs.github.com/en/rest/releases/releases#get-the-latest-release), [release asset digests](https://docs.github.com/en/rest/releases/assets#get-a-release-asset), and [go-selfupdate's release filtering and checksum validation](https://github.com/creativeprojects/go-selfupdate). The Network Configuration script provided the backup/atomic replacement pattern.
+
 ## Factory Reset (Testing)
 
 To completely reset Share Manager during development/testing:

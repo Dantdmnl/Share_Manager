@@ -90,16 +90,6 @@ Close and reopen Share Manager after installing. Persistent AutoMap scripts are 
 
 Update checks send a request to GitHub; downloads also use GitHub's asset hosting. No share configuration, usernames, or saved credentials are included. GitHub receives ordinary connection metadata such as your public IP address.
 
-### Maintenance Validation
-
-Run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Debug\test_regression.ps1` and `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Debug\test_syntax.ps1`.
-
-Run `powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Debug\test_update_gui.ps1` for an offline GUI worker smoke test. It briefly displays two progress dialogs and verifies success/error handling without downloading or installing anything.
-
-Before publishing, test GUI update progress and prompts, read-only script folders, reconnect after a server password change, and Disconnect All with only red-X mappings on Windows 10/11. Automated credential tests use synthetic arguments and mocks; they do not modify Windows Credential Manager or connect to a real SMB server.
-
-Design references: [GitHub release API](https://docs.github.com/en/rest/releases/releases#get-the-latest-release), [release asset digests](https://docs.github.com/en/rest/releases/assets#get-a-release-asset), and [go-selfupdate's release filtering and checksum validation](https://github.com/creativeprojects/go-selfupdate). The local Network Configuration script provided the backup/atomic replacement pattern.
-
 ## Prerequisites
 
 - Windows OS with PowerShell 5.1 or higher.
