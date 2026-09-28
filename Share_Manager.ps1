@@ -39,8 +39,14 @@
 .PARAMETER StartupMode
     Optional. Pass "CLI" or "GUI" to force that mode on launch, bypassing saved preference.
 
+.PARAMETER CleanupData
+    Preview obsolete rotated log archives and updater backups beside this script.
+
+.PARAMETER ApplyCleanup
+    With CleanupData, delete preview-eligible archives and updater backups. Other files are preserved.
+
 .VERSION
-    2.5.1
+    2.5.2
 
 .NOTES
     - No administrator permissions required
@@ -52,12 +58,14 @@
 #>
 
 param(
-    [string]$StartupMode
+    [string]$StartupMode,
+    [switch]$CleanupData,
+    [switch]$ApplyCleanup
 )
 
 #region Global Variables (Version, Paths, Defaults)
 
-$version        = '2.5.1'
+$version        = '2.5.2'
 $author         = 'Dantdmnl'
 $script:ApplicationPath = $PSCommandPath
 
@@ -391,6 +399,93 @@ function Set-TerminalBlackBackground {
     }
 }
 
+function Get-DataCleanupCandidates {
+    param([string]$Folder = $baseFolder, [datetime]$Now = (Get-Date))
+    if (-not (Test-Path -LiteralPath $Folder -PathType Container)) { return }
+    $root = Get-Item -LiteralPath $Folder -Force -ErrorAction Stop
+    if ($root.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Cleanup refuses a linked application data folder.' }
+    $archives = @(Get-ChildItem -LiteralPath $root.FullName -File -Force | Where-Object {
+        -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -and
+        $_.Name -match '^(Share_Manager|LogonScript)(\.events)?_\d{4}-\d{2}-\d{2}_\d{6}\.(log|jsonl)$'
+    })
+    foreach ($stream in @('Share_Manager', 'Share_Manager.events', 'LogonScript', 'LogonScript.events')) {
+        $extension = if ($stream.EndsWith('.events')) { 'jsonl' } else { 'log' }
+        $pattern = '^' + [regex]::Escape($stream) + '_(\d{4}-\d{2}-\d{2}_\d{6})\.' + $extension + '$'
+        $ordered = @($archives | Where-Object { $_.Name -match $pattern } | Sort-Object Name -Descending)
+        foreach ($file in @($ordered | Select-Object -Skip 2)) {
+            $null = $file.Name -match $pattern
+            $archivedAt = [datetime]::MinValue
+            if (-not [datetime]::TryParseExact($Matches[1], 'yyyy-MM-dd_HHmmss', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$archivedAt)) { continue }
+            if ($archivedAt -lt $Now.AddDays(-90) -and $file.LastWriteTime -lt $Now.AddDays(-90)) { $file }
+        }
+    }
+}
+
+function Get-UpdateBackupCleanupCandidates {
+    param([string]$CurrentScriptPath, [datetime]$Now = (Get-Date))
+    if (-not $CurrentScriptPath -or -not (Test-Path -LiteralPath $CurrentScriptPath -PathType Leaf)) { return }
+    $scriptFile = Get-Item -LiteralPath $CurrentScriptPath -Force -ErrorAction Stop
+    $root = Get-Item -LiteralPath $scriptFile.DirectoryName -Force -ErrorAction Stop
+    if ($scriptFile.Extension -ne '.ps1' -or
+        ($scriptFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        ($root.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return }
+    $pattern = '^' + [regex]::Escape($scriptFile.Name) + '\.(\d{8}-\d{6})\.[0-9a-f]{32}\.bak$'
+    $backups = @(Get-ChildItem -LiteralPath $root.FullName -File -Force -ErrorAction Stop | Where-Object {
+        $_.Name -match $pattern -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint)
+    } | Sort-Object Name -Descending)
+    foreach ($file in @($backups | Select-Object -Skip 2)) {
+        $null = $file.Name -match $pattern
+        $createdAt = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact($Matches[1], 'yyyyMMdd-HHmmss', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$createdAt)) { continue }
+        if ($createdAt -lt $Now.AddDays(-90) -and $file.LastWriteTime -lt $Now.AddDays(-90)) { $file }
+    }
+}
+
+function Invoke-DataCleanup {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([string]$Folder = $baseFolder, [switch]$Apply, [string]$CurrentScriptPath)
+    $rootPath = [IO.Path]::GetFullPath($Folder).TrimEnd('\')
+    $allowedRoots = @($rootPath)
+    if ($CurrentScriptPath) { $allowedRoots += [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($CurrentScriptPath)).TrimEnd('\') }
+    $candidates = @(Get-DataCleanupCandidates -Folder $Folder)
+    $candidates += @(Get-UpdateBackupCleanupCandidates -CurrentScriptPath $CurrentScriptPath)
+    foreach ($candidate in $candidates) {
+        $status = 'Preview'
+        if ($Apply -and $PSCmdlet.ShouldProcess($candidate.FullName, 'Delete expired log archive or updater backup')) {
+            try {
+                $candidateRoot = $candidate.DirectoryName.TrimEnd('\')
+                if ($candidateRoot -notin $allowedRoots) { throw 'File is outside the cleanup folders.' }
+                $root = Get-Item -LiteralPath $candidateRoot -Force -ErrorAction Stop
+                $current = Get-Item -LiteralPath $candidate.FullName -Force -ErrorAction Stop
+                if (($root.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                    ($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                    $current.PSIsContainer -or $current.DirectoryName.TrimEnd('\') -ne $candidateRoot -or
+                    $current.Length -ne $candidate.Length -or $current.LastWriteTimeUtc -ne $candidate.LastWriteTimeUtc) {
+                    throw 'File changed or no longer resides directly in the application folder.'
+                }
+                Remove-Item -LiteralPath $current.FullName -ErrorAction Stop
+                $status = 'Removed'
+            } catch { $status = 'Failed'; Write-Warning "Could not clean $($candidate.Name): $($_.Exception.Message)" }
+        }
+        [PSCustomObject]@{ Name = $candidate.Name; Bytes = $candidate.Length; Status = $status; Folder = $candidate.DirectoryName }
+    }
+}
+
+function Invoke-StartupDataCleanup {
+    try {
+        $results = @(Invoke-DataCleanup -CurrentScriptPath $script:ApplicationPath -Apply -Confirm:$false -WarningAction SilentlyContinue -ErrorAction Stop)
+        $removed = @($results | Where-Object { $_.Status -eq 'Removed' }).Count
+        $failed = @($results | Where-Object { $_.Status -eq 'Failed' }).Count
+        if ($removed -gt 0 -or $failed -gt 0) {
+            $level = if ($failed -gt 0) { 'WARN' } else { 'INFO' }
+            Write-ActionLog -Message "Archive cleanup: $removed removed, $failed failed." -Level $level -Category 'Maintenance'
+        }
+    } catch {
+        # Maintenance must not prevent the application from opening.
+        try { Write-ActionLog -Message "Archive cleanup skipped: $($_.Exception.Message)" -Level WARN -Category 'Maintenance' } catch { }
+    }
+}
+
 function Invoke-LogFileRotation {
     param(
         [Parameter(Mandatory)] [string]$Path,
@@ -513,7 +608,7 @@ function Write-ActionLog {
     }
 }
 
-Invoke-LogRotation
+if (-not $CleanupData -and -not $ApplyCleanup) { Invoke-LogRotation }
 
 #region New Multi-Share Functions
 
@@ -6018,7 +6113,7 @@ function Install-LogonScript {
     $ps1Path = Join-Path $baseFolder 'Share_Manager_AutoMap.ps1'
     $cmdPath = Join-Path $startupFolder 'Share_Manager_AutoMap.cmd'
     $logonScript = @'
-# Auto-generated by Share Manager v2.5.1 (multi-share, DPAPI-protected)
+# Auto-generated by Share Manager v2.5.2 (multi-share, DPAPI-protected)
 # Production-ready with enhanced error handling, network checks, and retry logic
 param()
 $baseFolder = Join-Path $env:APPDATA "Share_Manager"
@@ -6070,7 +6165,7 @@ function Write-Log {
         correlationId = $null
         sessionId     = $sessionId
         pid           = $PID
-        ver           = '2.5.1'
+        ver           = '2.5.2'
         data          = $Data
     }
     ($evt | ConvertTo-Json -Compress) | Out-File -FilePath $eventsPath -Encoding UTF8 -Append
@@ -6363,7 +6458,7 @@ $psVersion = $PSVersionTable.PSVersion.ToString()
 $psEditionInfo = $PSVersionTable.PSEdition
 
 Write-Log -Message "========================================" -Category 'AutoMap'
-Write-Log -Message "AutoMap start (v2.5.1)" -Category 'AutoMap' -Data @{ psVersion = $psVersion; psEdition = $psEditionInfo }
+Write-Log -Message "AutoMap start (v2.5.2)" -Category 'AutoMap' -Data @{ psVersion = $psVersion; psEdition = $psEditionInfo }
 Write-Log -Message "Environment: PowerShell $psVersion ($psEditionInfo)" -Level DEBUG -Category 'AutoMap'
 try {
     $executionContextInfo = Get-AutoMapExecutionContext
@@ -10377,6 +10472,17 @@ public class ListViewItemComparer : IComparer {
 
 # Allow test harnesses to load functions without executing startup flow.
 if ($env:SM_SKIP_ENTRYPOINT -eq '1') { return }
+
+if ($ApplyCleanup -and -not $CleanupData) { throw 'Use -CleanupData with -ApplyCleanup. Run -CleanupData alone to preview first.' }
+if ($CleanupData) {
+    $cleanupResults = @(Invoke-DataCleanup -CurrentScriptPath $script:ApplicationPath -Apply:$ApplyCleanup)
+    if ($cleanupResults.Count) { $cleanupResults | Format-Table -AutoSize }
+    else { Write-Host 'No old log archives or updater backups are eligible for cleanup.' }
+    if (-not $ApplyCleanup) { Write-Host 'Preview only. Add -ApplyCleanup to delete eligible files. Recent rollback backups and active data are preserved.' }
+    return
+}
+
+Invoke-StartupDataCleanup
 
 # Log script startup
 Write-ActionLog -Message "Share Manager v$version starting" -Level INFO -Category 'Startup' -Data @{ 

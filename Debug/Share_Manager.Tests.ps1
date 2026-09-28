@@ -548,6 +548,92 @@ finally {
         }
     }
 
+    Context "Conservative data cleanup" {
+        BeforeEach {
+            $cleanupFolder = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $cleanupFolder | Out-Null
+            foreach ($name in @('Share_Manager_2020-01-01_000000.log', 'Share_Manager_2020-02-01_000000.log', 'Share_Manager_2020-03-01_000000.log', 'shares_preimport_20200101_000000.json', 'creds.json', 'Share_Manager.log', 'unknown.log')) {
+                $path = Join-Path $cleanupFolder $name
+                Set-Content -LiteralPath $path -Value 'fixture'
+                (Get-Item -LiteralPath $path).LastWriteTime = [datetime]'2020-01-01'
+            }
+        }
+        It "previews only old recognized archives while retaining the newest two" {
+            $result = @(Invoke-DataCleanup -Folder $cleanupFolder)
+            $result.Count | Should Be 1
+            $result[0].Name | Should Be 'Share_Manager_2020-01-01_000000.log'
+            $result[0].Status | Should Be 'Preview'
+            @(Get-ChildItem -LiteralPath $cleanupFolder).Count | Should Be 7
+        }
+        It "deletes only eligible archives on explicit apply" {
+            $result = @(Invoke-DataCleanup -Folder $cleanupFolder -Apply -Confirm:$false)
+            $result[0].Status | Should Be 'Removed'
+            @(Get-ChildItem -LiteralPath $cleanupFolder).Count | Should Be 6
+            (Test-Path -LiteralPath (Join-Path $cleanupFolder 'creds.json')) | Should Be $true
+            (Test-Path -LiteralPath (Join-Path $cleanupFolder 'shares_preimport_20200101_000000.json')) | Should Be $true
+        }
+        It "honors WhatIf and preserves recently modified archives" {
+            Invoke-DataCleanup -Folder $cleanupFolder -Apply -WhatIf | Out-Null
+            @(Get-ChildItem -LiteralPath $cleanupFolder).Count | Should Be 7
+            (Get-Item -LiteralPath (Join-Path $cleanupFolder 'Share_Manager_2020-01-01_000000.log')).LastWriteTime = Get-Date
+            @(Get-DataCleanupCandidates -Folder $cleanupFolder).Count | Should Be 0
+        }
+    }
+
+    Context "Automatic startup cleanup" {
+        It "applies cleanup without prompting and logs the result" {
+            function Invoke-DataCleanup {
+                [CmdletBinding(SupportsShouldProcess)] param([switch]$Apply, $CurrentScriptPath)
+                $Apply.IsPresent | Should Be $true
+                $PSBoundParameters['Confirm'] | Should Be $false
+                return [PSCustomObject]@{ Status = 'Removed' }
+            }
+            function Write-ActionLog { param($Message, $Level, $Category) $script:CleanupMessage = $Message }
+            Invoke-StartupDataCleanup
+            $script:CleanupMessage | Should Match '1 removed, 0 failed'
+        }
+        It "does not stop startup when cleanup or logging fails" {
+            function Invoke-DataCleanup { [CmdletBinding(SupportsShouldProcess)] param([switch]$Apply, $CurrentScriptPath) throw 'Synthetic access denied' }
+            function Write-ActionLog { param($Message, $Level, $Category) throw 'Synthetic log failure' }
+            { Invoke-StartupDataCleanup } | Should Not Throw
+        }
+    }
+
+    Context "Updater backup retention" {
+        BeforeEach {
+            $backupFolder = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $backupFolder | Out-Null
+            $targetScript = Join-Path $backupFolder 'Custom Manager.ps1'
+            Set-Content -LiteralPath $targetScript -Value '# fixture'
+            $oldBackup = $null
+            foreach ($stamp in @('20200101-000000', '20200201-000000', '20200301-000000')) {
+                $path = $targetScript + '.' + $stamp + '.' + [guid]::NewGuid().ToString('N') + '.bak'
+                Set-Content -LiteralPath $path -Value 'backup'
+                (Get-Item -LiteralPath $path).LastWriteTime = [datetime]'2020-01-01'
+                if (-not $oldBackup) { $oldBackup = $path }
+            }
+            Set-Content -LiteralPath ($targetScript + '.bak') -Value 'manual backup'
+            Set-Content -LiteralPath (Join-Path $backupFolder 'Other.ps1.20200101-000000.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bak') -Value 'other script'
+        }
+        It "previews exact updater backups without touching manual or other-script backups" {
+            $result = @(Invoke-DataCleanup -Folder $backupFolder -CurrentScriptPath $targetScript)
+            $result.Count | Should Be 1
+            $result[0].Status | Should Be 'Preview'
+            (Test-Path -LiteralPath $oldBackup) | Should Be $true
+        }
+        It "keeps two rollback backups on apply and honors WhatIf" {
+            Invoke-DataCleanup -Folder $backupFolder -CurrentScriptPath $targetScript -Apply -WhatIf | Out-Null
+            (Test-Path -LiteralPath $oldBackup) | Should Be $true
+            Invoke-DataCleanup -Folder $backupFolder -CurrentScriptPath $targetScript -Apply -Confirm:$false | Out-Null
+            (Test-Path -LiteralPath $oldBackup) | Should Be $false
+            @(Get-ChildItem -LiteralPath $backupFolder).Count | Should Be 5
+        }
+        It "preserves recently modified backups despite old filename timestamps" {
+            (Get-Item -LiteralPath $oldBackup).LastWriteTime = Get-Date
+            @(Get-UpdateBackupCleanupCandidates -CurrentScriptPath $targetScript).Count | Should Be 0
+        }
+    }
+
     Context "Category suggestions" {
         It "offers starter categories without creating empty filters" {
             function Get-CachedConfig { return [PSCustomObject]@{ Shares = @() } }

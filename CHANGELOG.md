@@ -4,7 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
-## [Unreleased]
+## [2.5.2] - 2026-09-28
+
+### Added
+- Include updater-generated rollback backups beside the running script in startup cleanup and manual previews. Retain the newest two and all backups under 90 days old; preserve manual backups and backups belonging to other scripts. Never clean during update installation.
+- Automatic old-log cleanup at normal Share Manager startup, retaining two archives per log stream and 90 days of archives. Preserve active data, credentials, backups, unknown files, and linked files/directories. Cleanup failures do not block startup. `-CleanupData` remains preview-only; `-CleanupData -ApplyCleanup` applies manually.
 
 ### Fixed
 - Regression runner invoked from PowerShell 7 now delegates to Windows PowerShell 5.1 and reports its host, avoiding false failures in Pester 3.4 exception assertions. Custom test paths and child exit codes are preserved.

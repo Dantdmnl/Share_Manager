@@ -3,7 +3,7 @@
 ![GUI Screenshot](GUI.png)
 ![CLI Screenshot](CLI.png)
 
-- **Latest release:** 2.5.1
+- **Latest release:** 2.5.2
 - **Author:** Dantdmnl
 - **License:** See [LICENSE](LICENSE)
 
@@ -42,7 +42,13 @@ The following improvements are included in 2.5.1. Screenshots above show 2.5.0.
 
 AutoMap progress and actionable failures are in `%APPDATA%\Share_Manager\LogonScript.log`. Detailed DEBUG events are retained in `LogonScript.events.jsonl`, not the normal text log. Saved credentials must be readable by the Windows account signing in; copying another user's DPAPI credential file is not sufficient.
 
-### Release Highlights (v2.5.1)
+### Release Highlights (v2.5.2)
+
+- **Automatic housekeeping** - Remove eligible old log archives and updater rollback backups at normal startup, retaining the newest two per stream/script and everything under 90 days old.
+- **Preview before manual cleanup** - Use `-CleanupData` to list candidates without deleting anything. Credentials, configuration, active logs, and unrelated backups remain protected.
+- **Test runner compatibility** - Direct invocation from PowerShell 7 runs the regression suite in Windows PowerShell 5.1.
+
+### Previous Release (v2.5.1)
 
 - **Reliable AutoMap startup** - Direct share attempts, explicit credentials, bounded retries, and verified drive access before reporting success.
 - **Simpler share editing** - Reuse saved credentials, change passwords directly, and see which other shares are affected.
@@ -102,6 +108,16 @@ AutoMap progress and actionable failures are in `%APPDATA%\Share_Manager\LogonSc
 
 ## Updating Share Manager
 
+### AppData and Update Backup Cleanup
+
+Normal Share Manager startup automatically cleans eligible old log archives and updater rollback backups. Cleanup failures are logged without preventing startup. AutoMap alone does not run cleanup.
+
+For a non-destructive preview, run `.\Share_Manager.ps1 -CleanupData`. To apply cleanup manually, run `.\Share_Manager.ps1 -CleanupData -ApplyCleanup`. Both commands exit without opening the GUI or CLI menu; preview mode does not run automatic cleanup.
+
+Cleanup retains the newest two archives per log stream and all archives less than 90 days old. Only recognized, timestamped Share Manager and AutoMap log archives directly inside `%APPDATA%\Share_Manager` are eligible. Active logs, connection history, configuration, credentials, AutoMap scripts, pre-import backups, exported backups, legacy recovery files, and unknown files are preserved.
+
+Updater backups beside the running script have a separate retention rule: keep the newest two plus anything under 90 days old. Only filenames matching `<current-script>.yyyyMMdd-HHmmss.<32-character-GUID>.bak` qualify. Manual `.bak` files and backups for other scripts are untouched. Cleanup runs on subsequent normal launches, not during update installation; the newly created rollback backup is retained. Preview output includes each file's folder.
+
 Version 2.5.0 includes an optional updater. The CLI and GUI screenshots above show this version.
 
 ### Checking for Updates
@@ -112,7 +128,7 @@ The updater uses the latest stable release from this repository and its `Share_M
 
 The current script is replaced atomically, with a timestamped `.bak` file beside it. Local script customizations are replaced, but configurations and saved credentials in `%APPDATA%\Share_Manager` are not changed by the updater. The script folder must be writable. Download or validation failures leave the current script in place. Equal versions and downgrades are refused.
 
-Close and reopen Share Manager after installing. Persistent AutoMap scripts are regenerated through the normal startup flow when persistent mapping is enabled. To roll back, close Share Manager and replace the script with the saved `.bak` copy, retaining the `.ps1` filename. Backups are retained until you remove them.
+Close and reopen Share Manager after installing. Persistent AutoMap scripts are regenerated through the normal startup flow when persistent mapping is enabled. To roll back, close Share Manager and replace the script with the saved `.bak` copy, retaining the `.ps1` filename. Starting in 2.5.2, updater backups follow the cleanup retention rule above; copy a backup to a separate location if you need to retain it indefinitely.
 
 Update checks send a request to GitHub; downloads also use GitHub's asset hosting. No share configuration, usernames, or saved credentials are included. GitHub receives ordinary connection metadata such as your public IP address.
 
