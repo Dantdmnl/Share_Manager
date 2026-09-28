@@ -15,8 +15,23 @@ param(
     [string]$TestsPath = "$PSScriptRoot\Share_Manager.Tests.ps1"
 )
 
+# Pester 3.4 exception assertions misbehave in modern PowerShell. Always test
+# the application's compatibility baseline, including when invoked from pwsh.
+if ($PSVersionTable.PSEdition -eq 'Core') {
+    $windowsPowerShell = if ($env:SystemRoot) {
+        Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    } else { $null }
+    if (-not $windowsPowerShell -or -not (Test-Path -LiteralPath $windowsPowerShell)) {
+        Write-Host '[X] These compatibility tests require Windows PowerShell 5.1.' -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "Running compatibility tests in Windows PowerShell 5.1 (invoked from PowerShell $($PSVersionTable.PSVersion))." -ForegroundColor Cyan
+    & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -TestsPath $TestsPath
+    exit $LASTEXITCODE
+}
+
 try {
-    $resolvedTests = Resolve-Path -Path $TestsPath -ErrorAction Stop
+    $resolvedTests = Resolve-Path -LiteralPath $TestsPath -ErrorAction Stop
 }
 catch {
     Write-Host "[X] Test file not found: $TestsPath" -ForegroundColor Red
@@ -38,6 +53,7 @@ Write-Host "`n================================================================" 
 Write-Host "  SHARE MANAGER - REGRESSION TESTS" -ForegroundColor Cyan
 Write-Host "================================================================" -ForegroundColor Cyan
 Write-Host "  Pester: $($pesterModule.Version)" -ForegroundColor Gray
+Write-Host "  Host  : PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))" -ForegroundColor Gray
 Write-Host "  Tests : $resolvedTests`n" -ForegroundColor Gray
 
 $results = Invoke-Pester -Script $resolvedTests -PassThru

@@ -60,6 +60,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Debug\test_syntax.ps1
 
 Run regression tests:
 
+Direct invocation of `Debug/test_regression.ps1` from PowerShell 7 automatically launches Windows PowerShell 5.1 with no profile. The runner displays the tested host and propagates its exit code. This avoids Pester 3.4 exception-assertion incompatibilities in modern PowerShell; it validates the 5.1 baseline, not PowerShell 7 runtime compatibility.
+
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Debug\test_regression.ps1
 ```

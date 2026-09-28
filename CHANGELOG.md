@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [Unreleased]
+
+### Fixed
+- Regression runner invoked from PowerShell 7 now delegates to Windows PowerShell 5.1 and reports its host, avoiding false failures in Pester 3.4 exception assertions. Custom test paths and child exit codes are preserved.
+
 ## [2.5.1] - 2026-09-28
 
 ### Changed
