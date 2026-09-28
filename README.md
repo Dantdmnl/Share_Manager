@@ -3,7 +3,7 @@
 ![GUI Screenshot](GUI.png)
 ![CLI Screenshot](CLI.png)
 
-- **Version:** 2.5.0
+- **Latest release:** 2.5.1
 - **Author:** Dantdmnl
 - **License:** See [LICENSE](LICENSE)
 
@@ -23,7 +23,33 @@ Easily manage and map network shares using this PowerShell script with support f
 - **No administrator permissions required**
 - **Persistent mapping** - Automatic reconnection at Windows logon
 
-### Release Highlights (v2.5.0)
+### Working With Shares
+
+The following improvements are included in 2.5.1. Screenshots above show 2.5.0.
+
+**Categories:** GUI Add/Edit and CLI Edit suggest General, Home, Work, Backups, Media, and Projects. You can still enter a custom category. Suggestions do not create shares or add unused categories to the filter list.
+
+**Credentials:** GUI Add/Edit offers saved usernames; CLI lists them. Select an existing username to reuse its saved credential, or enter a new username and password. Ordinary edits keep usable credentials without another prompt. Credentials remain shared by username, not copied into each share.
+
+- In CLI Edit, enter `/password` at the username prompt to update its saved password immediately. Enter at the password prompt keeps the existing password and continues editing. A username without a usable saved credential still requires a password.
+- In GUI Edit, **Change password...** opens the credential dialog immediately. Credential changes save separately from share settings; cancelling the share dialog does not undo a saved password change.
+- Replacing a password warns about other shares using that username. Those shares will use the replacement on subsequent connections; existing sessions are not automatically reconnected.
+- If credentials cannot be saved, the Add/Edit workflow stops instead of reporting success. The storage format is unchanged.
+
+**Network paths:** GUI Add/Edit trims surrounding whitespace and matching quotes. An accidental backtick and extra separator before the server name produces a correction suggestion requiring confirmation. Characters inside share and folder names are preserved.
+
+**Automatic reconnection:** Run Share Manager normally, without administrator rights, with persistent mapping enabled to regenerate AutoMap after updating. AutoMap attempts configured shares directly, retries transient failures up to three times with 30-second delays, and checks drive access before reporting success. It does not continuously monitor a VPN that connects after the startup retry window.
+
+AutoMap progress and actionable failures are in `%APPDATA%\Share_Manager\LogonScript.log`. Detailed DEBUG events are retained in `LogonScript.events.jsonl`, not the normal text log. Saved credentials must be readable by the Windows account signing in; copying another user's DPAPI credential file is not sufficient.
+
+### Release Highlights (v2.5.1)
+
+- **Reliable AutoMap startup** - Direct share attempts, explicit credentials, bounded retries, and verified drive access before reporting success.
+- **Simpler share editing** - Reuse saved credentials, change passwords directly, and see which other shares are affected.
+- **Friendlier setup** - Starter category suggestions, confirmed UNC corrections, and accurate save-failure reporting.
+- **Quieter logs** - Normal AutoMap logs show progress and failures; detailed DEBUG information stays in the events file.
+
+### Previous Release (v2.5.0)
 
 - **Optional updater** - Check stable GitHub releases from the CLI or GUI, verify the downloaded script, and keep a backup before replacement.
 - **Credential reliability** - Correct Credential Manager argument boundaries, refresh changed passwords for the same username, and retain explicit credentials for mapping even if credential storage fails.
@@ -230,7 +256,7 @@ The script file (`Share_Manager.ps1`) remains intact. On next run, first-time se
   - `%APPDATA%\Share_Manager\Share_Manager.events.jsonl` (structured events for analysis)
   - `%APPDATA%\Share_Manager\LogonScript.log` (AutoMap startup script log)
   - `%APPDATA%\Share_Manager\LogonScript.events.jsonl` (AutoMap structured events)
-- **Logon Script**: `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Share_Manager_AutoMap.ps1` (if persistent mapping is enabled)
+- **Logon Script**: `%APPDATA%\Share_Manager\Share_Manager_AutoMap.ps1`, launched by `Share_Manager_AutoMap.cmd` in the current user's Startup folder (if persistent mapping is enabled).
 - **Credential Backups**: `%APPDATA%\Share_Manager\creds_backup_YYYY-MM-DD_HHmmss.json` (when exported)
 - **Legacy Files**: `config.json` and `cred.txt` (auto-migrated to v2 format with backups)
 

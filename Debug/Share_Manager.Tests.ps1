@@ -444,10 +444,308 @@ finally {
         It "repairs red-X unavailable SMB mappings before remapping" {
             $scriptText = Get-Content -Path $script:ScriptPath -Raw
 
-            $scriptText | Should Match 'function Repair-AutoMapUnavailableSmbMapping'
-            $scriptText | Should Match '\[string\]\$mapping\.Status -ne ''Unavailable'''
+            $scriptText | Should Match 'function Get-AutoMapSmbMapping'
             $scriptText | Should Match 'New-SmbMapping -LocalPath \$Drive -RemotePath \$Share'
-            $scriptText | Should Match 'Repair-AutoMapUnavailableSmbMapping -Drive \$drive -Share \$share -Username \$user -Password \$plainPW -Name \$name'
+            $scriptText | Should Match 'Reconnect in place first'
+        }
+    }
+
+    Context "Friendly GUI network path entry" {
+        It "trims pasted whitespace and matching surrounding quotes" {
+            (ConvertTo-UncPathInput -Path '  "\\server\share"  ').Path | Should Be '\\server\share'
+            (ConvertTo-UncPathInput -Path "  '\\server\share'  ").Path | Should Be '\\server\share'
+        }
+        It "suggests the malformed server prefix without silently changing it" {
+            $result = ConvertTo-UncPathInput -Path '\\`\192.168.1.2\backup'
+            $result.Path | Should Be '\\`\192.168.1.2\backup'
+            $result.Suggestion | Should Be '\\192.168.1.2\backup'
+        }
+        It "preserves backticks inside share and folder names" {
+            $result = ConvertTo-UncPathInput -Path '\\server\back`up\folder`name'
+            $result.Path | Should Be '\\server\back`up\folder`name'
+            $result.Suggestion | Should BeNullOrEmpty
+        }
+        It "supports omitted UNC prefixes and leaves empty input invalid" {
+            (ConvertTo-UncPathInput -Path 'server\share').Path | Should Be '\\server\share'
+            (Test-ValidUncPath -Path (ConvertTo-UncPathInput -Path ' ').Path) | Should Be $false
+        }
+    }
+
+    Context "Shared share credential workflow" {
+        BeforeEach {
+            function Get-ShareConfiguration { return @([PSCustomObject]@{ Name = 'Other share'; Username = 'test' }) }
+            function Write-Host { param($Object, $ForegroundColor) }
+            function Get-CredentialForShare { param($Username) return (New-Object System.Management.Automation.PSCredential('test', (ConvertTo-SecureString synthetic -AsPlainText -Force))) }
+            function Save-Credential { param($Credential, [switch]$PassThru) $script:CredentialWrites++; return $true }
+            $script:CredentialWrites = 0
+        }
+        It "reuses a saved credential without writing or prompting for a password" {
+            function Read-Host { param($Prompt) return '' }
+            function Read-Password { param($Prompt) throw 'Unexpected password prompt' }
+            (Confirm-ShareCredential -Username test) | Should Be $true
+            $script:CredentialWrites | Should Be 0
+        }
+        It "cancels without writing credentials" {
+            function Read-Host { param($Prompt) return 'C' }
+            (Confirm-ShareCredential -Username test) | Should Be $false
+            $script:CredentialWrites | Should Be 0
+        }
+
+        It "keeps unchanged credentials without asking any questions" {
+            function Read-Host { param($Prompt) throw 'Unexpected prompt' }
+            (Confirm-ShareCredential -Username test -KeepExisting) | Should Be $true
+            $script:CredentialWrites | Should Be 0
+        }
+
+        It "requires confirmation for an explicit password replacement" {
+            function Read-Host { param($Prompt) return 'N' }
+            function Read-Password { param($Prompt) throw 'Unexpected password capture' }
+            (Confirm-ShareCredential -Username test -KeepExisting -ReplaceExisting) | Should Be $false
+            $script:CredentialWrites | Should Be 0
+        }
+
+        It "goes directly to password entry when only the edited share uses it" {
+            function Get-ShareConfiguration { return @([PSCustomObject]@{ Id = 'current'; Name = 'Test'; Username = 'test' }) }
+            function Read-Host { param($Prompt) throw 'Unnecessary confirmation' }
+            function Read-Password { param($Prompt) return (ConvertTo-SecureString replacement -AsPlainText -Force) }
+            (Confirm-ShareCredential -Username test -ReplaceExisting -ShareId current) | Should Be $true
+            $script:CredentialWrites | Should Be 1
+        }
+
+        It "continues editing with the existing password after empty replacement input" {
+            function Get-ShareConfiguration { return @() }
+            function Read-Password { param($Prompt) return (New-Object System.Security.SecureString) }
+            (Confirm-ShareCredential -Username test -ReplaceExisting -ShareId current) | Should Be $true
+            $script:CredentialWrites | Should Be 0
+        }
+
+        It "does not accept empty input when no saved credential exists" {
+            function Get-CredentialForShare { param($Username) return $null }
+            function Get-ShareConfiguration { return @() }
+            function Read-Password { param($Prompt) return (New-Object System.Security.SecureString) }
+            (Confirm-ShareCredential -Username test -ReplaceExisting -ShareId current) | Should Be $false
+            $script:CredentialWrites | Should Be 0
+        }
+
+        It "still captures missing credentials when keeping the username" {
+            function Get-CredentialForShare { param($Username) return $null }
+            function Get-ShareConfiguration { return @() }
+            function Read-Password { param($Prompt) return (ConvertTo-SecureString synthetic -AsPlainText -Force) }
+            (Confirm-ShareCredential -Username test -KeepExisting) | Should Be $true
+            $script:CredentialWrites | Should Be 1
+        }
+        It "replaces a credential only after the explicit update choice" {
+            function Read-Host { param($Prompt) return 'U' }
+            function Read-Password { param($Prompt) return (ConvertTo-SecureString replacement -AsPlainText -Force) }
+            (Confirm-ShareCredential -Username test) | Should Be $true
+            $script:CredentialWrites | Should Be 1
+        }
+        It "propagates a credential save failure" {
+            function Read-Host { param($Prompt) return 'U' }
+            function Read-Password { param($Prompt) return (ConvertTo-SecureString replacement -AsPlainText -Force) }
+            function Save-Credential { param($Credential, [switch]$PassThru) return $false }
+            (Confirm-ShareCredential -Username test) | Should Be $false
+        }
+    }
+
+    Context "Category suggestions" {
+        It "offers starter categories without creating empty filters" {
+            function Get-CachedConfig { return [PSCustomObject]@{ Shares = @() } }
+            @(Get-ShareCategories -IncludeSuggestions).Count | Should Be 6
+            @(Get-ShareCategories).Count | Should Be 1
+        }
+        It "preserves custom categories without duplicating defaults" {
+            function Get-CachedConfig { return [PSCustomObject]@{ Shares = @([PSCustomObject]@{ Category = 'home' }, [PSCustomObject]@{ Category = 'Archive' }) } }
+            $categories = @(Get-ShareCategories -IncludeSuggestions)
+            $categories.Count | Should Be 7
+            ($categories -contains 'Archive') | Should Be $true
+            @($categories | Where-Object { $_ -eq 'Home' }).Count | Should Be 1
+        }
+    }
+
+    Context "First-time setup save failures" {
+        It "stops CLI setup when preferences cannot be saved" {
+            function Set-TerminalBlackBackground { param([switch]$Refresh) }
+            function Read-Host { param($Prompt) return '' }
+            function Write-Host { param($Object, $ForegroundColor) }
+            function Import-AllShares { return (New-DefaultSharesConfig) }
+            function Get-CachedConfig { return (New-DefaultSharesConfig) }
+            function Save-AllShares { param($Config) return $false }
+            function Clear-ConfigCache { $script:SetupCacheCleared = $true }
+            $script:SetupCacheCleared = $false
+            $result = Initialize-Config-CLI
+            $result | Should Be $false
+            $script:SetupCacheCleared | Should Be $true
+        }
+
+        It "reports failed replacement and preserves the previous configuration" {
+            $sharesPath = Join-Path $TestDrive 'failed-save.json'
+            $UseGUI = $false
+            $original = '{"Shares":[],"marker":"original"}'
+            Set-Content -LiteralPath $sharesPath -Value $original
+            function Move-Item {
+                [CmdletBinding()] param($LiteralPath, $Destination, [switch]$Force)
+                Write-Error 'Synthetic replacement failure'
+            }
+            function Write-ActionLog { param($Message, $Level, $Category, $Data) }
+            (Save-AllShares -Config (New-DefaultSharesConfig)) | Should Be $false
+            (Get-Content -LiteralPath $sharesPath -Raw).Trim() | Should Be $original
+            (Test-Path -LiteralPath "$sharesPath.tmp") | Should Be $false
+        }
+    }
+
+    Context "AutoMap authentication and access" {
+        BeforeEach {
+            $sourceAst = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+            $autoSource = $sourceAst.Find({ param($node) $node -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $node.Value -like '*function Set-AutoMapCredentialTarget*' }, $true).Value
+            $autoErrors = $null
+            $autoAst = [System.Management.Automation.Language.Parser]::ParseInput($autoSource, [ref]$null, [ref]$autoErrors)
+            $autoErrors.Count | Should Be 0
+            foreach ($definition in @($autoAst.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] })) {
+                . ([scriptblock]::Create($definition.Extent.Text))
+            }
+            $loop = $autoAst.Find({ param($node) $node -is [System.Management.Automation.Language.ForEachStatementAst] -and $node.Extent.Text -like 'foreach ($s in $cfg.Shares)*' }, $true)
+            $script:AutoLoop = [scriptblock]::Create($loop.Extent.Text)
+            $script:NativeCalls = 0
+            $script:FallbackCalls = 0
+            $script:DeletedMappings = 0
+            $script:MapCalls = 0
+            $script:WorkerResult = $null
+            function Start-Job { param($ScriptBlock, $ArgumentList) $workerArguments = @($ArgumentList); $script:WorkerResult = & $ScriptBlock @workerArguments; return 'synthetic-job' }
+            function Wait-Job { param($Job, $Timeout) return $Job }
+            function Receive-Job { [CmdletBinding()] param($Job) return $script:WorkerResult }
+            function Stop-Job { [CmdletBinding()] param($Job) }
+            function Remove-Job { [CmdletBinding()] param($Job, [switch]$Force) }
+            function net { $script:FallbackCalls++; $global:LASTEXITCODE = 0 }
+            function New-SmbMapping {
+                [CmdletBinding()] param($LocalPath, $RemotePath, $UserName, $Password, $Persistent, [switch]$SaveCredentials)
+                $script:NativeCalls++
+                $script:NativePassword = $Password
+                $script:NativeSaved = $SaveCredentials.IsPresent
+            }
+            function Write-Log { param($Message, $Level, $Category, $Data) }
+            function Get-AutoMapLocalDrive { param($Drive) return $null }
+            function Get-AutoMapSmbMapping { param($Drive) return $null }
+            function Invoke-AutoMapNetUseQuery { param($Drive, $TimeoutSeconds) return '' }
+        }
+
+        It "saves explicitly supplied credentials through the SMB API" {
+            $result = Invoke-AutoMapNetUseMap -Drive 'Z:' -Share '\\srv\docs' -Username 'test' -Password 'synthetic "& password' -TimeoutSeconds 5
+            $result.ExitCode | Should Be 0
+            $script:NativeCalls | Should Be 1
+            $script:NativeSaved | Should Be $true
+            $script:NativePassword | Should Be 'synthetic "& password'
+            $script:FallbackCalls | Should Be 0
+        }
+
+        It "uses explicit net use directly when the server credential was prepared" {
+            function net { $script:FallbackArguments = @($args); $script:FallbackCalls++; $global:LASTEXITCODE = 0 }
+            $result = Invoke-AutoMapNetUseMap -Drive 'Z:' -Share '\\\\srv\docs' -Username test -Password synthetic -TimeoutSeconds 5 -CredentialPrepared $true
+            $result.ExitCode | Should Be 0
+            $result.Backend | Should Be 'net use'
+            $result.SaveErrorCode | Should BeNullOrEmpty
+            $script:NativeCalls | Should Be 0
+            $script:FallbackCalls | Should Be 1
+            ($script:FallbackArguments -contains '/USER:test') | Should Be $true
+            ($script:FallbackArguments -contains 'synthetic') | Should Be $true
+            ($script:FallbackArguments -contains '/PERSISTENT:YES') | Should Be $true
+        }
+
+        It "retains the explicit net use fallback if saving SMB credentials fails" {
+            function New-SmbMapping { [CmdletBinding()] param($LocalPath, $RemotePath, $UserName, $Password, $Persistent, [switch]$SaveCredentials) throw 'Synthetic policy restriction' }
+            function net { $script:FallbackArguments = @($args); $script:FallbackCalls++; $global:LASTEXITCODE = 0 }
+            $result = Invoke-AutoMapNetUseMap -Drive 'Z:' -Share '\\srv\docs' -Username test -Password synthetic -TimeoutSeconds 5
+            $result.ExitCode | Should Be 0
+            $script:FallbackCalls | Should Be 1
+            ($script:FallbackArguments -contains '/USER:test') | Should Be $true
+            ($script:FallbackArguments -contains 'synthetic') | Should Be $true
+        }
+
+        It "does not retry rejected SMB credentials through net use" {
+            function New-SmbMapping {
+                [CmdletBinding()] param($LocalPath, $RemotePath, $UserName, $Password, $Persistent, [switch]$SaveCredentials)
+                throw (New-Object System.Runtime.InteropServices.COMException('Synthetic logon failure', -2147023570))
+            }
+            $result = Invoke-AutoMapNetUseMap -Drive 'Z:' -Share '\\srv\docs' -Username test -Password synthetic -TimeoutSeconds 5
+            $result.ExitCode | Should Be 1326
+            $script:FallbackCalls | Should Be 0
+        }
+
+        It "refuses to switch identities when the configured password is missing" {
+            $result = Invoke-AutoMapNetUseMap -Drive 'Z:' -Share '\\srv\docs' -Username test -TimeoutSeconds 5
+            $result.ExitCode | Should Be 1326
+            $script:NativeCalls | Should Be 0
+            $script:FallbackCalls | Should Be 0
+        }
+
+        It "records the SMB fallback reason without exposing the password" {
+            function New-SmbMapping {
+                [CmdletBinding()] param($LocalPath, $RemotePath, $UserName, $Password, $Persistent, [switch]$SaveCredentials)
+                throw "Synthetic rejection of $Password"
+            }
+            $result = Invoke-AutoMapNetUseMap -Drive 'Z:' -Share '\\\\srv\docs' -Username test -Password secret123 -TimeoutSeconds 5
+            $result.ExitCode | Should Be 0
+            $result.SaveErrorType | Should Not BeNullOrEmpty
+            $result.SaveErrorMessage | Should Match '\[REDACTED\]'
+            $result.SaveErrorMessage | Should Not Match 'secret123'
+        }
+
+        It "checks the drive root literally rather than a remembered mapping entry" {
+            function Test-Path { [CmdletBinding()] param($LiteralPath, $PathType) $script:ProbePath = $LiteralPath; return $false }
+            (Test-AutoMapDriveAccess -Drive 'Z:' -TimeoutSeconds 5) | Should Be $false
+            $script:ProbePath | Should Be 'Z:\'
+        }
+
+        It "does not count a successful mapping command as accessible" {
+            $cfg = [PSCustomObject]@{ Shares = @([PSCustomObject]@{ Enabled = $true; DriveLetter = 'Z'; SharePath = '\\srv\docs'; Username = 'test'; Name = 'Test' }) }
+            $credMap = @{ test = (ConvertTo-SecureString synthetic -AsPlainText -Force) }
+            $successCount = 0; $failCount = 0; $skipCount = 0; $netUseTimeoutSeconds = 5
+            function Set-AutoMapCredentialTarget { param($ServerTarget, $Username, $Password) return @{ Updated = $true; ExitCode = 0 } }
+            function Repair-AutoMapUnavailableSmbMapping { param($Drive, $Share, $Username, $Password, $Name) return $false }
+            function Get-AutoMapSmbMapping { param($Drive) return $null }
+            function Invoke-AutoMapNetUseQuery { param($Drive) return '' }
+            function Invoke-AutoMapNetUseMap { param($Drive, $Share, $Username, $Password, $TimeoutSeconds) $script:MapCalls++; return @{ ExitCode = 0; Output = '' } }
+            function Test-AutoMapDriveAccess { param($Drive, $TimeoutSeconds) return $false }
+            function Start-Sleep { param($Seconds) }
+            . $script:AutoLoop
+            $successCount | Should Be 0
+            $failCount | Should Be 1
+            $script:MapCalls | Should Be 3
+        }
+
+        It "attempts the configured share directly and recovers from transient network failures" {
+            $autoSource | Should Not Match 'Test-NetworkAvailable|Get-NetIPAddress|Get-NetAdapter|8\.8\.8\.8'
+            $cfg = [PSCustomObject]@{ Shares = @([PSCustomObject]@{ Enabled = $true; DriveLetter = 'Z'; SharePath = '\\srv\docs'; Username = 'test'; Name = 'Test' }) }
+            $credMap = @{ test = (ConvertTo-SecureString synthetic -AsPlainText -Force) }
+            $successCount = 0; $failCount = 0; $skipCount = 0; $netUseTimeoutSeconds = 5
+            function Set-AutoMapCredentialTarget { param($ServerTarget, $Username, $Password) return @{ Updated = $true; ExitCode = 0 } }
+            function Repair-AutoMapUnavailableSmbMapping { param($Drive, $Share, $Username, $Password, $Name) return $false }
+            function Get-AutoMapSmbMapping { param($Drive) return $null }
+            function Invoke-AutoMapNetUseQuery { param($Drive) return '' }
+            function Invoke-AutoMapNetUseMap {
+                param($Drive, $Share, $Username, $Password, $TimeoutSeconds)
+                $script:MapCalls++
+                if ($script:MapCalls -lt 3) { return @{ ExitCode = 2; Output = 'System error 53' } }
+                return @{ ExitCode = 0; Output = '' }
+            }
+            function Test-AutoMapDriveAccess { param($Drive, $TimeoutSeconds) return $true }
+            function Start-Sleep { param($Seconds) }
+            . $script:AutoLoop
+            $script:MapCalls | Should Be 3
+            $successCount | Should Be 1
+            $failCount | Should Be 0
+        }
+
+        It "leaves existing mappings untouched when credentials cannot be loaded" {
+            $cfg = [PSCustomObject]@{ Shares = @([PSCustomObject]@{ Enabled = $true; DriveLetter = 'Z'; SharePath = '\\srv\docs'; Username = 'test'; Name = 'Test' }) }
+            $credMap = @{}
+            $successCount = 0; $failCount = 0; $skipCount = 0
+            function Invoke-AutoMapNetUseDelete { param($Drive) $script:DeletedMappings++ }
+            function Invoke-AutoMapNetUseMap { param($Drive, $Share, $Username, $Password, $TimeoutSeconds) $script:MapCalls++ }
+            . $script:AutoLoop
+            $failCount | Should Be 1
+            $script:DeletedMappings | Should Be 0
+            $script:MapCalls | Should Be 0
         }
     }
 
@@ -600,7 +898,7 @@ finally {
                 )
             }
             Show-CLI-Menu
-            $script:MenuOutput | Should Match 'SHARE MANAGER v2\.5\.0'
+            $script:MenuOutput | Should Match ('SHARE MANAGER v' + [regex]::Escape($version))
             $script:MenuOutput | Should Match 'Connect All \(1 disconnected\)'
             $script:MenuOutput | Should Match 'U - Updates'
             ($script:MenuOutput.IndexOf('U - Updates') -lt $script:MenuOutput.IndexOf('Quit')) | Should Be $true

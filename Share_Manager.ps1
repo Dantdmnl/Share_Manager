@@ -25,7 +25,7 @@
     - Credentials stored per-user, per-machine (non-portable)
     - Special characters in passwords properly handled via cmdkey
     
-    Production Enhancements (v2.5.0+):
+    Production Enhancements (v2.5.1+):
     - Atomic file operations prevent configuration corruption
     - Automatic backup before destructive operations
     - Enhanced UNC path validation with auto-correction
@@ -40,7 +40,7 @@
     Optional. Pass "CLI" or "GUI" to force that mode on launch, bypassing saved preference.
 
 .VERSION
-    2.5.0
+    2.5.1
 
 .NOTES
     - No administrator permissions required
@@ -57,7 +57,7 @@ param(
 
 #region Global Variables (Version, Paths, Defaults)
 
-$version        = '2.5.0'
+$version        = '2.5.1'
 $author         = 'Dantdmnl'
 $script:ApplicationPath = $PSCommandPath
 
@@ -924,15 +924,15 @@ function Save-AllShares {
         
         try {
             # Write to temp file
-            $newJson | Set-Content -Path $tempPath -Encoding UTF8 -Force
+            $newJson | Set-Content -LiteralPath $tempPath -Encoding UTF8 -Force -ErrorAction Stop
             
             # Create backup of existing config if it exists
             if (Test-Path $sharesPath) {
-                Copy-Item -Path $sharesPath -Destination $backupPath -Force
+                Copy-Item -LiteralPath $sharesPath -Destination $backupPath -Force -ErrorAction Stop
             }
             
             # Atomic rename (overwrites destination)
-            Move-Item -Path $tempPath -Destination $sharesPath -Force
+            Move-Item -LiteralPath $tempPath -Destination $sharesPath -Force -ErrorAction Stop
             
             # Clean up backup on success
             if (Test-Path $backupPath) {
@@ -946,7 +946,7 @@ function Save-AllShares {
         catch {
             # Restore from backup if write failed
             if (Test-Path $backupPath) {
-                Copy-Item -Path $backupPath -Destination $sharesPath -Force
+                Copy-Item -LiteralPath $backupPath -Destination $sharesPath -Force -ErrorAction Stop
                 Remove-Item -Path $backupPath -Force -ErrorAction SilentlyContinue
                 Write-ActionLog -Message "Restored config from backup after failed write" -Level WARN -Category 'Config'
             }
@@ -1171,12 +1171,16 @@ function Get-ShareCategories {
     .SYNOPSIS
         Gets list of all unique categories
     #>
+    param([switch]$IncludeSuggestions)
+    $defaults = @('General', 'Home', 'Work', 'Backups', 'Media', 'Projects')
     $config = Get-CachedConfig
     if ($config -and $config.Shares) {
         $categories = @($config.Shares | Where-Object { $_.PSObject.Properties['Category'] -and -not [string]::IsNullOrWhiteSpace($_.Category) } | Select-Object -ExpandProperty Category -Unique | Sort-Object)
+        if ($IncludeSuggestions) { return @($defaults) + @($categories | Where-Object { $_ -notin $defaults }) }
         if ($categories.Count -eq 0) { return @('General') }
         return $categories
     }
+    if ($IncludeSuggestions) { return $defaults }
     return @('General')
 }
 
@@ -1843,7 +1847,7 @@ function Get-Key {
 }
 
 function Save-Credential {
-    param ([System.Management.Automation.PSCredential]$Credential)
+    param ([System.Management.Automation.PSCredential]$Credential, [switch]$PassThru)
 
     # Save credential by username in JSON store using DPAPI encryption
     try {
@@ -1870,17 +1874,18 @@ function Save-Credential {
         }
         
         # Persist JSON
-        $store | ConvertTo-Json -Depth 5 | Set-Content -Path $credentialsStorePath -Encoding UTF8 -Force
+        $store | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $credentialsStorePath -Encoding UTF8 -Force -ErrorAction Stop
 
         # Silent in GUI (caller handles messaging), verbose in CLI
         if (-not $UseGUI) {
             Write-Host "  [OK] Credentials saved for $user" -ForegroundColor Green
         }
         Write-ActionLog -Message "Saved credential for $user" -Level DEBUG -Category 'Credentials'
+        if ($PassThru) { return $true }
     }
     catch {
         if ($UseGUI) {
-            [System.Windows.Forms.MessageBox]::Show(
+            [void][System.Windows.Forms.MessageBox]::Show(
                 "Error: Failed to save credentials.`n$_",
                 "Share Manager v$version",
                 [System.Windows.Forms.MessageBoxButtons]::OK,
@@ -1891,6 +1896,7 @@ function Save-Credential {
             Write-Host "Error: Failed to save credentials: $_" -ForegroundColor Red
         }
         Write-ActionLog -Message "Failed to save credential: $_" -Level ERROR -Category 'Credentials' -Data @{ error = ("$_") }
+        if ($PassThru) { return $false }
     }
 }
 
@@ -2321,6 +2327,40 @@ function Read-Password {
 #endregion
 
 #region Network Check & Mapping Functions
+
+function ConvertTo-UncPathInput {
+    param([string]$Path)
+    $value = $Path.Trim()
+    if ($value.Length -ge 2 -and (($value[0] -eq '"' -and $value[$value.Length - 1] -eq '"') -or
+        ($value[0] -eq "'" -and $value[$value.Length - 1] -eq "'"))) {
+        $value = $value.Substring(1, $value.Length - 2).Trim()
+    }
+    $suggestion = $null
+    # Only repair the accidental backtick/separator before the server, never path components.
+    if ($value.StartsWith('\\`\')) { $suggestion = '\\' + $value.Substring(4) }
+    if ($value -and -not $value.StartsWith('\')) { $value = '\\' + $value }
+    [PSCustomObject]@{ Path = $value; Suggestion = $suggestion }
+}
+
+function Resolve-GuiUncPathInput {
+    param([string]$Path)
+    $inputPath = ConvertTo-UncPathInput -Path $Path
+    if ($inputPath.Suggestion) {
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            "There is a stray backtick and separator before the server name. Use this path instead?`n`n$($inputPath.Suggestion)",
+            'Confirm Network Path', [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Question)
+        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return $null }
+        $inputPath.Path = $inputPath.Suggestion
+    }
+    if (-not (Test-ValidUncPath -Path $inputPath.Path)) {
+        [void][System.Windows.Forms.MessageBox]::Show('Enter a network path such as \\server\share. A server and share name are both required.',
+            'Invalid Network Path', [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning)
+        return $null
+    }
+    return $inputPath.Path
+}
 
 function Test-ValidUncPath {
     <#
@@ -3228,7 +3268,11 @@ function Initialize-Config-CLI {
     $config.Preferences.UnmapOldMapping = $autoUnmap
     $config.Preferences.Theme = $themeChoice
     $config.Preferences.SyncShareNameToDriveLabel = $syncLabel
-    Save-AllShares -Config $config | Out-Null
+    if (-not (Save-AllShares -Config $config)) {
+        Clear-ConfigCache
+        Write-Host "  Preferences could not be saved. Check folder permissions and available disk space, then retry setup." -ForegroundColor Red
+        return $false
+    }
     
     Write-Host ""
     Write-Host "  [OK] Preferences saved!" -ForegroundColor Green
@@ -3401,7 +3445,10 @@ function Initialize-Config-GUI {
     if ($prefValues.PSObject.Properties['SyncShareNameToDriveLabel']) {
         $config.Preferences.SyncShareNameToDriveLabel = [bool]$prefValues.SyncShareNameToDriveLabel
     }
-    Save-AllShares -Config $config | Out-Null
+    if (-not (Save-AllShares -Config $config)) {
+        Clear-ConfigCache
+        return $false
+    }
     
     # Step 2: Ask if user wants to import from backup or add manually
     $setupChoice = [System.Windows.Forms.MessageBox]::Show(
@@ -3429,7 +3476,8 @@ function Initialize-Config-GUI {
                 $totalShares = $cfg.Shares.Count
                 $msgParts = @("Import complete!")
                 if ($importResult.Added -gt 0) { $msgParts += "$($importResult.Added) new share(s) added" }
-                if ($importResult.Skipped -gt 0) { $msgParts += "$($importResult.Skipped) existing share(s) updated" }
+                if ($importResult.Updated -gt 0) { $msgParts += "$($importResult.Updated) existing share(s) updated" }
+                if ($importResult.Skipped -gt 0) { $msgParts += "$($importResult.Skipped) share(s) skipped" }
                 $msgParts += "`nTotal shares: $totalShares"
                 $msgParts += "`nNote: Credentials were not included in the backup."
                 $msgParts += "You'll be prompted for credentials when connecting shares."
@@ -3506,6 +3554,67 @@ function Initialize-Config-GUI {
 #endregion
 
 #region Credential GUI Form
+
+function Confirm-ShareCredential {
+    param([string]$Username, [switch]$Gui, [switch]$KeepExisting, [switch]$ReplaceExisting, [string]$ShareId)
+    $Username = $Username.Trim()
+    if (-not $Username) { return $false }
+    $existing = Get-CredentialForShare -Username $Username
+    if ($existing -and $KeepExisting -and -not $ReplaceExisting) { return $true }
+    $linked = @((Get-ShareConfiguration) | Where-Object { $_.Username -eq $Username -and (-not $ShareId -or $_.Id -ne $ShareId) } | ForEach-Object { $_.Name })
+    $usage = if ($linked.Count) { "Used by: " + ($linked -join ', ') } else { 'No existing shares use this username.' }
+    if ($existing -and $ReplaceExisting) {
+        $question = "Replace the saved password for $Username ?`n`n$usage"
+        if ($linked.Count -eq 0) {
+            # The explicit change-password action is sufficient for an unshared credential.
+        } elseif ($Gui) {
+            if ([System.Windows.Forms.MessageBox]::Show($question, 'Replace Shared Password', 'YesNo', 'Warning') -ne 'Yes') { return $false }
+        } else {
+            Write-Host "  $usage" -ForegroundColor Yellow
+            if ((Read-Host "  Replace the saved password for $Username for all linked shares? (Y/N) [N]") -ne 'Y') { return $false }
+        }
+    } elseif ($existing) {
+        if ($Gui) {
+            $answer = [System.Windows.Forms.MessageBox]::Show(
+                "Reuse the saved credential for $Username ?`n`n$usage`n`nYes: reuse. No: replace the password for all linked shares. Cancel: return without saving the share.",
+                'Share Credential', [System.Windows.Forms.MessageBoxButtons]::YesNoCancel, [System.Windows.Forms.MessageBoxIcon]::Question)
+            if ($answer -eq 'Yes') { return $true }
+            if ($answer -ne 'No') { return $false }
+        } else {
+            Write-Host "  $usage" -ForegroundColor Gray
+            do { $answer = Read-Host "  Credential for $Username - reuse [R], replace for all linked shares [U], cancel [C] (default R)" } while ($answer -notmatch '^(|R|U|C)$')
+            if ($answer -eq '' -or $answer -eq 'R') { return $true }
+            if ($answer -eq 'C') { return $false }
+        }
+    } elseif ($linked.Count) {
+        if ($Gui) {
+            if ([System.Windows.Forms.MessageBox]::Show("Saving a password for $Username also affects these shares:`n$usage`n`nContinue?", 'Shared Credential', 'YesNo', 'Warning') -ne 'Yes') { return $false }
+        } else {
+            Write-Host "  $usage" -ForegroundColor Yellow
+            if ((Read-Host '  Save a password for all these shares? (Y/N) [N]') -ne 'Y') { return $false }
+        }
+    }
+    if ($Gui) {
+        $credential = Show-CredentialForm -Username $Username -Message "Credential for $Username"
+        if (-not $credential) { return $false }
+        if ($credential.UserName -ne $Username) {
+            [void][System.Windows.Forms.MessageBox]::Show('Change the username in the share dialog first, then save again.', 'Username Changed')
+            return $false
+        }
+    } else {
+        $passwordPrompt = if ($existing) { '  New password (Enter keeps existing): ' } else { '  Password (empty cancels): ' }
+        $password = Read-Password $passwordPrompt
+        if (-not $password -or $password.Length -eq 0) {
+            if ($existing) {
+                Write-Host '  Password unchanged.' -ForegroundColor Gray
+                return $true
+            }
+            return $false
+        }
+        $credential = New-Object System.Management.Automation.PSCredential($Username, $password)
+    }
+    return (Save-Credential -Credential $credential -PassThru)
+}
 
 function Get-RecentUsernames {
     <#
@@ -4349,7 +4458,7 @@ function Edit-ShareCli {
     $num = 0
     
     if ([int]::TryParse($choice, [ref]$num) -and $num -gt 0 -and $num -le $shares.Count) {
-        $share = $shares[$num - 1]
+        $share = $shares[$num - 1] | ConvertTo-Json -Depth 10 | ConvertFrom-Json
         
         Write-Host ""
         Write-Host "  Editing: $($share.Name)" -ForegroundColor Cyan
@@ -4383,11 +4492,16 @@ function Edit-ShareCli {
         }
         
         # Username
+        Write-Host "  Saved credentials: $((@(Get-RecentUsernames)) -join ', ')" -ForegroundColor Gray
+        Write-Host "  Enter keeps credentials; /password updates this share's saved password." -ForegroundColor DarkGray
         Write-Host "  Username [$($share.Username)]: " -NoNewline
         $newUser = Read-Host
-        if (-not [string]::IsNullOrWhiteSpace($newUser)) {
-            $share.Username = $newUser
+        $changePassword = ($newUser.Trim() -eq '/password')
+        $keepCredential = [string]::IsNullOrWhiteSpace($newUser) -or $newUser.Trim() -eq $share.Username
+        if (-not $changePassword -and -not [string]::IsNullOrWhiteSpace($newUser)) {
+            $share.Username = $newUser.Trim()
         }
+        if (-not (Confirm-ShareCredential -Username $share.Username -KeepExisting:$keepCredential -ReplaceExisting:$changePassword -ShareId $share.Id)) { return }
         
         # Description
         Write-Host "  Description [$($share.Description)]: " -NoNewline
@@ -4398,11 +4512,9 @@ function Edit-ShareCli {
         
         # Category
         $currentCategory = if ($share.PSObject.Properties['Category']) { $share.Category } else { "General" }
+        Write-Host "  Categories: $((Get-ShareCategories -IncludeSuggestions) -join ', ')" -ForegroundColor Gray
         Write-Host "  Category [$currentCategory]: " -NoNewline
         $newCategory = Read-Host
-        if (-not [string]::IsNullOrWhiteSpace($newCategory)) {
-            Set-ShareCategory -ShareId $share.Id -Category $newCategory
-        }
         
         # Enabled
         Write-Host "  Enabled [$($share.Enabled)] (Y/N/blank): " -NoNewline
@@ -4424,6 +4536,9 @@ function Edit-ShareCli {
             -Enabled $share.Enabled
         
         if ($result) {
+            if (-not [string]::IsNullOrWhiteSpace($newCategory)) {
+                Set-ShareCategory -ShareId $share.Id -Category $newCategory
+            }
             Write-Host ""
             Write-Host "  [OK] Share updated!" -ForegroundColor Green
         } else {
@@ -4634,6 +4749,7 @@ function Add-NewShareCli {
         
         # Step 4: Username
         if ([string]::IsNullOrWhiteSpace($username)) {
+            Write-Host "  Saved credentials: $((@(Get-RecentUsernames)) -join ', ')" -ForegroundColor Gray
             Write-Host "  Username" -ForegroundColor White
             Write-Host "  (Username for authentication, e.g., DOMAIN\user or user)" -ForegroundColor DarkGray
             $username = Read-ValidatedInput -ErrorMessage "Username required"
@@ -4743,6 +4859,8 @@ function Add-NewShareCli {
         return
     }
     
+    $username = $username.Trim()
+    if (-not (Confirm-ShareCredential -Username $username)) { return }
     # Add the share
     $result = Add-ShareConfiguration -Name $name -SharePath $sharePath -DriveLetter $driveLetter -Username $username -Description $description
     
@@ -5900,7 +6018,7 @@ function Install-LogonScript {
     $ps1Path = Join-Path $baseFolder 'Share_Manager_AutoMap.ps1'
     $cmdPath = Join-Path $startupFolder 'Share_Manager_AutoMap.cmd'
     $logonScript = @'
-# Auto-generated by Share Manager v2.5.0 (multi-share, DPAPI-protected)
+# Auto-generated by Share Manager v2.5.1 (multi-share, DPAPI-protected)
 # Production-ready with enhanced error handling, network checks, and retry logic
 param()
 $baseFolder = Join-Path $env:APPDATA "Share_Manager"
@@ -5939,7 +6057,9 @@ function Write-Log {
     if (-not (Test-Path $eventsPath))  { New-Item -Path $eventsPath -ItemType File -Force | Out-Null }
     $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
     $prefix = if ($Category) { "[$Level][$Category]" } else { "[$Level]" }
-    "$ts`t$prefix $Message" | Out-File -FilePath $logPath -Encoding UTF8 -Append
+    if ($Level -ne 'DEBUG') {
+        "$ts`t$prefix $Message" | Out-File -FilePath $logPath -Encoding UTF8 -Append
+    }
     # GDPR: no personal data in structured logs
     $evt = [ordered]@{
         ts            = (Get-Date).ToString("o")
@@ -5950,45 +6070,10 @@ function Write-Log {
         correlationId = $null
         sessionId     = $sessionId
         pid           = $PID
-        ver           = '2.5.0'
+        ver           = '2.5.1'
         data          = $Data
     }
     ($evt | ConvertTo-Json -Compress) | Out-File -FilePath $eventsPath -Encoding UTF8 -Append
-}
-
-function Test-NetworkAvailable {
-    # Robust network check - works with multiple adapters (Ethernet + WiFi)
-    try {
-        # Method 1: Check for valid IP addresses (most reliable)
-        $ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | 
-               Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' -and $_.PrefixOrigin -ne 'WellKnown' }
-        if ($ips -and $ips.Count -gt 0) {
-            return $true
-        }
-        
-        # Method 2: Check for adapters with status 'Up' AND valid IP configuration
-        $adapters = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
-        if ($adapters -and $adapters.Count -gt 0) {
-            # Verify at least one has a valid IP (not APIPA)
-            foreach ($adapter in $adapters) {
-                $adapterIPs = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-                              Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' }
-                if ($adapterIPs -and $adapterIPs.Count -gt 0) {
-                    return $true
-                }
-            }
-        }
-        
-        return $false
-    } catch {
-        # Fallback: Try basic connectivity test
-        try {
-            $result = Test-Connection -ComputerName 8.8.8.8 -Count 1 -Quiet -ErrorAction SilentlyContinue
-            return $result
-        } catch {
-            return $false
-        }
-    }
 }
 
 function Convert-SecureStringToPlainText {
@@ -6007,19 +6092,54 @@ function Convert-SecureStringToPlainText {
 }
 
 function Invoke-AutoMapNetUseDelete {
-    param([string]$Drive)
+    param([string]$Drive, [int]$TimeoutSeconds = 15)
 
-    $output = net use $Drive /DELETE /Y 2>&1
-    return [PSCustomObject]@{
-        Output = ($output | Out-String)
-        ExitCode = $LASTEXITCODE
+    $job = $null
+    try {
+        $job = Start-Job -ScriptBlock {
+            param($drive)
+            Add-Type -TypeDefinition @"
+using System.Runtime.InteropServices;
+public static class ShareManagerDisconnect {
+    [DllImport("mpr.dll", CharSet = CharSet.Unicode)]
+    public static extern int WNetCancelConnection2W(string name, int flags, bool force);
+}
+"@
+            # Keep the remembered profile and refuse to close open files.
+            $code = [ShareManagerDisconnect]::WNetCancelConnection2W($drive, 0, $false)
+            [PSCustomObject]@{ ExitCode = $code; Output = "Disconnect returned $code." }
+        } -ArgumentList $Drive
+        if (Wait-Job -Job $job -Timeout $TimeoutSeconds) {
+            return Receive-Job -Job $job -ErrorAction Stop
+        }
+        return [PSCustomObject]@{ ExitCode = 1460; Output = 'Disconnect timed out.' }
+    } catch {
+        return [PSCustomObject]@{ ExitCode = 1; Output = 'Disconnect failed.' }
+    } finally {
+        if ($job) {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
 function Invoke-AutoMapNetUseQuery {
-    param([string]$Drive)
+    param([string]$Drive, [int]$TimeoutSeconds = 15)
 
-    return (net use $Drive 2>&1 | Out-String)
+    $job = $null
+    try {
+        $job = Start-Job -ScriptBlock {
+            param($drive)
+            if ($drive) { net use $drive 2>&1 | Out-String } else { net use 2>&1 | Out-String }
+        } -ArgumentList $Drive
+        if (Wait-Job -Job $job -Timeout $TimeoutSeconds) { return Receive-Job -Job $job -ErrorAction Stop }
+        throw 'Mapping query timed out.'
+    } finally {
+        if ($job) {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Get-AutoMapServerTarget {
@@ -6044,7 +6164,7 @@ function Get-AutoMapCredentialTargets {
 function Get-AutoMapServerConnections {
     param([string]$ServerTarget)
 
-    $allConnections = net use 2>&1 | Out-String
+    try { $allConnections = Invoke-AutoMapNetUseQuery -Drive '' } catch { return @() }
     $escaped = [regex]::Escape($ServerTarget)
     $matches = @()
     foreach ($line in ($allConnections -split "`r?`n")) {
@@ -6081,58 +6201,22 @@ function Set-AutoMapCredentialTarget {
 }
 
 function Get-AutoMapSmbMapping {
-    param([string]$Drive)
-
-    if (-not (Get-Command Get-SmbMapping -ErrorAction SilentlyContinue)) {
-        return $null
-    }
-
+    param([string]$Drive, [int]$TimeoutSeconds = 15)
+    $job = $null
     try {
-        return @(Get-SmbMapping -LocalPath $Drive -ErrorAction SilentlyContinue | Select-Object -First 1)[0]
-    }
-    catch {
-        Write-Log -Message "Get-SmbMapping failed for $Drive - $_" -Level DEBUG -Category 'AutoMap'
-        return $null
-    }
-}
-
-function Repair-AutoMapUnavailableSmbMapping {
-    param(
-        [string]$Drive,
-        [string]$Share,
-        [string]$Username,
-        [string]$Password,
-        [string]$Name
-    )
-
-    if (-not (Get-Command New-SmbMapping -ErrorAction SilentlyContinue)) {
-        return $false
-    }
-
-    $mapping = Get-AutoMapSmbMapping -Drive $Drive
-    if (-not $mapping -or [string]$mapping.Status -ne 'Unavailable') {
-        return $false
-    }
-
-    $remotePath = [string]$mapping.RemotePath
-    if ($remotePath -and $remotePath -ne $Share) {
-        Write-Log -Message "Unavailable mapping on $Drive points to different remote path; skipping SMB repair" -Level WARN -Category 'AutoMap' -Data @{ drive = $Drive; configured = $Share; existing = $remotePath }
-        return $false
-    }
-
-    Write-Log -Message "Detected unavailable SMB mapping for $Drive ($Name); attempting reconnect with New-SmbMapping" -Level INFO -Category 'AutoMap'
-    try {
-        if ($Password) {
-            New-SmbMapping -LocalPath $Drive -RemotePath $Share -UserName $Username -Password $Password -Persistent $true -ErrorAction Stop | Out-Null
-        } else {
-            New-SmbMapping -LocalPath $Drive -RemotePath $Share -Persistent $true -ErrorAction Stop | Out-Null
+        $job = Start-Job -ScriptBlock {
+            param($drive)
+            if (Get-Command Get-SmbMapping -ErrorAction SilentlyContinue) {
+                Get-SmbMapping -LocalPath $drive -ErrorAction SilentlyContinue | Select-Object -First 1
+            }
+        } -ArgumentList $Drive
+        if (Wait-Job -Job $job -Timeout $TimeoutSeconds) { return Receive-Job -Job $job -ErrorAction Stop }
+        throw 'SMB mapping lookup timed out.'
+    } finally {
+        if ($job) {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
         }
-        Write-Log -Message "Reconnected unavailable SMB mapping for $Drive ($Name)" -Level INFO -Category 'AutoMap'
-        return $true
-    }
-    catch {
-        Write-Log -Message "New-SmbMapping repair failed for $Drive ($Name): $_" -Level WARN -Category 'AutoMap'
-        return $false
     }
 }
 
@@ -6142,13 +6226,36 @@ function Invoke-AutoMapNetUseMap {
         [string]$Share,
         [string]$Username,
         [string]$Password,
-        [int]$TimeoutSeconds
+        [int]$TimeoutSeconds,
+        [bool]$CredentialPrepared = $false
     )
 
     $job = $null
     try {
+        if ($Username -and [string]::IsNullOrEmpty($Password)) {
+            return [PSCustomObject]@{ Output = 'Configured credentials are unavailable; refusing to use a different Windows identity.'; ExitCode = 1326 }
+        }
         $job = Start-Job -ScriptBlock {
-            param($drive, $share, $username, $password)
+            param($drive, $share, $username, $password, $credentialPrepared)
+            $smbSaveErrorCode = $null
+            $smbSaveErrorType = $null
+            $smbSaveErrorMessage = $null
+            $smbCommand = Get-Command New-SmbMapping -ErrorAction SilentlyContinue
+            if (-not $credentialPrepared -and $password -and $smbCommand -and $smbCommand.Parameters.ContainsKey('SaveCredentials')) {
+                try {
+                    New-SmbMapping -LocalPath $drive -RemotePath $share -UserName $username -Password $password -Persistent $true -SaveCredentials -ErrorAction Stop | Out-Null
+                    return [PSCustomObject]@{ Output = 'SMB mapping created with saved credentials.'; ExitCode = 0; Backend = 'New-SmbMapping'; CredentialsSaved = $true; SaveErrorCode = $null }
+                } catch {
+                    # Preserve the explicit-credential fallback when saving credentials is unsupported by policy.
+                    $smbSaveErrorCode = $_.Exception.HResult
+                    $smbSaveErrorType = $_.Exception.GetType().FullName
+                    $smbSaveErrorMessage = ([string]$_.Exception.Message).Replace($password, '[REDACTED]') -replace '[\r\n]+', ' '
+                    $win32Code = $smbSaveErrorCode -band 0xFFFF
+                    if ($win32Code -in @(5, 86, 1326, 1219, 1330, 1331, 1909)) {
+                        return [PSCustomObject]@{ Output = "SMB authentication or session conflict ($win32Code)."; ExitCode = $win32Code; Backend = 'New-SmbMapping'; CredentialsSaved = $false; SaveErrorCode = $smbSaveErrorCode; SaveErrorType = $smbSaveErrorType; SaveErrorMessage = $smbSaveErrorMessage }
+                    }
+                }
+            }
             if ($password) {
                 $output = net use $drive $share /USER:$username $password /PERSISTENT:YES 2>&1
             } else {
@@ -6157,8 +6264,13 @@ function Invoke-AutoMapNetUseMap {
             [PSCustomObject]@{
                 Output = ($output | Out-String)
                 ExitCode = $LASTEXITCODE
+                Backend = 'net use'
+                CredentialsSaved = $false
+                SaveErrorCode = $smbSaveErrorCode
+                SaveErrorType = $smbSaveErrorType
+                SaveErrorMessage = $smbSaveErrorMessage
             }
-        } -ArgumentList $Drive, $Share, $Username, $Password
+        } -ArgumentList $Drive, $Share, $Username, $Password, $CredentialPrepared
 
         $completed = Wait-Job -Job $job -Timeout $TimeoutSeconds
         if ($completed) {
@@ -6167,6 +6279,11 @@ function Invoke-AutoMapNetUseMap {
                 return [PSCustomObject]@{
                     Output = $jobResult.Output
                     ExitCode = [int]$jobResult.ExitCode
+                    Backend = $jobResult.Backend
+                    CredentialsSaved = $jobResult.CredentialsSaved
+                    SaveErrorCode = $jobResult.SaveErrorCode
+                    SaveErrorType = $jobResult.SaveErrorType
+                    SaveErrorMessage = $jobResult.SaveErrorMessage
                 }
             }
         }
@@ -6190,54 +6307,93 @@ function Invoke-AutoMapNetUseMap {
     }
 }
 
+function Test-AutoMapDriveAccess {
+    param([string]$Drive, [int]$TimeoutSeconds = 15)
+
+    $job = $null
+    try {
+        $job = Start-Job -ScriptBlock {
+            param($root)
+            Test-Path -LiteralPath $root -PathType Container -ErrorAction Stop
+        } -ArgumentList ($Drive.TrimEnd('\') + '\')
+        if (Wait-Job -Job $job -Timeout $TimeoutSeconds) {
+            $result = @(Receive-Job -Job $job -ErrorAction Stop)
+            return ($result.Count -eq 1 -and $result[0] -eq $true)
+        }
+        return $false
+    } catch {
+        return $false
+    } finally {
+        if ($job) {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Get-AutoMapLocalDrive {
+    param([string]$Drive)
+    Get-PSDrive -Name $Drive.TrimEnd(':') -PSProvider FileSystem -ErrorAction SilentlyContinue
+}
+
+function Get-AutoMapExecutionContext {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return @{ elevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); sessionId = (Get-Process -Id $PID).SessionId }
+    } finally { $identity.Dispose() }
+}
+
+function Get-AutoMapFailureKind {
+    param([int]$ExitCode, [string]$Output)
+    if ($ExitCode -in @(5, 86, 1326, 1330, 1331, 1909) -or $Output -match '\b(1326|1330|1331|1909|86)\b') { return 'Authentication' }
+    if ($ExitCode -eq 1219 -or $Output -match '\b1219\b') { return 'MultipleConnections' }
+    if ($ExitCode -in @(85, 1202) -or $Output -match '\b(85|1202)\b') { return 'DriveInUse' }
+    if ($ExitCode -eq 67 -or $Output -match '\b67\b') { return 'InvalidPath' }
+    return 'NetworkOrAccess'
+}
+
 # Rotate and write a start marker
 Invoke-LogFileRotation -Path $logPath -Prefix 'LogonScript'
 Invoke-LogFileRotation -Path $eventsPath -Prefix 'LogonScript.events'
 
 # Track script execution time
 $scriptStartTime = Get-Date
-$psVersion = "$($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor).$($PSVersionTable.PSVersion.Patch)"
+$psVersion = $PSVersionTable.PSVersion.ToString()
 $psEditionInfo = $PSVersionTable.PSEdition
 
 Write-Log -Message "========================================" -Category 'AutoMap'
-Write-Log -Message "AutoMap start (v2.5.0)" -Category 'AutoMap' -Data @{ psVersion = $psVersion; psEdition = $psEditionInfo }
+Write-Log -Message "AutoMap start (v2.5.1)" -Category 'AutoMap' -Data @{ psVersion = $psVersion; psEdition = $psEditionInfo }
 Write-Log -Message "Environment: PowerShell $psVersion ($psEditionInfo)" -Level DEBUG -Category 'AutoMap'
-
-# Check network availability with retry logic (for slow WiFi connections during logon)
-$networkAvailable = $false
-$maxRetries = 6  # 6 attempts over ~30 seconds
-$retryDelay = 2  # Start with 2 seconds
-
-for ($i = 1; $i -le $maxRetries; $i++) {
-    if (Test-NetworkAvailable) {
-        $networkAvailable = $true
-        if ($i -gt 1) {
-            Write-Log -Message "Network connection detected (attempt $i/$maxRetries)" -Level INFO -Category 'AutoMap'
-        } else {
-            Write-Log -Message "Network connection detected" -Level INFO -Category 'AutoMap'
-        }
-        break
+try {
+    $executionContextInfo = Get-AutoMapExecutionContext
+    Write-Log -Message "AutoMap execution context: elevated=$($executionContextInfo.elevated), session=$($executionContextInfo.sessionId)" -Category 'AutoMap' -Data $executionContextInfo
+    if ($executionContextInfo.elevated) {
+        Write-Log -Message "AutoMap is elevated. Run it as the signed-in user without elevation so Explorer can use the mappings. No mapping changes made." -Level ERROR -Category 'AutoMap'
+        exit 2
     }
-    
-    if ($i -lt $maxRetries) {
-        Write-Log -Message "No network connection yet, waiting ${retryDelay}s (attempt $i/$maxRetries)" -Level INFO -Category 'AutoMap'
-        Start-Sleep -Seconds $retryDelay
-        $retryDelay = [Math]::Min($retryDelay * 1.5, 10)  # Exponential backoff, max 10s
-    }
+} catch {
+    Write-Log -Message "Could not establish the AutoMap execution context; no mapping changes made." -Level ERROR -Category 'AutoMap'
+    exit 2
 }
 
-if (-not $networkAvailable) {
-    Write-Log -Message "No network connection detected after $maxRetries attempts, skipping automap" -Level WARN -Category 'AutoMap'
-    Write-Log -Message "AutoMap aborted (no network)" -Category 'AutoMap'
-    Write-Log -Message "========================================" -Category 'AutoMap'
-    return
-}
+$autoMapMutex = New-Object System.Threading.Mutex($false, 'Local\ShareManager.AutoMap')
+$lockHeld = $false
+try {
+    try { $lockHeld = $autoMapMutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $lockHeld = $true }
+    if (-not $lockHeld) {
+        Write-Log -Message 'Another AutoMap run is active in this session; skipping duplicate run.' -Category 'AutoMap'
+        exit 0
+    }
+
+# Adapter state and Internet access do not establish reachability of a configured SMB server.
+Write-Log -Message "Checking configured shares directly; mapping attempts use per-share timeouts and retries." -Category 'AutoMap'
 
 if (!(Test-Path $sharesPath)) { 
     Write-Log "Missing shares.json at $sharesPath" -Level WARN -Category 'AutoMap'
     Write-Log -Message "AutoMap aborted (no config)" -Category 'AutoMap'
     Write-Log -Message "========================================" -Category 'AutoMap'
-    return 
+    exit 1
 }
 
 $cfg = $null
@@ -6247,18 +6403,22 @@ try {
     Write-Log "shares.json parse error: $_" -Level ERROR -Category 'AutoMap'
     Write-Log -Message "AutoMap aborted (parse error)" -Category 'AutoMap'
     Write-Log -Message "========================================" -Category 'AutoMap'
-    return 
+    exit 1
 }
 
-if (-not $cfg -or -not $cfg.Shares) { 
+if (-not $cfg -or -not $cfg.PSObject.Properties['Shares']) {
+    Write-Log -Message 'Configuration has no Shares collection.' -Level ERROR -Category 'AutoMap'
+    exit 1
+}
+if (-not $cfg.Shares) {
     Write-Log "No shares in config" -Level INFO -Category 'AutoMap'
     Write-Log -Message "AutoMap complete (no shares)" -Category 'AutoMap'
     Write-Log -Message "========================================" -Category 'AutoMap'
     return 
 }
 
-$totalShares = $cfg.Shares.Count
-$enabledShares = ($cfg.Shares | Where-Object { $_.Enabled }).Count
+$totalShares = @($cfg.Shares).Count
+$enabledShares = @($cfg.Shares | Where-Object { $_.Enabled }).Count
 Write-Log -Message "Found $totalShares total shares ($enabledShares enabled, $($totalShares - $enabledShares) disabled)" -Level INFO -Category 'AutoMap'
 
 $netUseTimeoutSeconds = 15
@@ -6309,13 +6469,13 @@ if (Test-Path $credsPath) {
                 try { 
                     if ($e.EncryptionType -eq "DPAPI") {
                         # Modern DPAPI encryption
-                        $credMap[$e.Username] = ($e.Encrypted | ConvertTo-SecureString)
+                        $credMap[$e.Username] = ($e.Encrypted | ConvertTo-SecureString -ErrorAction Stop)
                     } elseif ($aesKey) {
                         # Legacy AES encryption
-                        $credMap[$e.Username] = ($e.Encrypted | ConvertTo-SecureString -Key $aesKey)
+                        $credMap[$e.Username] = ($e.Encrypted | ConvertTo-SecureString -Key $aesKey -ErrorAction Stop)
                     } else {
                         # Try DPAPI anyway
-                        $credMap[$e.Username] = ($e.Encrypted | ConvertTo-SecureString)
+                        $credMap[$e.Username] = ($e.Encrypted | ConvertTo-SecureString -ErrorAction Stop)
                     }
                     $credLoadSuccess++
                 } catch { 
@@ -6344,6 +6504,16 @@ foreach ($s in $cfg.Shares) {
         $skipCount++
         continue 
     }
+    if ([string]$s.DriveLetter -notmatch '^[A-Za-z]$' -or [string]$s.SharePath -notmatch '^\\\\[^\\\s]+\\[^\\]+') {
+        Write-Log -Message 'Invalid drive letter or UNC path in an enabled share; skipping it.' -Level ERROR -Category 'AutoMap'
+        $failCount++
+        continue
+    }
+    if (@($cfg.Shares | Where-Object { $_.Enabled -and $_.DriveLetter -eq $s.DriveLetter }).Count -ne 1) {
+        Write-Log -Message 'Multiple enabled shares use the same drive letter; skipping the ambiguous mapping.' -Level ERROR -Category 'AutoMap'
+        $failCount++
+        continue
+    }
     
     $drive = "$($s.DriveLetter):"
     $share = $s.SharePath
@@ -6351,26 +6521,20 @@ foreach ($s in $cfg.Shares) {
     $name  = $s.Name
     $serverTarget = Get-AutoMapServerTarget -SharePath $share
 
-    # Check if drive is already in use by something else
-    if (Test-Path $drive) {
-        try {
-            $existing = Invoke-AutoMapNetUseQuery -Drive $drive
-            if ($existing -match [regex]::Escape($share)) {
-                Write-Log "Drive $drive already mapped to $share, skipping" -Level INFO -Category 'AutoMap'
-                $skipCount++
-                continue
-            } else {
-                # Drive in use by different share/source
-                Write-Log "Drive $drive in use by different resource, unmapping first" -Level INFO -Category 'AutoMap'
-                Invoke-AutoMapNetUseDelete -Drive $drive | Out-Null
-            }
-        } catch {
-            # Can't determine, try to unmap anyway
-            Invoke-AutoMapNetUseDelete -Drive $drive | Out-Null
+    $plainPW = $null
+    try {
+    try {
+        $existingMapping = Get-AutoMapSmbMapping -Drive $drive
+        if ($existingMapping -and ([string]$existingMapping.RemotePath).TrimEnd('\') -ne $share.TrimEnd('\')) {
+            throw 'The drive belongs to another SMB mapping.'
         }
-    } else {
-        # Clean unmap just in case
-        Invoke-AutoMapNetUseDelete -Drive $drive | Out-Null
+        $existing = if ($existingMapping) { [string]$existingMapping.RemotePath } else { Invoke-AutoMapNetUseQuery -Drive $drive -TimeoutSeconds $netUseTimeoutSeconds }
+        $sameTarget = $existing -match ('(?im)' + [regex]::Escape($share.TrimEnd('\')) + '\\?\s*$')
+        if (-not $sameTarget -and (Get-AutoMapLocalDrive -Drive $drive)) { throw 'The drive letter is already occupied.' }
+    } catch {
+        Write-Log -Message "Cannot safely use drive $drive; existing resources left untouched. $($_.Exception.Message)" -Level ERROR -Category 'AutoMap'
+        $failCount++
+        continue
     }
 
     $plainPW = $null
@@ -6382,65 +6546,67 @@ foreach ($s in $cfg.Shares) {
         }
     }
 
+    if ($user -and [string]::IsNullOrEmpty($plainPW)) {
+        Write-Log -Message "Configured credential missing or unreadable for drive $drive. Re-save it in Share Manager under the Windows account that signs in. Existing mapping left untouched." -Level ERROR -Category 'AutoMap'
+        $failCount++
+        continue
+    }
+
+    $credentialPrepared = $false
     if ($plainPW) {
         foreach ($credentialTarget in @(Get-AutoMapCredentialTargets -SharePath $share)) {
             $cmdKeyResult = Set-AutoMapCredentialTarget -ServerTarget $credentialTarget -Username $user -Password $plainPW
             if ($cmdKeyResult.Updated) {
+                if ($credentialTarget -eq $serverTarget.TrimStart('\')) { $credentialPrepared = $true }
                 Write-Log -Message "Prepared Windows credential target for $credentialTarget" -Level DEBUG -Category 'AutoMap'
             } elseif ($cmdKeyResult.ExitCode -ne 0) {
-                Write-Log -Message "Could not prepare Windows credential target for $credentialTarget (exit code $($cmdKeyResult.ExitCode)); continuing with explicit credentials" -Level WARN -Category 'AutoMap' -Data @{ server = $credentialTarget; output = $cmdKeyResult.Output }
+                Write-Log -Message "Could not prepare Windows credential target for $credentialTarget (exit code $($cmdKeyResult.ExitCode)); continuing with explicit credentials" -Level DEBUG -Category 'AutoMap' -Data @{ server = $credentialTarget; output = $cmdKeyResult.Output }
             }
+        }
+        if (-not $credentialPrepared) {
+            Write-Log -Message "Server credential preparation failed for $name; attempting native credential saving and explicit mapping." -Level WARN -Category 'AutoMap'
         }
     } else {
         Write-Log -Message "No stored password available for $name; attempting mapping without explicit password" -Level WARN -Category 'AutoMap'
     }
 
-    if (Repair-AutoMapUnavailableSmbMapping -Drive $drive -Share $share -Username $user -Password $plainPW -Name $name) {
-        $successCount++
+    if ($sameTarget -and (Test-AutoMapDriveAccess -Drive $drive -TimeoutSeconds $netUseTimeoutSeconds)) {
+        Write-Log -Message "Drive $drive is already accessible; skipping remap." -Category 'AutoMap'
         $plainPW = $null
+        $skipCount++
         continue
     }
-
-    # Enhanced retry with exponential backoff (2s, 4s, 8s)
+    # Reconnect in place first. Give startup networking time between bounded attempts.
     $mapped = $false
+    $resetAttempted = $false
     $maxAttempts = 3
     for ($i=1; $i -le $maxAttempts; $i++) {
         if ($i -gt 1) {
-            $backoff = [math]::Pow(2, $i - 1)  # Exponential backoff
+            $backoff = 30
             Write-Log -Message "Retry attempt $i/$maxAttempts after ${backoff}s delay for $name" -Level INFO -Category 'AutoMap' -Data @{ attempt = $i; backoff = $backoff }
             Start-Sleep -Seconds $backoff
         }
         
         Write-Log -Message "Mapping attempt ${i}: $drive -> $share ($name, timeout ${netUseTimeoutSeconds}s)" -Level INFO -Category 'AutoMap'
-        $mapResult = Invoke-AutoMapNetUseMap -Drive $drive -Share $share -Username $user -Password $plainPW -TimeoutSeconds $netUseTimeoutSeconds
+        $mapResult = Invoke-AutoMapNetUseMap -Drive $drive -Share $share -Username $user -Password $plainPW -TimeoutSeconds $netUseTimeoutSeconds -CredentialPrepared $credentialPrepared
+        if ($mapResult.SaveErrorType) {
+            $diagnosticLevel = if ($mapResult.ExitCode -eq 0) { 'DEBUG' } else { 'WARN' }
+            Write-Log -Message "SMB mapping diagnostic for $drive - $($mapResult.SaveErrorType): $($mapResult.SaveErrorMessage)" -Level $diagnosticLevel -Category 'AutoMap'
+        }
+        Write-Log -Message "Mapping result for $drive - backend=$($mapResult.Backend), exit=$($mapResult.ExitCode), SMB credentials saved=$($mapResult.CredentialsSaved), save error=$($mapResult.SaveErrorCode)" -Category 'AutoMap' -Data @{ backend = $mapResult.Backend; credentialsSavedBySmb = $mapResult.CredentialsSaved; saveErrorCode = $mapResult.SaveErrorCode; exitCode = $mapResult.ExitCode }
         
         if ($mapResult.ExitCode -eq 0) {
-            # Verify the mapping actually worked
-            $verified = $false
-            try {
-                $verifyOutput = Invoke-AutoMapNetUseQuery -Drive $drive
-                $verified = ($verifyOutput -match [regex]::Escape($share))
-                if ($verified -or (Test-Path $drive)) {
-                    Write-Log -Message "Mapped $drive to $share ($name)" -Category 'AutoMap'
-                } else {
-                    Write-Log -Message "Mapping succeeded but drive not accessible: $drive" -Level WARN -Category 'AutoMap'
-                }
-            } catch {
-                Write-Log -Message "Mapping succeeded but verification failed: $_" -Level WARN -Category 'AutoMap'
+            if (Test-AutoMapDriveAccess -Drive $drive -TimeoutSeconds $netUseTimeoutSeconds) {
+                Write-Log -Message "Mapped and verified access to drive $drive" -Category 'AutoMap'
+                $successCount++
+                $mapped = $true
+                break
             }
-            $successCount++
-            $mapped = $true
-            break 
+            Write-Log -Message "Mapping command succeeded but drive $drive is inaccessible; not counting this as success." -Level WARN -Category 'AutoMap'
+            $errorType = 'Inaccessible'
         } else {
-            # Classify error
-            $errorType = "Unknown"
             $resultStr = $mapResult.Output | Out-String
-            if ($resultStr -match "1326|Logon failure") { $errorType = "Authentication" }
-            elseif ($resultStr -match "53|network path") { $errorType = "PathNotFound" }
-            elseif ($resultStr -match "67|network name") { $errorType = "InvalidPath" }
-            elseif ($resultStr -match "1219|multiple connections") { $errorType = "MultipleConnections" }
-            elseif ($resultStr -match "1203|1231|network busy|timeout") { $errorType = "NetworkTimeout" }
-            elseif ($resultStr -match "85|local device.*in use") { $errorType = "DriveInUse" }
+            $errorType = Get-AutoMapFailureKind -ExitCode $mapResult.ExitCode -Output $resultStr
 
             if ($errorType -eq "MultipleConnections") {
                 $activeServerConnections = @(Get-AutoMapServerConnections -ServerTarget $serverTarget)
@@ -6449,11 +6615,32 @@ foreach ($s in $cfg.Shares) {
             
             Write-Log -Message "Attempt $i failed for $name`: $errorType" -Level WARN -Category 'AutoMap' -Data @{ attempt = $i; errorType = $errorType; exitCode = $mapResult.ExitCode; share = $name; netUseOutput = $resultStr }
         }
+        if ($errorType -in @('Authentication', 'MultipleConnections', 'InvalidPath')) {
+            Write-Log -Message "Stopping retries for drive $drive ($errorType). Check the saved credential, share permissions, or existing server sessions." -Level ERROR -Category 'AutoMap'
+            break
+        }
+        if ($errorType -in @('DriveInUse', 'Inaccessible') -and $sameTarget -and -not $resetAttempted -and $i -lt $maxAttempts) {
+            $resetAttempted = $true
+            $currentMapping = Get-AutoMapSmbMapping -Drive $drive
+            if (-not $currentMapping -or ([string]$currentMapping.RemotePath).TrimEnd('\') -ne $share.TrimEnd('\')) { break }
+            $removed = Invoke-AutoMapNetUseDelete -Drive $drive -TimeoutSeconds $netUseTimeoutSeconds
+            if ($removed.ExitCode -notin @(0, 2250)) {
+                Write-Log -Message "Drive $drive could not be disconnected without forcing open files; leaving it untouched." -Level ERROR -Category 'AutoMap'
+                break
+            }
+        }
     }
     $plainPW = $null
     if (-not $mapped) { 
-        Write-Log -Message "Failed mapping $drive -> $share ($name) after $maxAttempts attempts" -Level ERROR -Category 'AutoMap' -Data @{ drive = $drive; share = $share; name = $name; attempts = $maxAttempts }
+        $attemptsUsed = [Math]::Min($i, $maxAttempts)
+        Write-Log -Message "Failed mapping drive $drive after $attemptsUsed attempts" -Level ERROR -Category 'AutoMap' -Data @{ drive = $drive; attempts = $attemptsUsed }
         $failCount++
+    }
+    } catch {
+        $failCount++
+        Write-Log -Message "Unexpected mapping failure for drive $drive; continuing with other shares." -Level ERROR -Category 'AutoMap' -Data @{ errorType = $_.Exception.GetType().FullName; errorCode = $_.Exception.HResult }
+    } finally {
+        $plainPW = $null
     }
 }
 
@@ -6470,79 +6657,51 @@ Write-Log -Message "AutoMap complete: $successCount success, $failCount failed, 
     endTime = $scriptEndTime.ToString("o")
 }
 Write-Log -Message "========================================" -Category 'AutoMap'
+if ($failCount -gt 0) { exit 1 }
+} finally {
+    if ($lockHeld) { $autoMapMutex.ReleaseMutex() }
+    $autoMapMutex.Dispose()
+}
 '@
     $cmdScript = @"
 @echo off
-REM Auto-generated by Share Manager v2.5.0 - Logon Script Launcher
-REM This wrapper launches the PowerShell automap script with proper error handling
-REM Windows 11 25H2+ compatible (no wmic dependency)
-
-REM Hide CMD window immediately by relaunching minimized if not already hidden
-if not "%1"=="HIDDEN" (
-    start /min "" "%~f0" HIDDEN
-    exit
+setlocal DisableDelayedExpansion
+REM Auto-generated by Share Manager v$version - current-user logon launcher.
+title Share Manager v$version - AutoMap
+echo Share Manager v$version is reconnecting your network drives.
+echo AutoMap runs in the background and may retry while the network becomes available.
+echo Check Share Manager for drive status.
+echo Log: "%APPDATA%\Share_Manager\LogonScript.log"
+echo.
+if /I not "%~1"=="HIDDEN" (
+    start "" /min "%~f0" HIDDEN
+    exit /b
 )
+set "SCRIPT=%APPDATA%\Share_Manager\Share_Manager_AutoMap.ps1"
+set "LOG=%APPDATA%\Share_Manager\LogonScript.log"
+set "TEMP_LOG=%TEMP%\ShareManager_AutoMap_%RANDOM%_%RANDOM%.log"
+set "SHELL=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 
-setlocal enabledelayedexpansion
-
-REM Configuration
-set SCRIPT=%APPDATA%\Share_Manager\Share_Manager_AutoMap.ps1
-set LOG=%APPDATA%\Share_Manager\LogonScript.log
-set TEMP_LOG=%TEMP%\ShareManager_AutoMap_%RANDOM%.log
-
-REM Generate ISO 8601 timestamp using PowerShell (wmic removed in Windows 11 25H2+)
-for /f "delims=" %%a in ('powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-dd HH:mm:ss'"') do set "TIMESTAMP=%%a"
-
-REM Log start
-echo %TIMESTAMP%	[INFO][CMD] ======================================== >>"%LOG%"
-echo %TIMESTAMP%	[INFO][CMD] AutoMap launcher started >>"%LOG%"
-echo %TIMESTAMP%	[INFO][CMD] User: %USERNAME% Computer: %COMPUTERNAME% >>"%LOG%"
-
-REM Check if script exists
 if not exist "%SCRIPT%" (
-    for /f "delims=" %%a in ('powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-dd HH:mm:ss'"') do set "TIMESTAMP=%%a"
-    echo %TIMESTAMP%	[ERROR][CMD] Script not found: %SCRIPT% >>"%LOG%"
-    echo %TIMESTAMP%	[INFO][CMD] AutoMap launcher failed >>"%LOG%"
-    echo %TIMESTAMP%	[INFO][CMD] ======================================== >>"%LOG%"
+    echo AutoMap script missing. Open Share Manager to regenerate it.
+    echo [ERROR][CMD] AutoMap script missing. Open Share Manager to regenerate it. >>"%LOG%"
     exit /b 1
 )
-
-REM Detect PowerShell version (prefer pwsh)
-where pwsh >nul 2>nul
-if %errorlevel%==0 (
-    set SHELL=pwsh
-) else (
-    set SHELL=powershell
-)
-
-echo %TIMESTAMP%	[INFO][CMD] Using shell: !SHELL! >>"%LOG%"
-
-REM Execute script and capture exit code
-!SHELL! -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%SCRIPT%" >"%TEMP_LOG%" 2>&1
-set EXIT_CODE=!errorlevel!
-
-REM Append temporary output to main log (if any errors occurred)
+echo %DATE% %TIME% [INFO][CMD] AutoMap launcher started >>"%LOG%"
+"%SHELL%" -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "%SCRIPT%" >"%TEMP_LOG%" 2>&1
+set "EXIT_CODE=%ERRORLEVEL%"
 if exist "%TEMP_LOG%" (
-    if !EXIT_CODE! neq 0 (
-        for /f "delims=" %%a in ('powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-dd HH:mm:ss'"') do set "TIMESTAMP=%%a"
-        echo %TIMESTAMP%	[WARN][CMD] Script execution failed with exit code !EXIT_CODE! >>"%LOG%"
-        echo %TIMESTAMP%	[DEBUG][CMD] Script output: >>"%LOG%"
-        type "%TEMP_LOG%" >>"%LOG%" 2>nul
-    )
-    del "%TEMP_LOG%" 2>nul
+    if not "%EXIT_CODE%"=="0" type "%TEMP_LOG%" >>"%LOG%"
+    del /q "%TEMP_LOG%" >nul 2>&1
 )
-
-REM Log completion
-for /f "delims=" %%a in ('powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-dd HH:mm:ss'"') do set "TIMESTAMP=%%a"
-
-if !EXIT_CODE!==0 (
-    echo %TIMESTAMP%	[INFO][CMD] AutoMap launcher completed successfully >>"%LOG%"
+if "%EXIT_CODE%"=="0" (
+    echo AutoMap finished. See the log for individual drive results.
+    echo %DATE% %TIME% [INFO][CMD] AutoMap launcher completed successfully >>"%LOG%"
 ) else (
-    echo %TIMESTAMP%	[WARN][CMD] AutoMap launcher completed with exit code !EXIT_CODE! >>"%LOG%"
+    echo AutoMap needs attention. Open Share Manager or check the log for details.
+    echo %DATE% %TIME% [ERROR][CMD] AutoMap launcher failed with exit code %EXIT_CODE% >>"%LOG%"
 )
-echo %TIMESTAMP%	[INFO][CMD] ======================================== >>"%LOG%"
-
-exit /b !EXIT_CODE!
+exit /b %EXIT_CODE%
 "@
     if (-not (Test-Path $baseFolder)) {
         New-Item -Path $baseFolder -ItemType Directory -Force | Out-Null
@@ -6956,7 +7115,9 @@ function Show-AddShareDialog {
     $lblUser.Width = 120
     $form.Controls.Add($lblUser)
     
-    $txtUser = New-Object System.Windows.Forms.TextBox
+    $txtUser = New-Object System.Windows.Forms.ComboBox
+    $txtUser.DropDownStyle = 'DropDown'
+    foreach ($savedUser in @(Get-RecentUsernames)) { [void]$txtUser.Items.Add($savedUser) }
     $txtUser.Top = $y
     $txtUser.Left = 150
     $txtUser.Width = 310
@@ -7015,7 +7176,7 @@ function Show-AddShareDialog {
     $cmbCategoryAdd.Left = 150
     $cmbCategoryAdd.Width = 310
     $cmbCategoryAdd.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown
-    $categories = Get-ShareCategories
+    $categories = Get-ShareCategories -IncludeSuggestions
     foreach ($cat in $categories) {
         [void]$cmbCategoryAdd.Items.Add($cat)
     }
@@ -7053,17 +7214,9 @@ function Show-AddShareDialog {
             return
         }
         
-        # Auto-format UNC path if missing \\
-        $path = $txtPath.Text.Trim()
-        if ($path -and -not $path.StartsWith("\\")) {
-            $path = "\\$path"
-            $txtPath.Text = $path
-        }
-        
-        if ($path -notmatch '^\\\\[^\\]+\\') {
-            [System.Windows.Forms.MessageBox]::Show("Invalid UNC path. Must start with \\ (e.g., \\server\share)", "Validation Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
-            return
-        }
+        $path = Resolve-GuiUncPathInput -Path $txtPath.Text
+        if ($null -eq $path) { return }
+        $txtPath.Text = $path
         if ($txtDrive.Text -notmatch '^[A-Za-z]$') {
             [System.Windows.Forms.MessageBox]::Show("Invalid drive letter. Enter a single letter (A-Z).", "Validation Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
             return
@@ -7103,6 +7256,7 @@ function Show-AddShareDialog {
         }
         
         $username = $txtUser.Text.Trim()
+        if (-not (Confirm-ShareCredential -Username $username -Gui)) { return }
         
         $result = Add-ShareConfiguration -Name $txtName.Text -SharePath $path `
             -DriveLetter $driveLetter -Username $username `
@@ -7256,7 +7410,7 @@ function Show-ManageShareDialog {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "Manage Share - $($share.Name)"
     $form.Width = 500
-    $form.Height = 490
+    $form.Height = 525
     $form.StartPosition = "CenterParent"
     $form.FormBorderStyle = "FixedDialog"
     $form.MaximizeBox = $false
@@ -7323,12 +7477,31 @@ function Show-ManageShareDialog {
     $lblUser.AutoSize = $true
     $form.Controls.Add($lblUser)
     
-    $txtUser = New-Object System.Windows.Forms.TextBox
+    $txtUser = New-Object System.Windows.Forms.ComboBox
+    $txtUser.DropDownStyle = 'DropDown'
+    foreach ($savedUser in @(Get-RecentUsernames)) { [void]$txtUser.Items.Add($savedUser) }
     $txtUser.Text = $share.Username
     $txtUser.Top = $y
     $txtUser.Left = 150
     $txtUser.Width = 300
     $form.Controls.Add($txtUser)
+    $y += 30
+    $btnChangePassword = New-Object System.Windows.Forms.Button
+    $btnChangePassword.Text = 'Change password...'
+    $btnChangePassword.Left = 150
+    $btnChangePassword.Top = $y
+    $btnChangePassword.Size = New-Object System.Drawing.Size(170, 27)
+    $btnChangePassword.Add_Click({
+        if ([string]::IsNullOrWhiteSpace($txtUser.Text)) {
+            [void][System.Windows.Forms.MessageBox]::Show('Enter or select a username first.', 'Credentials')
+            $txtUser.Focus()
+            return
+        }
+        if (Confirm-ShareCredential -Username $txtUser.Text.Trim() -Gui -ReplaceExisting -ShareId $ShareId) {
+            [void][System.Windows.Forms.MessageBox]::Show('Credential saved. Share settings are saved separately with Save Changes.', 'Credentials')
+        }
+    })
+    $form.Controls.Add($btnChangePassword)
     
     $y += 35
     
@@ -7362,7 +7535,7 @@ function Show-ManageShareDialog {
     $cmbCategoryEdit.Left = 150
     $cmbCategoryEdit.Width = 300
     $cmbCategoryEdit.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown
-    $categories = Get-ShareCategories
+    $categories = Get-ShareCategories -IncludeSuggestions
     foreach ($cat in $categories) {
         [void]$cmbCategoryEdit.Items.Add($cat)
     }
@@ -7403,10 +7576,9 @@ function Show-ManageShareDialog {
             [System.Windows.Forms.MessageBox]::Show("Name is required", "Validation Error")
             return
         }
-        if (-not (Test-ValidUncPath -Path $txtPath.Text)) {
-            [System.Windows.Forms.MessageBox]::Show("Invalid UNC path. Must be \\\\servername\\sharename`n(Server name must be at least 2 characters)", "Validation Error")
-            return
-        }
+        $path = Resolve-GuiUncPathInput -Path $txtPath.Text
+        if ($null -eq $path) { return }
+        $txtPath.Text = $path
         if ($txtDrive.Text -notmatch '^[A-Za-z]$') {
             [System.Windows.Forms.MessageBox]::Show("Invalid drive letter", "Validation Error")
             return
@@ -7423,6 +7595,8 @@ function Show-ManageShareDialog {
             return
         }
 
+        $txtUser.Text = $txtUser.Text.Trim()
+        if (-not (Confirm-ShareCredential -Username $txtUser.Text -Gui -KeepExisting -ShareId $ShareId)) { return }
         $result = Update-ShareConfiguration -ShareId $ShareId -Name $txtName.Text `
             -SharePath $txtPath.Text -DriveLetter $txtDrive.Text.ToUpper() `
             -Username $txtUser.Text -Description $txtDesc.Text -Enabled $chkEnabled.Checked

@@ -64,6 +64,14 @@ Run regression tests:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Debug\test_regression.ps1
 ```
 
+Run isolated AutoMap startup and CMD launcher tests:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Debug\test_automap.ps1
+```
+
+These tests use temporary configuration and synthetic credentials, with Windows mapping operations replaced by test doubles. They do not connect to shares or change Credential Manager. Real sign-in acceptance checks are documented in [AutoMap validation](Debug/AUTOMAP-VALIDATION.md).
+
 The validation script checks:
 
 1. Legacy parser syntax

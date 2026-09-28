@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [2.5.1] - 2026-09-28
+
+### Changed
+- Add General, Home, Work, Backups, Media, and Projects category suggestions to GUI share editors and CLI Edit, preserving custom categories and keeping unused suggestions out of filters.
+- Replace GUI Edit's password checkbox with a direct Change password action. Credential changes are saved separately from share settings.
+- CLI Edit handles credential changes immediately at the username step. Explicit password changes only require shared-impact confirmation when other shares use that username.
+- Ordinary GUI/CLI share edits retain usable credentials without prompting. CLI Edit offers `/password`; GUI Edit offers Change password. Explicit replacement still confirms affected shares, and missing credentials still trigger capture.
+- GUI and CLI Add/Edit share workflows now reuse or save credentials before saving the share. GUI username fields offer saved credentials; CLI lists saved usernames. Password replacement identifies linked shares and requires an explicit choice. The credential storage format is unchanged.
+- Credential-save errors now stop the new workflow; CLI edits use a detached share object so cancelled edits do not mutate cached share fields.
+
+### Fixed
+- Empty CLI password-replacement input keeps the saved credential and continues the share edit instead of cancelling it; missing credentials still require a password.
+- GUI Add/Edit share dialogs trim pasted whitespace and surrounding quotes, consistently validate complete UNC paths, and ask before correcting an accidental backtick/separator before the server name. Backticks inside share and folder names are preserved.
+- Stop first-time setup if preferences cannot be saved instead of reporting success. Treat configuration write, backup, and replacement errors as terminating failures, and correct GUI import counts for updated versus skipped shares.
+- AutoMap uses explicit persistent `net use` directly after successfully preparing the bare-server credential, avoiding a redundant `New-SmbMapping -SaveCredentials` attempt. Native credential saving remains available when preparation fails.
+- Remove the AutoMap adapter/Internet preflight that incorrectly aborted on a networked VM. Attempt each configured share directly using mapping timeouts and retries; missing or malformed configuration now returns a failure exit code.
+- When bare-server credential preparation fails, AutoMap attempts `New-SmbMapping -SaveCredentials` where available, retaining explicit `net use` as the fallback for older systems or rejected native credential saving.
+- Credential decryption failures now stop that share's mapping attempt instead of silently using the Windows sign-in identity.
+- Inspect red-X mappings before deleting them. Skip a mapping to a different SMB target instead of removing it.
+- Require a bounded, literal drive-root access check before reporting a new or repaired mapping as successful. Return a failing process exit code when mappings fail.
+- Use the built-in Windows PowerShell host consistently for logon mapping.
+- Reconnect matching mappings in place first, with three bounded attempts and 30-second retry delays. Stop on recognized authentication or session conflicts rather than repeatedly submitting rejected credentials.
+- Permit only one AutoMap run per session and reject elevated execution. Protect occupied drive letters, duplicate configuration, unrelated mappings, and mappings with open files.
+- Preserve the remembered drive profile during a necessary stale-mapping reset; never force-close files or disconnect every server session.
+- Simplify CMD launcher quoting and propagate failures instead of reporting unsuccessful mapping runs as successful.
+
+### Diagnostics
+- Keep AutoMap DEBUG details in the structured events file only, leaving the normal text log focused on progress and actionable failures. Correct bare-server credential matching to avoid false preparation warnings and unnecessary native mapping attempts.
+- Log individual credential-target failures and recovered SMB fallback details at DEBUG; retain warnings for failed server credential preparation and mapping failures.
+- Correct single-share enabled/disabled counts in Windows PowerShell 5.1 and include a password-redacted SMB fallback reason and exception type.
+- Show a versioned AutoMap console banner, background retry guidance, the log location, and completion/failure messages without pausing unattended sign-in.
+- Log the mapping backend, SMB credential-save result, fallback error code, elevation, and session ID.
+- Add executable tests of generated AutoMap functions, isolated PowerShell 5.1 startup processes, and real CMD launcher exit handling with special-character paths. User-provided Windows PowerShell 5.1 VM logs confirm first-attempt, access-verified mapping through explicit `net use`, with no warnings in the normal log.
+
+### Documentation
+- Document the unified credential workflow, immediate password changes, starter categories, UNC correction, and AutoMap logging. Identify screenshots as 2.5.0 while documenting the 2.5.1 release.
+
 ## [2.5.0] - 2026-09-27
 
 ### Added
