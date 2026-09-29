@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [2.6.0] - 2026-09-29
+
+### Added
+- GUI first setup can review, edit, and remove saved shares before an explicit **Finish Setup** action. Preferences are directly accessible, including startup mode and theme.
+- CLI Manage Shares has a keyboard picker with focus, search, details, multi-selection, and bulk actions; a typed menu remains available with `:`.
+- Grouped CLI help and readable commands with unique prefixes, including `status`, `edit`, `remove`, `filter`, `batch`, and `back`.
+
+### Changed
+- First setup tracks completion separately from share count. Cancelling or closing setup keeps saved shares and resumes next launch; an intentionally empty setup does not repeat. New GUI setups default to the Modern theme.
+- CLI Add Share validates malformed server addresses before review and confirms suggested corrections. Review says when a password prompt follows; cancelling that prompt returns to review without losing entries.
+- CLI menus use shorter, context-sensitive actions. Manage Shares shows selection actions only when appropriate, confirms bulk targets, and keeps disabled shares out of Connect actions. The empty-state tip now reads "Try adding a network share to get started!".
+- Classic and Modern visual styles apply between setup dialogs and before the main GUI. A dedicated PowerShell console is hidden instead of minimized when GUI mode opens; shared terminals remain visible.
+
+### Fixed
+- GUI setup no longer finishes after the first added or restored share. Failed or cancelled Add/Restore operations return to setup, and failed preference saves do not report completion.
+- CLI Add Share does not claim an unverified mapping is connected, and password cancellation does not save an incomplete share.
+
 ## [2.5.2] - 2026-09-28
 
 ### Added

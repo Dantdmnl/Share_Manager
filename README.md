@@ -3,9 +3,11 @@
 ![GUI Screenshot](GUI.png)
 ![CLI Screenshot](CLI.png)
 
-- **Latest release:** 2.5.2
+- **Script version:** 2.6.0
 - **Author:** Dantdmnl
 - **License:** See [LICENSE](LICENSE)
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## Description
 
@@ -25,7 +27,11 @@ Easily manage and map network shares using this PowerShell script with support f
 
 ### Working With Shares
 
-The following improvements are included in 2.5.1. Screenshots above show 2.5.0.
+**First-time setup:** In the CLI, add a share, restore a backup, or start with no shares; optional preferences come first. In the GUI, add or restore as many shares as needed, edit or remove mistakes, adjust preferences, then choose **Finish Setup**. You can finish without shares. Closing setup early leaves it unfinished but keeps any shares already saved. Backups do not include passwords, so restored shares need credentials before connecting.
+
+**CLI Add Share:** Enter a path such as `\\server\share` or `\\192.168.1.2\backup`. Invalid server addresses are explained before review; a single-dot correction for an IP-looking address is offered for confirmation, with Yes as the default. At review, the save actions indicate when a password prompt follows. At that prompt, Enter or Escape returns to review with the entered fields intact. A failed connection leaves the saved share available to retry later.
+
+New GUI setups start with the Modern theme. Switching to Classic in Preferences applies to subsequent setup windows and the main GUI. Removing a share from setup does not disconnect an existing drive mapping.
 
 **Categories:** GUI Add/Edit and CLI Edit suggest General, Home, Work, Backups, Media, and Projects. You can still enter a custom category. Suggestions do not create shares or add unused categories to the filter list.
 
@@ -41,26 +47,6 @@ The following improvements are included in 2.5.1. Screenshots above show 2.5.0.
 **Automatic reconnection:** Run Share Manager normally, without administrator rights, with persistent mapping enabled to regenerate AutoMap after updating. AutoMap attempts configured shares directly, retries transient failures up to three times with 30-second delays, and checks drive access before reporting success. It does not continuously monitor a VPN that connects after the startup retry window.
 
 AutoMap progress and actionable failures are in `%APPDATA%\Share_Manager\LogonScript.log`. Detailed DEBUG events are retained in `LogonScript.events.jsonl`, not the normal text log. Saved credentials must be readable by the Windows account signing in; copying another user's DPAPI credential file is not sufficient.
-
-### Release Highlights (v2.5.2)
-
-- **Automatic housekeeping** - Remove eligible old log archives and updater rollback backups at normal startup, retaining the newest two per stream/script and everything under 90 days old.
-- **Preview before manual cleanup** - Use `-CleanupData` to list candidates without deleting anything. Credentials, configuration, active logs, and unrelated backups remain protected.
-- **Test runner compatibility** - Direct invocation from PowerShell 7 runs the regression suite in Windows PowerShell 5.1.
-
-### Previous Release (v2.5.1)
-
-- **Reliable AutoMap startup** - Direct share attempts, explicit credentials, bounded retries, and verified drive access before reporting success.
-- **Simpler share editing** - Reuse saved credentials, change passwords directly, and see which other shares are affected.
-- **Friendlier setup** - Starter category suggestions, confirmed UNC corrections, and accurate save-failure reporting.
-- **Quieter logs** - Normal AutoMap logs show progress and failures; detailed DEBUG information stays in the events file.
-
-### Previous Release (v2.5.0)
-
-- **Optional updater** - Check stable GitHub releases from the CLI or GUI, verify the downloaded script, and keep a backup before replacement.
-- **Credential reliability** - Correct Credential Manager argument boundaries, refresh changed passwords for the same username, and retain explicit credentials for mapping even if credential storage fails.
-- **CLI maintenance** - Disconnect stale mappings, count only enabled shares for Connect All, and group update/log actions above GUI Mode and Quit.
-- **PowerShell 5.1 fixes** - Correct background job cleanup and expand offline regression coverage.
 
 ### Organization and Search
 
@@ -105,6 +91,7 @@ AutoMap progress and actionable failures are in `%APPDATA%\Share_Manager\LogonSc
 - **Batch enable/disable** - Enable or disable multiple shares at once
 - **Drive label sync** - Mapped drives labeled with share name in Explorer
 - **Reconnect All** operation for quick bulk remapping
+- **CLI navigation** - Use the keys shown in each menu or type names and unique prefixes such as `stat` and `pref`. Bulk names require `all`: `connect-all`, `disconnect-all`, `reconnect-all`, or abbreviated forms such as `con a`. In Manage Shares, arrow keys move focus, Enter opens that share's details and actions, Space selects shares for bulk actions, `/` searches, and `?` shows more keys. Selection actions appear only after selecting a share; multi-share and enable/disable actions confirm their target list. In an interactive console, Escape backs out of menus and cancels CLI text/password prompts; at the main menu it exits. Press `:` to switch to the numbered menu; it is also the automatic fallback when interactive key input is unavailable. Disabled shares cannot be connected until enabled. Filters match text literally.
 
 ## Updating Share Manager
 
@@ -118,8 +105,6 @@ Cleanup retains the newest two archives per log stream and all archives less tha
 
 Updater backups beside the running script have a separate retention rule: keep the newest two plus anything under 90 days old. Only filenames matching `<current-script>.yyyyMMdd-HHmmss.<32-character-GUID>.bak` qualify. Manual `.bak` files and backups for other scripts are untouched. Cleanup runs on subsequent normal launches, not during update installation; the newly created rollback backup is retained. Preview output includes each file's folder.
 
-Version 2.5.0 includes an optional updater. The CLI and GUI screenshots above show this version.
-
 ### Checking for Updates
 
 Use **U - Updates** in the CLI or **Help > Check for Updates** in the GUI. Checks are manual; Share Manager does not contact GitHub at startup or schedule update checks. Installation asks for confirmation.
@@ -128,7 +113,7 @@ The updater uses the latest stable release from this repository and its `Share_M
 
 The current script is replaced atomically, with a timestamped `.bak` file beside it. Local script customizations are replaced, but configurations and saved credentials in `%APPDATA%\Share_Manager` are not changed by the updater. The script folder must be writable. Download or validation failures leave the current script in place. Equal versions and downgrades are refused.
 
-Close and reopen Share Manager after installing. Persistent AutoMap scripts are regenerated through the normal startup flow when persistent mapping is enabled. To roll back, close Share Manager and replace the script with the saved `.bak` copy, retaining the `.ps1` filename. Starting in 2.5.2, updater backups follow the cleanup retention rule above; copy a backup to a separate location if you need to retain it indefinitely.
+Close and reopen Share Manager after installing. Persistent AutoMap scripts are regenerated through the normal startup flow when persistent mapping is enabled. To roll back, close Share Manager and replace the script with the saved `.bak` copy, retaining the `.ps1` filename. Updater backups follow the cleanup retention rule above; copy a backup to a separate location if you need to retain it indefinitely.
 
 Update checks send a request to GitHub; downloads also use GitHub's asset hosting. No share configuration, usernames, or saved credentials are included. GitHub receives ordinary connection metadata such as your public IP address.
 
@@ -188,42 +173,6 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 - **Password Security (v2.4.0+)**: Special characters in passwords are handled via direct `net use` arguments and prepared Credential Manager targets for persistent mappings.
 - **Local Storage Only**: All data (config, credentials, logs) is stored locally under `%APPDATA%\Share_Manager`.
 - **Log Rotation**: Automatic cleanup after 30 days or 5MB to prevent indefinite data retention.
-
-## Validation and Testing
-
-This repository includes a comprehensive validation script to ensure the project remains production-ready.
-
-Run all checks locally:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Debug\test_syntax.ps1
-```
-
-Run regression tests:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Debug\test_regression.ps1
-```
-
-What it checks:
-
-- PowerShell legacy parser (syntax)
-- AST parser (structure)
-- Function analysis (approved verbs and definitions)
-- PSScriptAnalyzer (uses `Debug/PSScriptAnalyzerSettings.psd1` if present)
-- Security check (hardcoded secrets)
-- Documentation quality checks
-- File encoding and size
-- Unicode character check (ASCII compliance)
-- Function call existence
-
-If PSScriptAnalyzer is not installed, the syntax script skips that step and shows how to install it.
-
-The regression runner selects Pester 3.4 or 4.x because the suite uses legacy assertion syntax. Pester 5 can remain installed alongside it. If a compatible version is not installed, use:
-
-```powershell
-Install-Module -Name Pester -RequiredVersion 4.10.1 -Scope CurrentUser
-```
 
 ## Factory Reset
 

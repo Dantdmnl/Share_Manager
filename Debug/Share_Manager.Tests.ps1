@@ -131,6 +131,7 @@ finally {
             (Test-ValidUncPath -Path '\\server\share') | Should Be $true
             (Test-ValidUncPath -Path '\\server\share\folder') | Should Be $true
             (Test-ValidUncPath -Path '\\server\share\folder\') | Should Be $true
+            (Test-ValidUncPath -Path '\\192.168.1.2\backup') | Should Be $true
         }
 
         It "rejects invalid UNC paths" {
@@ -138,6 +139,34 @@ finally {
             (Test-ValidUncPath -Path '\\s\share') | Should Be $false
             (Test-ValidUncPath -Path '\\server\') | Should Be $false
             (Test-ValidUncPath -Path '') | Should Be $false
+            (Test-ValidUncPath -Path '\\192..168.1.2\backup') | Should Be $false
+            (Test-ValidUncPath -Path '\\999.168.1.2\backup') | Should Be $false
+        }
+
+        It "suggests a single-dot IPv4 correction without silently applying it" {
+            $check = Get-UncPathValidation -Path '\\192.168..1.2\backup'
+            $check.Valid | Should Be $false
+            $check.Message | Should Match 'consecutive dots'
+            $check.Suggestion | Should Be '\\192.168.1.2\backup'
+            (Get-UncPathValidation -Path '\\999.168.1.2\backup').Suggestion | Should BeNullOrEmpty
+        }
+
+        It "uses a malformed-server suggestion only after CLI confirmation" {
+            $script:UncAnswers = @('\\192.168..1.2\backup', 'y')
+            $script:UncAnswerIndex = 0
+            Mock Read-CliPrompt { $answer = $script:UncAnswers[$script:UncAnswerIndex]; $script:UncAnswerIndex++; return $answer }
+            Mock Write-Host { }
+            (Read-CliUncPath) | Should Be '\\192.168.1.2\backup'
+            $script:UncAnswerIndex | Should Be 2
+        }
+
+        It "accepts the suggested correction when Enter selects the default" {
+            $script:UncAnswers = @('\\192.168..1.2\backup', '')
+            $script:UncAnswerIndex = 0
+            Mock Read-CliPrompt { $answer = $script:UncAnswers[$script:UncAnswerIndex]; $script:UncAnswerIndex++; return $answer }
+            Mock Write-Host { }
+            (Read-CliUncPath) | Should Be '\\192.168.1.2\backup'
+            $script:UncAnswerIndex | Should Be 2
         }
     }
 
@@ -377,6 +406,16 @@ finally {
             $scriptText | Should Match 'Checking connection state for: \$shareName'
             $scriptText | Should Match 'Mapping \$shareName to \$\(\$share\.DriveLetter\):'
             $scriptText | Should Match 'Disconnecting \$shareName from \$\(\$share\.DriveLetter\):'
+        }
+    }
+
+    Context "GUI console handoff" {
+        It "hides a dedicated console instead of leaving a minimized taskbar button" {
+            $sourceAst = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)
+            $handoff = $sourceAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Hide-ConsoleWindow' }, $true)
+            $handoff.Extent.Text | Should Match 'GetConsoleProcessList'
+            $handoff.Extent.Text | Should Match 'GetConsoleProcessList\(\$consoleProcesses, \$consoleProcesses.Length\) -ne 1'
+            $handoff.Extent.Text | Should Match 'ShowWindow\(\$hWnd, 0\)'
         }
     }
 
@@ -650,7 +689,7 @@ finally {
     }
 
     Context "First-time setup save failures" {
-        It "stops CLI setup when preferences cannot be saved" {
+        It "stops CLI setup when its initial state cannot be saved" {
             function Set-TerminalBlackBackground { param([switch]$Refresh) }
             function Read-Host { param($Prompt) return '' }
             function Write-Host { param($Object, $ForegroundColor) }
@@ -677,6 +716,363 @@ finally {
             (Save-AllShares -Config (New-DefaultSharesConfig)) | Should Be $false
             (Get-Content -LiteralPath $sharesPath -Raw).Trim() | Should Be $original
             (Test-Path -LiteralPath "$sharesPath.tmp") | Should Be $false
+        }
+    }
+
+    Context "First-time setup choices" {
+        It "requires setup for new and explicitly unfinished configs, but accepts legacy shares" {
+            (Test-FirstRunNeeded -Config (New-DefaultSharesConfig)) | Should Be $true
+            (Test-FirstRunNeeded -Config ([PSCustomObject]@{ Shares = @([PSCustomObject]@{ Name = 'Legacy' }) })) | Should Be $false
+            (Test-FirstRunNeeded -Config ([PSCustomObject]@{ Shares = @(); SetupCompleted = $true })) | Should Be $false
+            (Test-FirstRunNeeded -Config ([PSCustomObject]@{ Shares = @([PSCustomObject]@{ Name = 'Partial' }); SetupCompleted = $false })) | Should Be $true
+            (Test-FirstRunNeeded -Config ([PSCustomObject]@{ Shares = @(); SetupCompleted = 'false' })) | Should Be $true
+            (Test-FirstRunNeeded -Config ([PSCustomObject]@{ Shares = $null })) | Should Be $true
+        }
+
+        It "marks setup unfinished before the share action and complete only at the end" {
+            $script:SetupConfig = New-DefaultSharesConfig
+            Mock Get-CachedConfig { return $script:SetupConfig }
+            Mock Save-AllShares { return $true }
+            (Start-FirstRunSetup) | Should Be $true
+            $script:SetupConfig.SetupCompleted | Should Be $false
+            $prefs = (New-DefaultSharesConfig).Preferences
+            $prefs.PreferredMode = 'CLI'
+            (Complete-FirstRunSetup -Preferences $prefs) | Should Be $true
+            $script:SetupConfig.SetupCompleted | Should Be $true
+            $script:SetupConfig.Preferences.PreferredMode | Should Be 'CLI'
+        }
+
+        It "lets CLI users start empty without launching the add-share dialog" {
+            $script:SetupAnswers = @('', '3')
+            $script:SetupAnswerIndex = 0
+            Mock Read-CliPrompt { $answer = $script:SetupAnswers[$script:SetupAnswerIndex]; $script:SetupAnswerIndex++; return $answer }
+            Mock Start-FirstRunSetup { return $true }
+            Mock Complete-FirstRunSetup { return $true }
+            Mock Get-ShareConfiguration { return @() }
+            Mock Add-NewShareCli { }
+            Mock Set-TerminalBlackBackground { }
+            Mock Write-Host { }
+            Mock Write-CliMenuOption { }
+            (Initialize-Config-CLI) | Should Be $true
+            Assert-MockCalled Add-NewShareCli -Times 0 -Exactly -Scope It
+            Assert-MockCalled Complete-FirstRunSetup -Times 1 -Exactly -Scope It -ParameterFilter { $Preferences.PreferredMode -eq 'CLI' }
+        }
+
+        It "returns to CLI setup choices after a cancelled add" {
+            $script:SetupAnswers = @('', '1', '3')
+            $script:SetupAnswerIndex = 0
+            Mock Read-CliPrompt { $answer = $script:SetupAnswers[$script:SetupAnswerIndex]; $script:SetupAnswerIndex++; return $answer }
+            Mock Start-FirstRunSetup { return $true }
+            Mock Complete-FirstRunSetup { return $true }
+            Mock Get-ShareConfiguration { return @() }
+            Mock Add-NewShareCli { }
+            Mock Set-TerminalBlackBackground { }
+            Mock Write-Host { }
+            Mock Write-CliMenuOption { }
+            (Initialize-Config-CLI) | Should Be $true
+            Assert-MockCalled Add-NewShareCli -Times 1 -Exactly -Scope It
+            $script:SetupAnswerIndex | Should Be 3
+        }
+
+        It "completes CLI setup after a share is actually saved" {
+            $script:SetupAnswers = @('', '1')
+            $script:SetupAnswerIndex = 0
+            $script:SavedShareCount = 0
+            Mock Read-CliPrompt { $answer = $script:SetupAnswers[$script:SetupAnswerIndex]; $script:SetupAnswerIndex++; return $answer }
+            Mock Start-FirstRunSetup { return $true }
+            Mock Complete-FirstRunSetup { return $true }
+            Mock Get-ShareConfiguration { if ($script:SavedShareCount -gt 0) { return [PSCustomObject]@{ Name = 'Saved' } }; return @() }
+            Mock Add-NewShareCli { $script:SavedShareCount++ }
+            Mock Set-TerminalBlackBackground { }
+            Mock Write-Host { }
+            Mock Write-CliMenuOption { }
+            (Initialize-Config-CLI) | Should Be $true
+            Assert-MockCalled Add-NewShareCli -Times 1 -Exactly -Scope It
+            Assert-MockCalled Complete-FirstRunSetup -Times 1 -Exactly -Scope It
+        }
+
+        It "keeps all advanced CLI setup preferences available and bounded" {
+            $script:SetupAnswers = @('y', '2', 'y', 'n', 'y', '2', '7', '30', '3')
+            $script:SetupAnswerIndex = 0
+            $script:SavedSetupPreferences = $null
+            Mock Read-CliPrompt { $answer = $script:SetupAnswers[$script:SetupAnswerIndex]; $script:SetupAnswerIndex++; return $answer }
+            Mock Start-FirstRunSetup { return $true }
+            Mock Complete-FirstRunSetup { $script:SavedSetupPreferences = $Preferences; return $true }
+            Mock Get-ShareConfiguration { return @() }
+            Mock Set-TerminalBlackBackground { }
+            Mock Write-Host { }
+            Mock Write-CliMenuOption { }
+            (Initialize-Config-CLI) | Should Be $true
+            $script:SavedSetupPreferences.PreferredMode | Should Be 'GUI'
+            $script:SavedSetupPreferences.PersistentMapping | Should Be $true
+            $script:SavedSetupPreferences.UnmapOldMapping | Should Be $false
+            $script:SavedSetupPreferences.SyncShareNameToDriveLabel | Should Be $true
+            $script:SavedSetupPreferences.Theme | Should Be 'Modern'
+            $script:SavedSetupPreferences.UncProbeTimeoutSeconds | Should Be 7
+            $script:SavedSetupPreferences.NetUseTimeoutSeconds | Should Be 30
+        }
+
+        It "lets CLI users retry after a failed restore" {
+            $script:SetupAnswers = @('', '2', 'missing.json', '3')
+            $script:SetupAnswerIndex = 0
+            Mock Read-CliPrompt { $answer = $script:SetupAnswers[$script:SetupAnswerIndex]; $script:SetupAnswerIndex++; return $answer }
+            Mock Start-FirstRunSetup { return $true }
+            Mock Complete-FirstRunSetup { return $true }
+            Mock Get-ShareConfiguration { return @() }
+            Mock Import-ShareConfiguration { return @{ Success = $false; Added = 0 } }
+            Mock Set-TerminalBlackBackground { }
+            Mock Write-Host { }
+            Mock Write-CliMenuOption { }
+            (Initialize-Config-CLI) | Should Be $true
+            Assert-MockCalled Import-ShareConfiguration -Times 1 -Exactly -Scope It
+            $script:SetupAnswerIndex | Should Be 4
+        }
+
+        It "lets GUI users start empty with GUI as the default startup mode" {
+            Mock Start-FirstRunSetup { return $true }
+            Mock Complete-FirstRunSetup { return $true }
+            Mock Show-FirstRunChoiceGUI { return [PSCustomObject]@{ Action = 'Finish' } }
+            Mock Show-FirstRunMessageGUI { }
+            Mock Get-ShareConfiguration { return @() }
+            Mock Show-AddShareDialog { }
+            (Initialize-Config-GUI) | Should Be $true
+            Assert-MockCalled Show-AddShareDialog -Times 0 -Exactly -Scope It
+            Assert-MockCalled Complete-FirstRunSetup -Times 1 -Exactly -Scope It -ParameterFilter { $Preferences.PreferredMode -eq 'GUI' -and $Preferences.Theme -eq 'Modern' -and -not $Preferences.PersistentMapping }
+        }
+
+        It "opens preferences during GUI setup and saves the selected values" {
+            $script:GuiSetupChoices = @('Preferences', 'Finish')
+            $script:GuiSetupChoiceIndex = 0
+            Mock Start-FirstRunSetup { return $true }
+            Mock Complete-FirstRunSetup { return $true }
+            Mock Show-FirstRunChoiceGUI {
+                $action = $script:GuiSetupChoices[$script:GuiSetupChoiceIndex]
+                $script:GuiSetupChoiceIndex++
+                return [PSCustomObject]@{ Action = $action }
+            }
+            Mock Show-PreferencesForm {
+                $CurrentPrefs.PersistentMapping = $true
+                $CurrentPrefs.Theme = 'Classic'
+                return $CurrentPrefs
+            }
+            Mock Show-FirstRunMessageGUI { }
+            Mock Get-ShareConfiguration { return @() }
+            Mock Set-GuiVisualStyle { }
+            (Initialize-Config-GUI) | Should Be $true
+            Assert-MockCalled Show-PreferencesForm -Times 1 -Exactly -Scope It
+            Assert-MockCalled Set-GuiVisualStyle -Times 1 -Exactly -Scope It -ParameterFilter { $Theme -eq 'Modern' }
+            Assert-MockCalled Set-GuiVisualStyle -Times 1 -Exactly -Scope It -ParameterFilter { $Theme -eq 'Classic' }
+            Assert-MockCalled Complete-FirstRunSetup -Times 1 -Exactly -Scope It -ParameterFilter { $Preferences.PersistentMapping -and $Preferences.Theme -eq 'Classic' }
+        }
+
+        It "does not complete GUI setup after a cancelled add" {
+            $script:GuiSetupChoices = @('Add', 'Cancel')
+            $script:GuiSetupChoiceIndex = 0
+            Mock Start-FirstRunSetup { return $true }
+            Mock Complete-FirstRunSetup { return $true }
+            Mock Show-FirstRunChoiceGUI {
+                $action = $script:GuiSetupChoices[$script:GuiSetupChoiceIndex]
+                $script:GuiSetupChoiceIndex++
+                return [PSCustomObject]@{ Action = $action; Advanced = $false }
+            }
+            Mock Show-FirstRunMessageGUI { }
+            Mock Get-ShareConfiguration { return @() }
+            Mock Show-AddShareDialog { }
+            (Initialize-Config-GUI) | Should Be $false
+            Assert-MockCalled Complete-FirstRunSetup -Times 0 -Exactly -Scope It
+            $script:GuiSetupChoiceIndex | Should Be 2
+        }
+
+        It "returns to GUI setup after each added share until Finish is chosen" {
+            $script:SavedShareCount = 0
+            $script:GuiSetupChoices = @('Add', 'Add', 'Finish')
+            $script:GuiSetupChoiceIndex = 0
+            Mock Start-FirstRunSetup { return $true }
+            Mock Complete-FirstRunSetup { return $true }
+            Mock Show-FirstRunChoiceGUI {
+                $action = $script:GuiSetupChoices[$script:GuiSetupChoiceIndex]
+                $script:GuiSetupChoiceIndex++
+                return [PSCustomObject]@{ Action = $action }
+            }
+            Mock Show-FirstRunMessageGUI { }
+            Mock Get-ShareConfiguration {
+                for ($i = 1; $i -le $script:SavedShareCount; $i++) { [PSCustomObject]@{ Name = "Saved $i" } }
+            }
+            Mock Show-AddShareDialog { $script:SavedShareCount++ }
+            (Initialize-Config-GUI) | Should Be $true
+            Assert-MockCalled Show-AddShareDialog -Times 2 -Exactly -Scope It
+            Assert-MockCalled Complete-FirstRunSetup -Times 1 -Exactly -Scope It
+            $script:GuiSetupChoiceIndex | Should Be 3
+        }
+
+        It "lets GUI setup edit a saved share before finishing" {
+            $script:GuiSetupChoices = @('Edit', 'Finish')
+            $script:GuiSetupChoiceIndex = 0
+            Mock Start-FirstRunSetup { return $true }
+            Mock Complete-FirstRunSetup { return $true }
+            Mock Show-FirstRunChoiceGUI {
+                $action = $script:GuiSetupChoices[$script:GuiSetupChoiceIndex]
+                $script:GuiSetupChoiceIndex++
+                return [PSCustomObject]@{ Action = $action; ShareId = 'share-1' }
+            }
+            Mock Get-ShareConfiguration { return [PSCustomObject]@{ Id = 'share-1'; Name = 'Saved' } }
+            Mock Show-ManageShareDialog { }
+            Mock Show-FirstRunMessageGUI { }
+            (Initialize-Config-GUI) | Should Be $true
+            Assert-MockCalled Show-ManageShareDialog -Times 1 -Exactly -Scope It -ParameterFilter { $ShareId -eq 'share-1' -and $FromSetup }
+            Assert-MockCalled Complete-FirstRunSetup -Times 1 -Exactly -Scope It
+        }
+
+        It "lets GUI setup remove an accidental share before finishing" {
+            $script:GuiSetupChoices = @('Remove', 'Finish')
+            $script:GuiSetupChoiceIndex = 0
+            Mock Start-FirstRunSetup { return $true }
+            Mock Complete-FirstRunSetup { return $true }
+            Mock Show-FirstRunChoiceGUI {
+                $action = $script:GuiSetupChoices[$script:GuiSetupChoiceIndex]
+                $script:GuiSetupChoiceIndex++
+                return [PSCustomObject]@{ Action = $action; ShareId = 'share-1' }
+            }
+            Mock Get-ShareConfiguration { return @() }
+            Mock Remove-FirstRunShareGUI { return $true }
+            Mock Show-FirstRunMessageGUI { }
+            (Initialize-Config-GUI) | Should Be $true
+            Assert-MockCalled Remove-FirstRunShareGUI -Times 1 -Exactly -Scope It -ParameterFilter { $ShareId -eq 'share-1' }
+            Assert-MockCalled Complete-FirstRunSetup -Times 1 -Exactly -Scope It
+        }
+
+        It "returns to GUI choices after a failed restore" {
+            $script:GuiSetupChoices = @('Restore', 'Finish')
+            $script:GuiSetupChoiceIndex = 0
+            Mock Start-FirstRunSetup { return $true }
+            Mock Complete-FirstRunSetup { return $true }
+            Mock Show-FirstRunChoiceGUI {
+                $action = $script:GuiSetupChoices[$script:GuiSetupChoiceIndex]
+                $script:GuiSetupChoiceIndex++
+                return [PSCustomObject]@{ Action = $action; Advanced = $false }
+            }
+            Mock Select-FirstRunBackupGUI { return 'missing.json' }
+            Mock Import-ShareConfiguration { return @{ Success = $false; Added = 0 } }
+            Mock Show-FirstRunMessageGUI { }
+            Mock Get-ShareConfiguration { return @() }
+            (Initialize-Config-GUI) | Should Be $true
+            Assert-MockCalled Import-ShareConfiguration -Times 1 -Exactly -Scope It
+            $script:GuiSetupChoiceIndex | Should Be 2
+        }
+
+        It "returns to GUI choices after a successful restore" {
+            $script:GuiSetupChoices = @('Restore', 'Finish')
+            $script:GuiSetupChoiceIndex = 0
+            Mock Start-FirstRunSetup { return $true }
+            Mock Complete-FirstRunSetup { return $true }
+            Mock Show-FirstRunChoiceGUI {
+                $action = $script:GuiSetupChoices[$script:GuiSetupChoiceIndex]
+                $script:GuiSetupChoiceIndex++
+                return [PSCustomObject]@{ Action = $action }
+            }
+            Mock Select-FirstRunBackupGUI { return 'backup.json' }
+            Mock Import-ShareConfiguration { return @{ Success = $true; Added = 1 } }
+            Mock Show-FirstRunMessageGUI { }
+            Mock Get-ShareConfiguration { return [PSCustomObject]@{ Name = 'Restored' } }
+            (Initialize-Config-GUI) | Should Be $true
+            Assert-MockCalled Import-ShareConfiguration -Times 1 -Exactly -Scope It
+            Assert-MockCalled Complete-FirstRunSetup -Times 1 -Exactly -Scope It
+            $script:GuiSetupChoiceIndex | Should Be 2
+        }
+    }
+
+    Context "First-time setup persistence" {
+        It "persists an intentionally empty setup across configuration reloads" {
+            $sharesPath = Join-Path $TestDrive 'first-run.json'
+            Mock Write-ActionLog { }
+            Clear-ConfigCache
+            (Start-FirstRunSetup) | Should Be $true
+            Clear-ConfigCache
+            (Test-FirstRunNeeded -Config (Import-AllShares)) | Should Be $true
+            $prefs = (New-DefaultSharesConfig).Preferences
+            $prefs.PreferredMode = 'CLI'
+            (Complete-FirstRunSetup -Preferences $prefs) | Should Be $true
+            Clear-ConfigCache
+            $saved = Import-AllShares
+            (Test-FirstRunNeeded -Config $saved) | Should Be $false
+            $saved.Shares.Count | Should Be 0
+            $saved.Preferences.PreferredMode | Should Be 'CLI'
+        }
+    }
+
+    Context "CLI add-share review" {
+        BeforeEach {
+            $script:AddFields = @('Test', 'Z', 'user')
+            $script:AddFieldIndex = 0
+            $script:AddPrompts = @('notes', '2')
+            $script:AddPromptIndex = 0
+            $script:AddOutput = ''
+            Mock Clear-Host { }
+            Mock Write-Host { $script:AddOutput += [string]$Object + "`n" }
+            Mock Write-CliMenuOption { }
+            Mock Read-ValidatedInput { $value = $script:AddFields[$script:AddFieldIndex]; $script:AddFieldIndex++; return $value }
+            Mock Read-CliUncPath { return '\\server\share' }
+            Mock Read-CliPrompt { $value = $script:AddPrompts[$script:AddPromptIndex]; $script:AddPromptIndex++; return $value }
+            Mock Get-ShareConfiguration { return @() }
+            Mock Get-RecentUsernames { return @() }
+            Mock Get-CachedConfig { return [PSCustomObject]@{ Shares = @() } }
+            Mock Get-CredentialForShare { return (New-Object System.Management.Automation.PSCredential('user', (ConvertTo-SecureString 'synthetic' -AsPlainText -Force))) }
+            Mock Confirm-ShareCredential { return $true }
+            Mock Add-ShareConfiguration { return [PSCustomObject]@{ Id = 'saved-id' } }
+            Mock Connect-NetworkShare { return @{ Success = $true; Verified = $true } }
+        }
+
+        It "saves without a second credential or connect prompt when Save only is chosen" {
+            Add-NewShareCli
+            Assert-MockCalled Confirm-ShareCredential -Times 1 -Exactly -Scope It
+            Assert-MockCalled Add-ShareConfiguration -Times 1 -Exactly -Scope It
+            Assert-MockCalled Connect-NetworkShare -Times 0 -Exactly -Scope It
+            $script:AddPromptIndex | Should Be 2
+            $script:AddOutput | Should Match 'saved as Z:'
+        }
+
+        It "shows that a password prompt follows the review action" {
+            $script:CredentialLookups = 0
+            Mock Get-CredentialForShare {
+                $script:CredentialLookups++
+                if ($script:CredentialLookups -eq 1) { return $null }
+                return (New-Object System.Management.Automation.PSCredential('user', (ConvertTo-SecureString 'synthetic' -AsPlainText -Force)))
+            }
+            $script:AddPrompts = @('notes', '2')
+            Add-NewShareCli
+            Assert-MockCalled Write-CliMenuOption -Times 1 -Exactly -Scope It -ParameterFilter { $Label -eq 'Enter password, save and connect' }
+            Assert-MockCalled Write-CliMenuOption -Times 1 -Exactly -Scope It -ParameterFilter { $Label -eq 'Enter password and save only' }
+        }
+
+        It "does not call an unverified mapping a verified connection" {
+            $script:AddPrompts = @('notes', '1')
+            Mock Connect-NetworkShare { return @{ Success = $true; Verified = $false } }
+            Add-NewShareCli
+            Assert-MockCalled Connect-NetworkShare -Times 1 -Exactly -Scope It -ParameterFilter { $ReturnStatus -and $Silent }
+            $script:AddOutput | Should Match 'could not be verified'
+            $script:AddOutput | Should Not Match 'connected and verified'
+        }
+
+        It "keeps a saved share when its immediate connection fails" {
+            $script:AddPrompts = @('notes', '1')
+            Mock Connect-NetworkShare { return @{ Success = $false; ErrorMessage = 'Server unavailable' } }
+            Add-NewShareCli
+            Assert-MockCalled Add-ShareConfiguration -Times 1 -Exactly -Scope It
+            $script:AddOutput | Should Match 'Share saved, but connection failed: Server unavailable'
+            $script:AddOutput | Should Not Match 'connected and verified'
+        }
+
+        It "returns from a cancelled password step to review with fields intact" {
+            $script:AddPrompts = @('notes', '1', '2')
+            $script:CredentialAttempts = 0
+            Mock Confirm-ShareCredential {
+                $script:CredentialAttempts++
+                return $script:CredentialAttempts -gt 1
+            }
+            Add-NewShareCli
+            $script:CredentialAttempts | Should Be 2
+            Assert-MockCalled Add-ShareConfiguration -Times 1 -Exactly -Scope It -ParameterFilter { $Name -eq 'Test' -and $SharePath -eq '\\server\share' }
+            $script:AddOutput | Should Match 'entries are still here for review'
         }
     }
 
@@ -985,9 +1381,11 @@ finally {
             }
             Show-CLI-Menu
             $script:MenuOutput | Should Match ('SHARE MANAGER v' + [regex]::Escape($version))
-            $script:MenuOutput | Should Match 'Connect All \(1 disconnected\)'
-            $script:MenuOutput | Should Match 'U - Updates'
-            ($script:MenuOutput.IndexOf('U - Updates') -lt $script:MenuOutput.IndexOf('Quit')) | Should Be $true
+            $script:MenuOutput | Should Match 'C Connect all \(1 remaining\)'
+            $script:MenuOutput | Should Match '1/2 connected \(enabled shares\) \(1 disabled\)'
+            $script:MenuOutput | Should Match 'U Updates'
+            $script:MenuOutput | Should Match 'H Help'
+            ($script:MenuOutput.IndexOf('U Updates') -lt $script:MenuOutput.IndexOf('Quit')) | Should Be $true
         }
 
         It "does not suggest connecting disabled shares" {
@@ -996,12 +1394,320 @@ finally {
             $script:MenuOutput | Should Match 'no enabled shares'
             $script:MenuOutput | Should Match 'Disconnect All'
             $script:MenuOutput | Should Not Match '\d+ disconnected'
+            $script:MenuOutput | Should Not Match 'N Reconnect all'
+        }
+
+        It "does not count a connected disabled share as enabled" {
+            Mock Test-ShareConnection { return $true }
+            Mock Get-ShareConfiguration {
+                return @(
+                    [PSCustomObject]@{ DriveLetter = 'X'; Enabled = $true },
+                    [PSCustomObject]@{ DriveLetter = 'Z'; Enabled = $false }
+                )
+            }
+            Show-CLI-Menu
+            $script:MenuOutput | Should Match '1/1 connected \(enabled shares\) \(1 disabled\)'
+            $script:MenuOutput | Should Not Match '2/1'
+        }
+
+        It "does not show Connect All as an available action when all enabled shares are connected" {
+            Mock Get-ShareConfiguration { return [PSCustomObject]@{ DriveLetter = 'X'; Enabled = $true } }
+            Show-CLI-Menu
+            $script:MenuOutput | Should Match '1/1 connected'
+            $script:MenuOutput | Should Not Match 'C Connect all'
+            $script:MenuOutput | Should Not Match 'Names and prefixes'
         }
 
         It "shows Add Share only once for an empty configuration" {
             Mock Get-ShareConfiguration { return @() }
             Show-CLI-Menu
-            ([regex]::Matches($script:MenuOutput, '1 - Add')).Count | Should Be 1
+            ([regex]::Matches($script:MenuOutput, '1 Add')).Count | Should Be 1
+            $script:MenuOutput | Should Match 'Try adding a network share to get started!'
+        }
+
+        It "highlights shortcut keys without relying on colour for labels" {
+            Mock Get-ShareConfiguration { return @() }
+            Show-CLI-Menu
+            Assert-MockCalled Write-Host -Scope It -ParameterFilter { $Object -eq '  SHARES' -and $ForegroundColor -eq 'Cyan' }
+            Assert-MockCalled Write-Host -Scope It -ParameterFilter { $Object -eq '  1' -and $ForegroundColor -eq 'Yellow' }
+            Assert-MockCalled Write-Host -Scope It -ParameterFilter { $Object -eq ' Add share      ' -and $ForegroundColor -eq 'Gray' }
+            Assert-MockCalled Write-Host -Scope It -ParameterFilter { $Object -eq 'Q' -and $ForegroundColor -eq 'Yellow' }
+        }
+    }
+
+    Context "Modern CLI commands" {
+        BeforeEach { Mock Test-CliInteractiveInput { return $false } }
+        It "accepts text editing and Escape in interactive CLI prompts" {
+            $script:PromptKeys = @(
+                [PSCustomObject]@{ VirtualKeyCode = 65; Character = 'a' },
+                [PSCustomObject]@{ VirtualKeyCode = 8; Character = [char]8 },
+                [PSCustomObject]@{ VirtualKeyCode = 66; Character = 'b' },
+                [PSCustomObject]@{ VirtualKeyCode = 13; Character = [char]13 },
+                [PSCustomObject]@{ VirtualKeyCode = 27; Character = [char]27 }
+            )
+            $script:PromptKeyIndex = 0
+            Mock Test-CliInteractiveInput { return $true }
+            Mock Write-Host { }
+            Mock Read-CliKey {
+                if ($script:PromptKeyIndex -ge $script:PromptKeys.Count) { throw 'Unexpected extra key read' }
+                $key = $script:PromptKeys[$script:PromptKeyIndex]
+                $script:PromptKeyIndex++
+                return $key
+            }
+            (Read-CliPrompt 'Choice') | Should Be 'b'
+            { Read-CliPrompt 'Choice' } | Should Throw
+        }
+        It "cancels password entry with Escape instead of appending it" {
+            Mock Write-Host { }
+            Mock Read-CliKey { return [PSCustomObject]@{ VirtualKeyCode = 27; Character = [char]27 } }
+            { Read-Password 'Password: ' } | Should Throw
+        }
+        It "accepts readable commands and preserves existing shortcuts" {
+            (Resolve-CliCommand 'CONNECT-ALL') | Should Be 'C'
+            (Resolve-CliCommand 'c') | Should Be 'C'
+            (Resolve-CliCommand 'disconnect-all') | Should Be 'D'
+            (Resolve-CliCommand 'd') | Should Be 'D'
+            (Resolve-CliCommand 'con a') | Should Be 'C'
+            (Resolve-CliCommand 'disc a') | Should Be 'D'
+            (Resolve-CliCommand 'stat') | Should Be '3'
+            (Resolve-CliCommand 'pref') | Should Be 'P'
+            (Resolve-CliCommand '1') | Should Be '1'
+            (Resolve-CliCommand 'add') | Should Be '1'
+            (Resolve-CliCommand 'preferences') | Should Be 'P'
+            (Resolve-CliCommand '?') | Should Be 'H'
+            (Resolve-CliCommand 'exit') | Should Be 'Q'
+        }
+        It "rejects unknown and blank commands without guessing" {
+            (Resolve-CliCommand 'connect-one') | Should BeNullOrEmpty
+            (Resolve-CliCommand 'connect') | Should BeNullOrEmpty
+            (Resolve-CliCommand 'disconnect') | Should BeNullOrEmpty
+            (Resolve-CliCommand 'con') | Should BeNullOrEmpty
+            (Resolve-CliCommand 'co a') | Should BeNullOrEmpty
+            (Resolve-CliPrefix -InputText 'st' -Commands @{ status = 'S'; startup = 'P' }) | Should BeNullOrEmpty
+            (Resolve-CliCommand ' ') | Should BeNullOrEmpty
+            (Resolve-CliCommand $null) | Should BeNullOrEmpty
+        }
+        It "accepts readable Manage Shares commands and share numbers" {
+            (Resolve-CliManageCommand 'status') | Should Be 'S'
+            (Resolve-CliManageCommand 'stat') | Should Be 'S'
+            (Resolve-CliManageCommand 'edi') | Should Be 'E'
+            (Resolve-CliManageCommand 'edit') | Should Be 'E'
+            (Resolve-CliManageCommand 'delete') | Should Be 'R'
+            (Resolve-CliManageCommand 'search') | Should Be 'F'
+            (Resolve-CliManageCommand 'batch') | Should Be 'X'
+            (Resolve-CliManageCommand 'back') | Should Be 'B'
+            (Resolve-CliManageCommand '12') | Should Be '12'
+            (Resolve-CliManageCommand 'wat') | Should BeNullOrEmpty
+        }
+        It "matches Manage and Batch filters as literal text" {
+            $shares = @(
+                [PSCustomObject]@{ Name = 'NAS*Backup'; SharePath = '\\srv\backup'; DriveLetter = 'X' },
+                [PSCustomObject]@{ Name = 'NAS?Media'; SharePath = '\\srv\media'; DriveLetter = 'Y' },
+                [PSCustomObject]@{ Name = 'NAS-Work'; SharePath = '\\srv\work'; DriveLetter = 'Z' }
+            )
+            @(Select-CliSharesByFilter -Shares $shares -FilterText '*').Count | Should Be 1
+            @(Select-CliSharesByFilter -Shares $shares -FilterText '?').Count | Should Be 1
+            @(Select-CliSharesByFilter -Shares $shares -FilterText 'NAS').Count | Should Be 3
+        }
+        It "uses selected visible shares, otherwise the focused row" {
+            $shares = @(
+                [PSCustomObject]@{ Id = 'one'; Name = 'One' },
+                [PSCustomObject]@{ Id = 'two'; Name = 'Two' }
+            )
+            $selected = @{ one = $true }
+            @(Get-CliManageTargets -VisibleShares $shares -FocusedIndex 1 -SelectedIds $selected)[0].Id | Should Be 'one'
+            @(Get-CliManageTargets -VisibleShares $shares -FocusedIndex 1 -SelectedIds @{})[0].Id | Should Be 'two'
+            @(Get-CliManageTargets -VisibleShares @() -FocusedIndex 0 -SelectedIds @{}).Count | Should Be 0
+        }
+        It "does not connect disabled shares in the picker" {
+            Mock Get-ShareConfiguration { return [PSCustomObject]@{ Id = 'one'; Name = 'One'; Enabled = $false; DriveLetter = 'X' } }
+            Mock Test-ShareConnection { return $false }
+            Mock Connect-NetworkShare { throw 'Unexpected connection attempt' }
+            Mock Write-Host { }
+            Invoke-CliManageAction -Action C -Targets @([PSCustomObject]@{ Id = 'one' })
+            Assert-MockCalled Connect-NetworkShare -Times 0 -Exactly -Scope It
+        }
+        It "updates batch selection by ID when names repeat" {
+            $script:BatchConfig = [PSCustomObject]@{
+                Shares = @(
+                    [PSCustomObject]@{ Id = 'one'; Name = 'NAS'; Enabled = $false },
+                    [PSCustomObject]@{ Id = 'two'; Name = 'NAS'; Enabled = $false }
+                )
+            }
+            Mock Get-ShareConfiguration { return $script:BatchConfig.Shares }
+            Mock Get-CachedConfig { return $script:BatchConfig }
+            Mock Save-AllShares { return $true }
+            Mock Read-Host { return 'Y' }
+            Mock Write-Host { }
+            Invoke-CliManageAction -Action Enable -Targets @([PSCustomObject]@{ Id = 'two' })
+            $script:BatchConfig.Shares[0].Enabled | Should Be $false
+            $script:BatchConfig.Shares[1].Enabled | Should Be $true
+            Assert-MockCalled Save-AllShares -Times 1 -Exactly -Scope It
+        }
+        It "moves focus, selects a row, and acts on the selected ID" {
+            $script:PickerKeys = @(
+                [PSCustomObject]@{ VirtualKeyCode = 40; Character = [char]0 },
+                [PSCustomObject]@{ VirtualKeyCode = 32; Character = ' ' },
+                [PSCustomObject]@{ VirtualKeyCode = 67; Character = 'c' },
+                [PSCustomObject]@{ VirtualKeyCode = 13; Character = [char]13 },
+                [PSCustomObject]@{ VirtualKeyCode = 27; Character = [char]27 }
+            )
+            $script:PickerKeyIndex = 0
+            $script:PickerTarget = $null
+            Mock Get-ShareConfiguration {
+                return @(
+                    [PSCustomObject]@{ Id = 'one'; Name = 'One'; Enabled = $true; DriveLetter = 'X'; SharePath = '\\srv\one' },
+                    [PSCustomObject]@{ Id = 'two'; Name = 'Two'; Enabled = $true; DriveLetter = 'Y'; SharePath = '\\srv\two' }
+                )
+            }
+            Mock Test-ShareConnection { return $false }
+            Mock Clear-Host { }
+            Mock Write-Host { }
+            Mock Read-CliKey {
+                if ($script:PickerKeyIndex -ge $script:PickerKeys.Count) { throw 'Unexpected extra key read' }
+                $key = $script:PickerKeys[$script:PickerKeyIndex]
+                $script:PickerKeyIndex++
+                return $key
+            }
+            Mock Invoke-CliManageAction { $script:PickerTarget = [string]$Targets[0].Id; return $true }
+            (Show-CliInteractiveManageShares) | Should Be $true
+            $script:PickerTarget | Should Be 'two'
+            Assert-MockCalled Invoke-CliManageAction -Times 1 -Exactly -Scope It -ParameterFilter { $Action -eq 'C' }
+        }
+        It "falls back to the typed menu when key reading is unavailable" {
+            Mock Get-ShareConfiguration { return [PSCustomObject]@{ Id = 'one'; Name = 'One'; Enabled = $true; DriveLetter = 'X'; SharePath = '\\srv\one' } }
+            Mock Test-ShareConnection { return $false }
+            Mock Clear-Host { }
+            Mock Write-Host { }
+            Mock Read-CliKey { throw 'No interactive key input' }
+            (Show-CliInteractiveManageShares) | Should Be $false
+        }
+        It "requires confirmation before disconnecting multiple selected shares" {
+            Mock Get-ShareConfiguration {
+                return @(
+                    [PSCustomObject]@{ Id = 'one'; Name = 'One'; DriveLetter = 'X' },
+                    [PSCustomObject]@{ Id = 'two'; Name = 'Two'; DriveLetter = 'Y' }
+                )
+            }
+            Mock Read-Host { return '' }
+            Mock Write-Host { }
+            Mock Disconnect-NetworkShare { throw 'Unexpected disconnect attempt' }
+            Invoke-CliManageAction -Action D -Targets @(
+                [PSCustomObject]@{ Id = 'one' }, [PSCustomObject]@{ Id = 'two' }
+            )
+            Assert-MockCalled Disconnect-NetworkShare -Times 0 -Exactly -Scope It
+        }
+        It "does not open selection actions when nothing is selected" {
+            $script:PickerKeys = @(
+                [PSCustomObject]@{ VirtualKeyCode = 88; Character = 'x' },
+                [PSCustomObject]@{ VirtualKeyCode = 27; Character = [char]27 }
+            )
+            $script:PickerKeyIndex = 0
+            $script:PickerOutput = ''
+            Mock Get-ShareConfiguration { return [PSCustomObject]@{ Id = 'one'; Name = 'One'; Enabled = $true; DriveLetter = 'X'; SharePath = '\\srv\one' } }
+            Mock Test-ShareConnection { return $true }
+            Mock Clear-Host { }
+            Mock Write-Host { $script:PickerOutput += [string]$Object + "`n" }
+            Mock Read-CliKey {
+                if ($script:PickerKeyIndex -ge $script:PickerKeys.Count) { throw 'Unexpected extra key read' }
+                $key = $script:PickerKeys[$script:PickerKeyIndex]
+                $script:PickerKeyIndex++
+                return $key
+            }
+            (Show-CliInteractiveManageShares) | Should Be $true
+            $script:PickerKeyIndex | Should Be 2
+            $script:PickerOutput | Should Not Match '1 Enable selected'
+            $script:PickerOutput | Should Not Match 'X Enable/disable'
+            $script:PickerOutput | Should Not Match 'Press any key to return'
+        }
+        It "returns directly when cancelling the selected-shares menu" {
+            $script:PickerKeys = @(
+                [PSCustomObject]@{ VirtualKeyCode = 32; Character = ' ' },
+                [PSCustomObject]@{ VirtualKeyCode = 88; Character = 'x' },
+                [PSCustomObject]@{ VirtualKeyCode = 27; Character = [char]27 },
+                [PSCustomObject]@{ VirtualKeyCode = 27; Character = [char]27 }
+            )
+            $script:PickerKeyIndex = 0
+            $script:PickerOutput = ''
+            Mock Get-ShareConfiguration { return [PSCustomObject]@{ Id = 'one'; Name = 'One'; Enabled = $true; DriveLetter = 'X'; SharePath = '\\srv\one' } }
+            Mock Test-ShareConnection { return $true }
+            Mock Clear-Host { }
+            Mock Write-Host { $script:PickerOutput += [string]$Object + "`n" }
+            Mock Read-CliKey {
+                if ($script:PickerKeyIndex -ge $script:PickerKeys.Count) { throw 'Unexpected extra key read' }
+                $key = $script:PickerKeys[$script:PickerKeyIndex]
+                $script:PickerKeyIndex++
+                return $key
+            }
+            (Show-CliInteractiveManageShares) | Should Be $true
+            $script:PickerKeyIndex | Should Be 4
+            $script:PickerOutput | Should Match 'Disable selected'
+            $script:PickerOutput | Should Not Match '1 Enable selected'
+            $script:PickerOutput | Should Not Match 'C Connect selected'
+            $script:PickerOutput | Should Not Match 'Press any key to return'
+        }
+        It "returns to Manage after cancelling a nested edit" {
+            $script:ManageChoices = @('E', 'B')
+            $script:ManageChoiceIndex = 0
+            Mock Get-ShareConfiguration { return [PSCustomObject]@{ Id = 'one'; Name = 'One'; Enabled = $true; DriveLetter = 'X'; SharePath = '\\srv\one' } }
+            Mock Test-ShareConnection { return $false }
+            Mock Clear-Host { }
+            Mock Write-Host { }
+            Mock Read-CliPrompt {
+                $choice = $script:ManageChoices[$script:ManageChoiceIndex]
+                $script:ManageChoiceIndex++
+                return $choice
+            }
+            Mock Edit-ShareCli { throw [System.OperationCanceledException]::new('cancel') }
+            Show-ManageSharesMenu
+            $script:ManageChoiceIndex | Should Be 2
+            Assert-MockCalled Edit-ShareCli -Times 1 -Exactly -Scope It
+        }
+        It "lists command families in help" {
+            $script:HelpOutput = ''
+            Mock Clear-Host { }
+            Mock Write-Host { $script:HelpOutput += [string]$Object + "`n" }
+            Show-CliHelp -NoPause
+            $script:HelpOutput | Should Match 'add, manage, status'
+            $script:HelpOutput | Should Match 'connect-all, disconnect-all, reconnect-all'
+            $script:HelpOutput | Should Match 'gui, help, quit'
+        }
+        It "exits CLI mode cleanly when Escape cancels the main prompt" {
+            Mock Write-ActionLog { }
+            Mock Set-TerminalBlackBackground { }
+            Mock Convert-LegacyConfig { }
+            Mock Get-PreferenceValue { return $false }
+            Mock Show-CLI-Menu { }
+            Mock Write-Host { }
+            Mock Read-CliPrompt { throw [System.OperationCanceledException]::new('cancel') }
+            { Start-CliMode } | Should Not Throw
+            Assert-MockCalled Show-CLI-Menu -Times 1 -Exactly -Scope It
+        }
+    }
+
+    Context "Manage picker colour" {
+        It "distinguishes focus, selection, and connection state" {
+            $script:PickerColours = @()
+            Mock Clear-Host { }
+            Mock Get-ShareConfiguration { return [PSCustomObject]@{ Id = 'one'; Name = 'One'; Enabled = $true; DriveLetter = 'X'; SharePath = '\\srv\one' } }
+            Mock Test-ShareConnection { return $true }
+            Mock Read-CliKey { return [PSCustomObject]@{ VirtualKeyCode = 27; Character = [char]27 } }
+            Mock Write-Host { $script:PickerColours += [PSCustomObject]@{ Text = [string]$Object; Colour = [string]$ForegroundColor } }
+            (Show-CliInteractiveManageShares) | Should Be $true
+            @($script:PickerColours | Where-Object { $_.Text -eq '  > ' -and $_.Colour -eq 'Cyan' }).Count | Should Be 1
+            @($script:PickerColours | Where-Object { $_.Text -eq 'Connected' -and $_.Colour -eq 'Green' }).Count | Should Be 1
+            @($script:PickerColours | Where-Object { $_.Text -eq '  Esc' -and $_.Colour -eq 'Yellow' }).Count | Should Be 1
+        }
+    }
+
+    Context "CLI option colours" {
+        It "uses the same key, label, and value colours across menus" {
+            $script:OptionColours = @()
+            Mock Write-Host { $script:OptionColours += [PSCustomObject]@{ Text = [string]$Object; Colour = [string]$ForegroundColor } }
+            Write-CliMenuOption -Key '1.' -Label 'Setting: ' -Value 'True'
+            @($script:OptionColours | Where-Object { $_.Text -eq '  1.' -and $_.Colour -eq 'Yellow' }).Count | Should Be 1
+            @($script:OptionColours | Where-Object { $_.Text -eq ' Setting: ' -and $_.Colour -eq 'Gray' }).Count | Should Be 1
+            @($script:OptionColours | Where-Object { $_.Text -eq 'True' -and $_.Colour -eq 'White' }).Count | Should Be 1
         }
     }
 

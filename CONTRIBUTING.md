@@ -72,7 +72,7 @@ Run isolated AutoMap startup and CMD launcher tests:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Debug\test_automap.ps1
 ```
 
-These tests use temporary configuration and synthetic credentials, with Windows mapping operations replaced by test doubles. They do not connect to shares or change Credential Manager. Real sign-in acceptance checks are documented in [AutoMap validation](Debug/AUTOMAP-VALIDATION.md).
+These tests use temporary configuration and synthetic credentials, with Windows mapping operations replaced by test doubles. They do not connect to shares or change Credential Manager. The [2.5.1 AutoMap VM notes](Debug/AUTOMAP-VALIDATION.md) are historical, not current release criteria.
 
 The validation script checks:
 
@@ -108,9 +108,15 @@ powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Debug\test_update
 
 It briefly displays two progress dialogs and verifies success/error handling without downloading or installing anything.
 
-Before publishing, test GUI update progress and prompts, read-only script folders, reconnect after a server password change, and Disconnect All with only red-X mappings on Windows 10/11. Automated credential tests use synthetic arguments and mocks; they do not modify Windows Credential Manager or connect to a real SMB server.
+Run the first-run GUI smoke test in an STA Windows PowerShell session:
 
-Updater design references: [GitHub release API](https://docs.github.com/en/rest/releases/releases#get-the-latest-release), [release asset digests](https://docs.github.com/en/rest/releases/assets#get-a-release-asset), and [go-selfupdate's release filtering and checksum validation](https://github.com/creativeprojects/go-selfupdate). The Network Configuration script provided the backup/atomic replacement pattern.
+```powershell
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Debug\test_first_run_gui.ps1
+```
+
+It checks the empty and populated setup states, share actions, and theme switching without saving configuration.
+
+Before publishing, test GUI update progress and prompts, read-only script folders, reconnect after a server password change, and Disconnect All with only red-X mappings on Windows 10/11. Automated credential tests use synthetic arguments and mocks; they do not modify Windows Credential Manager or connect to a real SMB server.
 
 ## Factory Reset (Testing)
 

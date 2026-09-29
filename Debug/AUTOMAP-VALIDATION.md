@@ -1,4 +1,6 @@
-# AutoMap 2.5.1 Validation
+# AutoMap 2.5.1 Validation (Historical)
+
+This records the 2.5.1 VM investigation. For the current script, use the generated AutoMap version and the regression tests rather than treating these candidate-version steps as release criteria.
 
 ## Recorded VM Result
 

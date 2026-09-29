@@ -1,6 +1,6 @@
 # GDPR Compliance Overview
 
-This document explains how Share Manager (CLI/GUI, v2.5.0) handles personal data and how you can exercise your data rights.
+This document explains how Share Manager (CLI/GUI, v2.6.0) handles personal data and how you can exercise your data rights.
 
 ## What data is processed
 
